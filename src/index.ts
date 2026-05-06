@@ -15,6 +15,7 @@ import { parseArgs } from "node:util";
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
+import { errorMessage } from "./lib/error.js";
 import { PathValidationError, type VaultRoot, validateVaultRoot } from "./lib/validatePath.js";
 import { createServer } from "./server.js";
 
@@ -92,7 +93,7 @@ async function main(): Promise<void> {
 		try {
 			await server.close();
 		} catch (err) {
-			console.error(`error during shutdown: ${err instanceof Error ? err.message : String(err)}`);
+			console.error(`error during shutdown: ${errorMessage(err)}`);
 		}
 		process.exit(0);
 	};

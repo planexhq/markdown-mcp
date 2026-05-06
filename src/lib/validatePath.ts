@@ -31,7 +31,7 @@ import { constants as fsConstants, type Stats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize, relative, sep } from "node:path";
 import type { PathRejectionReason, SafePath, VaultError } from "../types.js";
-import { vaultError } from "./error.js";
+import { errorMessage, vaultError } from "./error.js";
 import { MAX_PATH_DEPTH, MAX_PATH_LENGTH } from "./limits.js";
 
 /**
@@ -238,12 +238,20 @@ export async function validatePath(input: string, vaultRoot: VaultRoot): Promise
 }
 
 /**
- * Open a previously-validated absolute path with `O_RDONLY | O_NOFOLLOW`.
- * Returned `FileHandle` is the caller's responsibility to close.
+ * Open a previously-validated absolute path with
+ * `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`. Returned `FileHandle` is the
+ * caller's responsibility to close.
  *
- * Refuses a final-component symlink swap that occurred between
- * `validatePath` and the open — the documented TOCTOU residual mitigation
- * (THREAT_MODEL V1/V6).
+ * Two protections layered:
+ *   - `O_NOFOLLOW` refuses a final-component symlink swap that occurred
+ *     between `validatePath` and the open (THREAT_MODEL V1/V6).
+ *   - `O_NONBLOCK` ensures the open returns immediately for FIFOs / named
+ *     pipes that have no writer attached. Without it, `open(O_RDONLY)`
+ *     on a FIFO blocks indefinitely waiting for a writer — a trivial
+ *     server-hang vector if a vault contains a FIFO. POSIX says
+ *     `O_NONBLOCK` is unspecified-but-harmless on regular files, so
+ *     normal note reads are unaffected. The caller is responsible for
+ *     `fstat`-ing and rejecting non-regular files (see `readNote`).
  *
  * On platforms where `O_NOFOLLOW` is not supported (Windows / libuv
  * silently strips the flag), the protection degrades to "rejected
@@ -251,7 +259,7 @@ export async function validatePath(input: string, vaultRoot: VaultRoot): Promise
  * Windows is not a CI target.
  */
 export async function openNoFollow(absolutePath: string): Promise<import("node:fs/promises").FileHandle> {
-	return open(absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+	return open(absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -273,9 +281,4 @@ function isENOENT(err: unknown): boolean {
 
 function isENOTDIR(err: unknown): boolean {
 	return typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === "ENOTDIR";
-}
-
-function errorMessage(err: unknown): string {
-	if (err instanceof Error) return err.message;
-	return String(err);
 }

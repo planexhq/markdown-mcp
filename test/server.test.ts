@@ -34,6 +34,13 @@ const TOOL_NAMES = [
 	"get_links",
 ] as const;
 
+/**
+ * Tools still returning the W1 INTERNAL_ERROR stub. The 3 W2 tools
+ * (`get_file_outline`, `get_fragment`, `get_metadata`) now return real
+ * responses against the real markdown parser and are tested separately.
+ */
+const STUBBED_TOOLS = ["get_vault_tree", "search", "get_links"] as const;
+
 let vault: { path: string; cleanup: () => Promise<void> };
 let connection: TestClient;
 
@@ -120,8 +127,8 @@ describe("tools/list", () => {
 	});
 });
 
-describe("tools/call — INTERNAL_ERROR envelope", () => {
-	for (const name of TOOL_NAMES) {
+describe("tools/call — INTERNAL_ERROR envelope (W1 stubs)", () => {
+	for (const name of STUBBED_TOOLS) {
 		test(`${name} returns isError + structuredContent + _meta`, async () => {
 			const args = stubArgsFor(name);
 			const result = await connection.client.callTool({ name, arguments: args });
@@ -139,13 +146,469 @@ describe("tools/call — INTERNAL_ERROR envelope", () => {
 	}
 
 	test("two consecutive calls have different request_ids", async () => {
-		const a = await connection.client.callTool({ name: "get_metadata", arguments: { file: "foo.md" } });
-		const b = await connection.client.callTool({ name: "get_metadata", arguments: { file: "foo.md" } });
+		// Use a stubbed tool so structuredContent remains a VaultError.
+		const a = await connection.client.callTool({ name: "search", arguments: { query: "" } });
+		const b = await connection.client.callTool({ name: "search", arguments: { query: "" } });
 		const idA = (a.structuredContent as VaultError).request_id;
 		const idB = (b.structuredContent as VaultError).request_id;
 		expect(idA).toBeTruthy();
 		expect(idB).toBeTruthy();
 		expect(idA).not.toBe(idB);
+	});
+});
+
+describe("tools/call — W2 real handlers", () => {
+	test("get_file_outline returns outline + blockIndex with tokenizer in _meta", async () => {
+		const result = await connection.client.callTool({
+			name: "get_file_outline",
+			arguments: { file: "multi-section.md" },
+		});
+		expect(result.isError).toBeFalsy();
+		const structured = result.structuredContent as {
+			outline: Array<{ path: string }>;
+			blockIndex: Record<string, unknown>;
+		};
+		expect(structured.outline.map((n) => n.path)).toEqual(["Auth", "Tags"]);
+		const meta = result._meta as MetaEnvelope | undefined;
+		expect(meta?.tokenizer).toBe("heuristic/content-aware-v1");
+	});
+
+	test("get_file_outline surfaces blockIndex first-match-wins", async () => {
+		const result = await connection.client.callTool({
+			name: "get_file_outline",
+			arguments: { file: "with-blocks.md" },
+		});
+		const structured = result.structuredContent as { blockIndex: Record<string, { heading_path: string[] }> };
+		expect(Object.keys(structured.blockIndex).sort()).toEqual(["block-one", "block-two"]);
+		expect(structured.blockIndex["block-one"]?.heading_path).toEqual(["Section"]);
+	});
+
+	test("get_fragment heading_path resolves a single match", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "multi-section.md", anchor: { kind: "heading_path", path: ["Auth"] } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as {
+			anchor_kind: string;
+			heading_path: string[];
+			level: number;
+			content: string;
+		};
+		expect(f.anchor_kind).toBe("heading");
+		expect(f.heading_path).toEqual(["Auth"]);
+		expect(f.level).toBe(1);
+		expect(f.content).toContain("Auth body");
+	});
+
+	test("get_fragment heading_path 'A > B' string form works", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "multi-section.md", anchor: { kind: "heading_path", path: "Auth > OAuth2" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { heading_path: string[]; level: number };
+		expect(f.heading_path).toEqual(["Auth", "OAuth2"]);
+		expect(f.level).toBe(2);
+	});
+
+	test("get_fragment heading_path string form is trimmed and whitespace-collapsed", async () => {
+		// Stored `pathText` runs `.trim().replace(/\s+/g, " ")` at parse time;
+		// input must undergo the same normalization or sloppy whitespace
+		// returns HEADING_NOT_FOUND despite matching the canonical form.
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "multi-section.md", anchor: { kind: "heading_path", path: "  Auth  >  OAuth2  " } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { heading_path: string[] };
+		expect(f.heading_path).toEqual(["Auth", "OAuth2"]);
+	});
+
+	test("get_fragment heading_path array form is trimmed per component", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "multi-section.md", anchor: { kind: "heading_path", path: ["  Auth  ", "OAuth2"] } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { heading_path: string[] };
+		expect(f.heading_path).toEqual(["Auth", "OAuth2"]);
+	});
+
+	test("get_fragment heading_path empty returns PreambleFragment", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "multi-section.md", anchor: { kind: "heading_path", path: [] } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { anchor_kind: string; content: string };
+		expect(f.anchor_kind).toBe("preamble");
+		expect(f.content).toContain("Preamble line");
+	});
+
+	test("get_fragment ambiguous heading_path returns HEADING_AMBIGUOUS with candidates", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "ambiguous.md", anchor: { kind: "heading_path", path: ["Auth"] } },
+		});
+		expect(result.isError).toBe(true);
+		const err = result.structuredContent as VaultError & { candidates?: Array<{ stable_id: string }> };
+		expect(err.code).toBe("HEADING_AMBIGUOUS");
+		expect(err.candidates).toHaveLength(2);
+		expect(err.candidates?.[0]?.stable_id).toMatch(/^h:[0-9a-f]{14}$/);
+	});
+
+	test("get_fragment missing heading_path returns HEADING_NOT_FOUND", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "multi-section.md", anchor: { kind: "heading_path", path: ["NonExistent"] } },
+		});
+		expect(result.isError).toBe(true);
+		const err = result.structuredContent as VaultError;
+		expect(err.code).toBe("HEADING_NOT_FOUND");
+	});
+
+	test("get_fragment block id returns BlockFragment with containing_heading_path", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "with-blocks.md", anchor: { kind: "block", id: "block-one" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as {
+			anchor_kind: string;
+			block_id: string;
+			containing_heading_path: string[];
+			content: string;
+		};
+		expect(f.anchor_kind).toBe("block");
+		expect(f.block_id).toBe("block-one");
+		expect(f.containing_heading_path).toEqual(["Section"]);
+		expect(f.content).not.toMatch(/\^block-one/); // ^id stripped from displayed content
+	});
+
+	test("get_fragment deferred-block preserves caret-suffixed prior text", async () => {
+		// `^math-block` is a deferred-form block ID addressing `Value x^2`.
+		// The trim regex must strip ONLY `^math-block`, not `^2` from the
+		// addressed paragraph (which is not a block ID per BLOCK_ID_RE).
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "block-deferred-caret.md", anchor: { kind: "block", id: "math-block" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { content: string; block_id: string };
+		expect(f.block_id).toBe("math-block");
+		expect(f.content).toBe("Value x^2");
+	});
+
+	test("get_fragment for block inside blockquote preserves the `>` marker", async () => {
+		// mdast paragraph offsets start after `> `; the block-fragment slice
+		// must re-include the marker so the returned content is the raw
+		// markdown blockquote, not bare quoted text.
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "block-in-blockquote.md", anchor: { kind: "block", id: "quote-block" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { content: string; block_id: string };
+		expect(f.block_id).toBe("quote-block");
+		expect(f.content).toBe("> quoted text");
+	});
+
+	test("get_fragment for block inside a blockquote-wrapped list preserves the `> -` prefix", async () => {
+		// `> - item` nests as `blockquote → list → listItem`, so detection must
+		// walk the ancestor chain (not just immediate parent) to fire the
+		// line-start walkback that re-includes the `> ` marker.
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "block-in-blockquote-list.md", anchor: { kind: "block", id: "qlist-block" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { content: string; block_id: string };
+		expect(f.block_id).toBe("qlist-block");
+		expect(f.content).toBe("> - quoted item");
+	});
+
+	test("get_fragment for deferred block ID inside a blockquote returns the prior quoted paragraph", async () => {
+		// `> p1\n> \n> ^id` is the canonical deferred-form pattern inside a
+		// blockquote: the blank `> ` line ends p1; the lone `> ^id` paragraph
+		// addresses p1. `>` markers are notation, not content, for adjacency.
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "block-in-blockquote-deferred.md", anchor: { kind: "block", id: "quote-deferred" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { content: string; block_id: string };
+		expect(f.block_id).toBe("quote-deferred");
+		expect(f.content).toBe("> first quoted");
+	});
+
+	test("get_fragment for ^id on a parent list item with a sub-list returns the parent (marker stripped)", async () => {
+		// Per Obsidian semantics the addressed block is the entire parent
+		// listItem — including the nested sub-list — when `^id` sits at the
+		// parent's text edge. The addressing marker itself is metadata
+		// (carried in `block_id`), so it must be stripped from `content`
+		// along with its leading space — same behavior as inline form.
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "nested-list-block-ids.md", anchor: { kind: "block", id: "p" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { content: string; block_id: string };
+		expect(f.block_id).toBe("p");
+		expect(f.content).toBe("- Parent\n  - Child");
+	});
+
+	test("get_fragment for ^id on a nested-list parent excludes wikilinks inside child code spans", async () => {
+		// Regression guard for buildBlockFragment's extract-then-strip order:
+		// stripping ` ^p` mid-`raw` would shift the child's wikilink offsets
+		// out of sync with `excludedRanges`, leaking `[[Fake]]` (inside an
+		// inline-code span) as a real outgoing link.
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "nested-list-block-with-code-child.md", anchor: { kind: "block", id: "p" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as {
+			content: string;
+			outgoing_links: Array<{ raw_target: string }>;
+		};
+		expect(f.outgoing_links.map((l) => l.raw_target)).toEqual(["Real"]);
+		expect(f.content.startsWith("- Parent\n")).toBe(true);
+	});
+
+	test("get_fragment for a duplicate ^id resolves to the FIRST occurrence (Brief line 90)", async () => {
+		// Fixture has `^dupe` in both `# First section` and `# Second section`.
+		// Index is first-match-wins; the parser test confirms the outline
+		// also attributes `dupe` only to "First section".
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "duplicate-block-ids.md", anchor: { kind: "block", id: "dupe" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { content: string; block_id: string };
+		expect(f.block_id).toBe("dupe");
+		expect(f.content).toContain("Paragraph A");
+		expect(f.content).not.toContain("Paragraph C");
+	});
+
+	test("get_fragment with anchor.kind='file' returns FileFragment", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "foo.md", anchor: { kind: "file" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const structured = result.structuredContent as { anchor_kind: string; content: string };
+		expect(structured.anchor_kind).toBe("file");
+		expect(structured.content).toContain("# foo");
+	});
+
+	test("get_fragment on a frontmatter-only note excludes the YAML block", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "fm-only.md", anchor: { kind: "file" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const structured = result.structuredContent as { anchor_kind: string; content: string };
+		expect(structured.anchor_kind).toBe("file");
+		expect(structured.content).not.toContain("title:");
+		expect(structured.content).not.toContain("---");
+	});
+
+	test("get_fragment with frontmatter+blank+heading starts at the heading, no stray leading newline", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "with-frontmatter.md", anchor: { kind: "file" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const structured = result.structuredContent as { content: string };
+		expect(structured.content.startsWith("# Body heading")).toBe(true);
+		expect(structured.content).not.toContain("title:");
+	});
+
+	test("get_fragment on a non-markdown extension returns PATH_NOT_FOUND", async () => {
+		const err = await callToolForError("get_fragment", { file: "secret.txt", anchor: { kind: "file" } });
+		expect(err.code).toBe("PATH_NOT_FOUND");
+		expect(err.param).toBe("file");
+	});
+
+	test("get_file_outline on a non-markdown extension returns PATH_NOT_FOUND", async () => {
+		const err = await callToolForError("get_file_outline", { file: "secret.txt" });
+		expect(err.code).toBe("PATH_NOT_FOUND");
+		expect(err.param).toBe("file");
+	});
+
+	test("get_metadata on a non-markdown extension returns PATH_NOT_FOUND", async () => {
+		const err = await callToolForError("get_metadata", { file: "secret.txt" });
+		expect(err.code).toBe("PATH_NOT_FOUND");
+		expect(err.param).toBe("file");
+	});
+
+	test("get_fragment on a hidden path (.obsidian/notes.md) returns PATH_NOT_FOUND", async () => {
+		const err = await callToolForError("get_fragment", {
+			file: ".obsidian/notes.md",
+			anchor: { kind: "file" },
+		});
+		expect(err.code).toBe("PATH_NOT_FOUND");
+		expect(err.param).toBe("file");
+	});
+
+	test("get_file_outline on a hidden path returns PATH_NOT_FOUND", async () => {
+		const err = await callToolForError("get_file_outline", { file: ".obsidian/notes.md" });
+		expect(err.code).toBe("PATH_NOT_FOUND");
+		expect(err.param).toBe("file");
+	});
+
+	test("get_metadata on a hidden path returns PATH_NOT_FOUND", async () => {
+		const err = await callToolForError("get_metadata", { file: ".obsidian/notes.md" });
+		expect(err.code).toBe("PATH_NOT_FOUND");
+		expect(err.param).toBe("file");
+	});
+
+	test("get_file_outline on ambiguous.md emits deduplicated slugs", async () => {
+		// The fixture has two `# Auth` headings. Anchors must be `auth` and `auth-1`
+		// per github-slugger convention; otherwise agents can't link to the second.
+		const result = await connection.client.callTool({
+			name: "get_file_outline",
+			arguments: { file: "ambiguous.md" },
+		});
+		const structured = result.structuredContent as { outline: Array<{ anchor: string }> };
+		expect(structured.outline.map((n) => n.anchor)).toEqual(["auth", "auth-1"]);
+	});
+
+	test("get_fragment accepts case-variant stable_id (uppercase prefix + hex digits)", async () => {
+		// Get a real stable_id from the outline, then send it back uppercased.
+		// The schema regex is case-insensitive (`/^h:[0-9a-f]{14}$/i`); generated
+		// IDs are always lowercase. Handler-side normalization should resolve
+		// either form to the same heading.
+		const outline = await connection.client.callTool({
+			name: "get_file_outline",
+			arguments: { file: "multi-section.md" },
+		});
+		const id = (outline.structuredContent as { outline: Array<{ stable_id: string }> }).outline[0]?.stable_id;
+		expect(id).toMatch(/^h:[0-9a-f]{14}$/);
+		const upper = id?.toUpperCase() ?? "";
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "multi-section.md", anchor: { kind: "file" }, stable_id: upper },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as {
+			anchor_kind: string;
+			stable_id: string;
+			stable_id_status: string;
+			heading_path: string[];
+		};
+		expect(f.anchor_kind).toBe("heading");
+		expect(f.stable_id_status).toBe("fresh");
+		// The resolved ID is the canonical lowercase form, not the uppercase input.
+		expect(f.stable_id).toBe(id);
+		expect(f.heading_path).toEqual(["Auth"]);
+	});
+
+	test("get_fragment with stale stable_id returns HEADING_NOT_FOUND with stable_id_status='stale'", async () => {
+		// Hex-shape valid id (`h:` + 14 hex) but not present in any fixture's outline.
+		const STALE_STABLE_ID = "h:0000000000abcd";
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "foo.md", anchor: { kind: "file" }, stable_id: STALE_STABLE_ID },
+		});
+		expect(result.isError).toBe(true);
+		const structured = result.structuredContent as VaultError & {
+			requested_stable_id?: string;
+			stable_id_status?: string;
+		};
+		expect(structured.code).toBe("HEADING_NOT_FOUND");
+		expect(structured.requested_stable_id).toBe(STALE_STABLE_ID);
+		expect(structured.stable_id_status).toBe("stale");
+		expect(Array.isArray(structured.candidates)).toBe(true);
+		expect(structured.candidates).toHaveLength(0);
+	});
+
+	test("get_fragment expand_embeds is accepted as a no-op in W2", async () => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "multi-section.md", anchor: { kind: "file" }, expand_embeds: true },
+		});
+		expect(result.isError).toBeFalsy();
+		// Embeds present in the source would have `expanded: false` in W2;
+		// `multi-section.md` has none, so just confirm the call succeeds.
+		const f = result.structuredContent as { embeds: unknown[] };
+		expect(Array.isArray(f.embeds)).toBe(true);
+	});
+
+	test("get_fragment classifies embed kind correctly when target carries a #fragment", async () => {
+		// `extname("paper.pdf#page=2")` returns `.pdf#page=2` — the kind guess
+		// must strip the `#…` before doing the extension lookup.
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "with-embeds.md", anchor: { kind: "file" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { embeds: Array<{ raw_target: string; kind: string }> };
+		const byPrefix = (prefix: string) => f.embeds.find((e) => e.raw_target.startsWith(prefix));
+		expect(byPrefix("paper.pdf")?.kind).toBe("pdf");
+		expect(byPrefix("clip.mp4")?.kind).toBe("media");
+		expect(byPrefix("image.png")?.kind).toBe("image");
+		expect(byPrefix("note#Section")?.kind).toBe("note");
+	});
+
+	test.each([
+		{ fixture: "with-code-wikilinks.md", desc: "code blocks and inline code" },
+		{ fixture: "with-math-wikilinks.md", desc: "math spans (inline + display)" },
+	])("get_fragment skips wikilinks inside $desc", async ({ fixture }) => {
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: fixture, anchor: { kind: "file" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as {
+			outgoing_links: Array<{ raw_target: string }>;
+			embeds: Array<{ raw_target: string }>;
+		};
+		const targets = f.outgoing_links.map((l) => l.raw_target);
+		expect(targets).toEqual(["Real", "Other"]);
+		expect(f.embeds).toEqual([]);
+	});
+
+	test("get_fragment honors CommonMark backslash-escape on wikilinks", async () => {
+		// `\\[[…]]` (even backslash count) emits a real link; phantom emissions
+		// would shift `link_ordinal` and break `get_links` cursor stability.
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "with-escaped-wikilinks.md", anchor: { kind: "heading_path", path: ["H"] } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as {
+			outgoing_links: Array<{ raw_target: string; link_ordinal: number }>;
+		};
+		expect(f.outgoing_links.map((l) => l.raw_target)).toEqual(["Real", "Other", "StillReal"]);
+		expect(f.outgoing_links.map((l) => l.link_ordinal)).toEqual([1, 2, 3]);
+	});
+
+	test("get_metadata on a no-frontmatter file returns has_frontmatter=false", async () => {
+		const result = await connection.client.callTool({ name: "get_metadata", arguments: { file: "foo.md" } });
+		expect(result.isError).toBeFalsy();
+		const structured = result.structuredContent as { metadata: unknown; has_frontmatter: boolean };
+		expect(structured.has_frontmatter).toBe(false);
+		expect(structured.metadata).toEqual({});
+	});
+
+	test("get_metadata preserves nested frontmatter objects", async () => {
+		const result = await connection.client.callTool({
+			name: "get_metadata",
+			arguments: { file: "with-frontmatter.md" },
+		});
+		expect(result.isError).toBeFalsy();
+		const structured = result.structuredContent as {
+			metadata: Record<string, unknown>;
+			has_frontmatter: boolean;
+		};
+		expect(structured.has_frontmatter).toBe(true);
+		expect(structured.metadata["title"]).toBe("Test");
+		expect(structured.metadata["tags"]).toEqual(["api", "auth"]);
+		const book = structured.metadata["book"] as Record<string, unknown>;
+		const author = book["author"] as Record<string, unknown>;
+		expect(author["name"]).toBe("Jane Doe");
 	});
 });
 

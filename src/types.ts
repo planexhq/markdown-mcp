@@ -259,13 +259,13 @@ export type Anchor =
 	| { kind: "block"; id: string }
 	| { kind: "file" };
 
-export type ExpandEmbedsOption = boolean | { max_depth?: number };
+export type ExpandEmbedsOption = boolean | { max_depth?: number | undefined };
 
 export interface GetFragmentInput {
 	file: string;
 	anchor: Anchor;
-	stable_id?: string;
-	expand_embeds?: ExpandEmbedsOption;
+	stable_id?: string | undefined;
+	expand_embeds?: ExpandEmbedsOption | undefined;
 }
 
 export interface OutgoingLink {

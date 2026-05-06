@@ -14,13 +14,24 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { ErrorCode, IndexStatus, MetaEnvelope, VaultError } from "../types.js";
+import type { ErrorCode, HeadingCandidate, IndexStatus, MetaEnvelope, VaultError } from "../types.js";
+import { MAX_FILE_BYTES } from "./limits.js";
+import type { ParseErrorReason } from "./parser.js";
 
 /**
  * Generate a fresh server-side request ID. Always UUID v4 per D13.
  */
 export function newRequestId(): string {
 	return randomUUID();
+}
+
+/**
+ * Extract a printable message from a caught value. `catch` binds to `unknown`
+ * because anything can be thrown; this normalizes to a string for embedding
+ * in `ParseError` / `vaultError` messages.
+ */
+export function errorMessage(cause: unknown): string {
+	return cause instanceof Error ? cause.message : String(cause);
 }
 
 /**
@@ -131,5 +142,141 @@ export function internalErrorEnvelope(message = "Tool not yet implemented (W1 st
 	const err = vaultError("INTERNAL_ERROR", message, {
 		request_id: meta.request_id,
 	});
+	return toolErrorEnvelope(err, meta);
+}
+
+// ─── W2 envelope builders ─────────────────────────────────────────────────
+
+/**
+ * Shape of a CallToolResult success envelope. Mirrors {@link ToolErrorEnvelope}
+ * but with `isError: false` (or absent) so the SDK marks the result as
+ * successful while still surfacing the typed `structuredContent` (D13
+ * hybrid envelope).
+ *
+ * `structuredContent` is intersected with `Record<string, unknown>` so
+ * the typed payload satisfies the SDK's loose-Record expectation without
+ * each response interface needing an explicit `[k: string]: unknown`
+ * index signature.
+ */
+export interface ToolSuccessEnvelope<T> {
+	[extra: string]: unknown;
+	content: Array<{ type: "text"; text: string }>;
+	structuredContent: T & Record<string, unknown>;
+	_meta: MetaEnvelope;
+}
+
+/**
+ * Wrap a typed payload + meta envelope as a successful tool result. The
+ * `content[0].text` mirrors `structuredContent` as JSON for clients that
+ * don't read structured content.
+ */
+export function successEnvelope<T extends object>(structuredContent: T, meta: MetaEnvelope): ToolSuccessEnvelope<T> {
+	return {
+		content: [{ type: "text", text: JSON.stringify(structuredContent, null, 2) }],
+		structuredContent: structuredContent as T & Record<string, unknown>,
+		_meta: meta,
+	};
+}
+
+/**
+ * `FILE_TOO_LARGE` per Brief line 770. Carries `limit_bytes` /
+ * `actual_bytes` in `structuredContent` so agents can decide whether to
+ * skip vs split vs abort.
+ */
+export function fileTooLargeEnvelope(
+	param: string,
+	actualBytes: number,
+	meta: MetaEnvelope = newMeta(),
+): ToolErrorEnvelope {
+	const err = vaultError("FILE_TOO_LARGE", `File exceeds ${MAX_FILE_BYTES}-byte read cap (actual: ${actualBytes}).`, {
+		param,
+		request_id: meta.request_id,
+		limit_bytes: MAX_FILE_BYTES,
+		actual_bytes: actualBytes,
+		suggestion: "Split the file into smaller notes (each under 10 MB).",
+	});
+	return toolErrorEnvelope(err, meta);
+}
+
+/**
+ * `MARKDOWN_PARSE_ERROR` with reason routing per CLAUDE.md hard-cap rules.
+ */
+export function markdownParseErrorEnvelope(
+	param: string,
+	reason: ParseErrorReason,
+	options: { message?: string; line?: number; column?: number } = {},
+	meta: MetaEnvelope = newMeta(),
+): ToolErrorEnvelope {
+	const message = options.message ?? defaultParseMessage(reason);
+	const extras: Record<string, unknown> = { reason };
+	if (options.line !== undefined) extras["line"] = options.line;
+	if (options.column !== undefined) extras["column"] = options.column;
+	const err = vaultError("MARKDOWN_PARSE_ERROR", message, {
+		param,
+		request_id: meta.request_id,
+		...extras,
+	});
+	return toolErrorEnvelope(err, meta);
+}
+
+function defaultParseMessage(reason: ParseErrorReason): string {
+	switch (reason) {
+		case "syntax":
+			return "Markdown parse failed (syntax).";
+		case "ast_node_cap_exceeded":
+			return "Markdown parse failed (AST node cap exceeded).";
+		case "encoding_failed":
+			return "Markdown parse failed (file is not valid UTF-8).";
+	}
+}
+
+/**
+ * `HEADING_NOT_FOUND` flat payload per round 8 (CLAUDE.md): stale-recovery
+ * fields sit directly on `VaultError`, NOT inside a nested `structured`
+ * sub-object. `requested_stable_id` is present on a stale-stable_id miss;
+ * `stable_id_status: "stale"` likewise.
+ */
+export function headingNotFoundEnvelope(
+	options: {
+		message?: string;
+		param?: string;
+		suggestion?: string;
+		requested_stable_id?: string;
+		stable_id_status?: "stale" | "missing";
+		candidates?: HeadingCandidate[];
+	},
+	meta: MetaEnvelope = newMeta(),
+): ToolErrorEnvelope {
+	const candidates = options.candidates ?? [];
+	const extras: Record<string, unknown> = {};
+	if (options.requested_stable_id) extras["requested_stable_id"] = options.requested_stable_id;
+	if (options.stable_id_status) extras["stable_id_status"] = options.stable_id_status;
+	const errOptions: Parameters<typeof vaultError>[2] = {
+		request_id: meta.request_id,
+		candidates,
+		...extras,
+	};
+	if (options.param !== undefined) errOptions.param = options.param;
+	if (options.suggestion !== undefined) errOptions.suggestion = options.suggestion;
+	const err = vaultError("HEADING_NOT_FOUND", options.message ?? "Heading not found.", errOptions);
+	return toolErrorEnvelope(err, meta);
+}
+
+/**
+ * `HEADING_AMBIGUOUS` — `heading_path` matched multiple headings; client
+ * must pick one. `candidates` carries every matching heading's stable_id +
+ * heading_path so the agent can disambiguate by structural slot.
+ */
+export function headingAmbiguousEnvelope(
+	options: { candidates: HeadingCandidate[]; param?: string; suggestion?: string; message?: string },
+	meta: MetaEnvelope = newMeta(),
+): ToolErrorEnvelope {
+	const errOptions: Parameters<typeof vaultError>[2] = {
+		request_id: meta.request_id,
+		candidates: options.candidates,
+	};
+	if (options.param !== undefined) errOptions.param = options.param;
+	if (options.suggestion !== undefined) errOptions.suggestion = options.suggestion;
+	const err = vaultError("HEADING_AMBIGUOUS", options.message ?? "Heading path matched multiple headings.", errOptions);
 	return toolErrorEnvelope(err, meta);
 }

@@ -1,0 +1,37 @@
+/**
+ * `get_file_outline` — heading tree + block-ID index for a single file.
+ *
+ * Per Brief lines 62–91: not paginated, returns full outline regardless
+ * of node count. The `_meta.tokenizer` field carries the active tokenizer
+ * id since outline nodes expose `bodyTokensApprox` / `descendantTokensApprox`.
+ *
+ * Hard-cap routing per CLAUDE.md:
+ *   - PathValidationError → PATH_OUTSIDE_VAULT / PATH_NOT_FOUND envelope
+ *   - FileTooLargeError   → FILE_TOO_LARGE envelope
+ *   - ParseError(reason)  → MARKDOWN_PARSE_ERROR envelope (reason routed)
+ *   - Anything else       → INTERNAL_ERROR (true bug, not a domain error)
+ */
+
+import { newMeta, successEnvelope, type ToolErrorEnvelope, type ToolSuccessEnvelope } from "../lib/error.js";
+import { readNote } from "../lib/readNote.js";
+import { getTokenizerId } from "../lib/tokenizer.js";
+import { type VaultRoot, validatePath } from "../lib/validatePath.js";
+import type { GetFileOutlineInput, GetFileOutlineResult } from "../types.js";
+import { routeToolError } from "./routeError.js";
+
+export async function handleGetFileOutline(
+	input: GetFileOutlineInput,
+	vaultRoot: VaultRoot,
+): Promise<ToolSuccessEnvelope<GetFileOutlineResult> | ToolErrorEnvelope> {
+	try {
+		const safePath = await validatePath(input.file, vaultRoot);
+		const { parsed } = await readNote(safePath);
+		const result: GetFileOutlineResult = {
+			outline: parsed.outline,
+			blockIndex: parsed.blockIndex,
+		};
+		return successEnvelope(result, newMeta({ tokenizer: getTokenizerId() }));
+	} catch (err) {
+		return routeToolError(err, "get_file_outline");
+	}
+}

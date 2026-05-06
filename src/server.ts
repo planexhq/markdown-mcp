@@ -37,6 +37,9 @@ import {
 	SearchSchema,
 	TOOL_DESCRIPTIONS,
 } from "./schemas.js";
+import { handleGetFileOutline } from "./tools/getFileOutline.js";
+import { handleGetFragment } from "./tools/getFragment.js";
+import { handleGetMetadata } from "./tools/getMetadata.js";
 
 /**
  * Server name + version reported in the MCP `initialize` handshake.
@@ -115,7 +118,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot): void {
 			description: TOOL_DESCRIPTIONS.get_file_outline,
 			inputSchema: GetFileOutlineSchema,
 		},
-		async ({ file }) => stubWithPathValidation(vaultRoot, file, "get_file_outline"),
+		async (input) => handleGetFileOutline(input, vaultRoot),
 	);
 
 	server.registerTool(
@@ -125,7 +128,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot): void {
 			description: TOOL_DESCRIPTIONS.get_fragment,
 			inputSchema: GetFragmentSchema,
 		},
-		async ({ file }) => stubWithPathValidation(vaultRoot, file, "get_fragment"),
+		async (input) => handleGetFragment(input, vaultRoot),
 	);
 
 	server.registerTool(
@@ -145,7 +148,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot): void {
 			description: TOOL_DESCRIPTIONS.get_metadata,
 			inputSchema: GetMetadataSchema,
 		},
-		async ({ file }) => stubWithPathValidation(vaultRoot, file, "get_metadata"),
+		async (input) => handleGetMetadata(input, vaultRoot),
 	);
 
 	server.registerTool(
