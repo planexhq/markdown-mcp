@@ -1,6 +1,6 @@
 {
   "name": "vault-mcp",
-  "version": "1.0.0-w1",
+  "version": "1.0.0-w3",
   "description": "Read-only MCP server exposing a local markdown vault to AI agents.",
   "type": "module",
   "bin": {
@@ -30,6 +30,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.9.0",
     "mdast-util-to-string": "^4.0.0",
     "remark-frontmatter": "^5.0.0",
     "remark-gfm": "^4.0.1",
@@ -42,6 +43,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.0.0",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.1.5",
     "typescript": "^6.0.3",

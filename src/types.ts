@@ -74,7 +74,9 @@ export interface VaultError {
  *
  * - `cold`: no usable persisted index; vault-wide tools return INDEX_WARMING,
  *   bounded tools (outline/fragment/metadata) parse on demand.
- * - `warming`: queryable but counts may grow.
+ * - `warming`: initial scan in progress; vault-wide tools also return
+ *   INDEX_WARMING (the `progress.phase` payload was always designed for
+ *   this), bounded reads parse on demand.
  * - `warm`: fully indexed; steady state.
  * - `reconciling`: diagnostic-only; reads continue on the prior snapshot.
  *
@@ -167,7 +169,9 @@ export type PathRejectionReason =
 	| "VAULT_ROOT_SYMLINK"
 	| "VAULT_ROOT_NOT_DIRECTORY"
 	| "STAT_FAILED"
-	| "REALPATH_FAILED";
+	| "REALPATH_FAILED"
+	| "INDEX_FILE_SYMLINK"
+	| "INDEX_FILE_NOT_REGULAR";
 
 // ─── Range / shared (Brief lines 73–87) ────────────────────────────────────
 
@@ -352,52 +356,70 @@ export type FragmentResult = HeadingFragment | PreambleFragment | BlockFragment 
 // ─── Search (Brief lines 206–299, D31 + D33) ───────────────────────────────
 
 export interface TagOps {
-	has?: string;
-	has_any?: string[];
-	has_all?: string[];
+	has?: string | undefined;
+	has_any?: string[] | undefined;
+	has_all?: string[] | undefined;
 }
 
 export interface DateOps {
-	gte?: string;
-	lte?: string;
-	gt?: string;
-	lt?: string;
+	gte?: string | undefined;
+	lte?: string | undefined;
+	gt?: string | undefined;
+	lt?: string | undefined;
+}
+
+/**
+ * `fields[name]` range bounds accept string OR number. Date-typed fields
+ * use ISO strings; scalar fields use numbers. The compiler's disambiguator
+ * (filter.ts) routes by value type at runtime.
+ */
+export interface FieldRangeOps {
+	gte?: string | number | undefined;
+	lte?: string | number | undefined;
+	gt?: string | number | undefined;
+	lt?: string | number | undefined;
 }
 
 export interface ScalarOps<T = unknown> {
-	eq?: T;
-	ne?: T;
-	in?: T[];
-	nin?: T[];
-	contains?: string;
-	is_empty?: boolean;
+	eq?: T | undefined;
+	ne?: T | undefined;
+	in?: T[] | undefined;
+	nin?: T[] | undefined;
+	contains?: string | undefined;
+	is_empty?: boolean | undefined;
 }
 
-export type FieldOps = ScalarOps<unknown> | TagOps | DateOps;
+export type FieldOps = ScalarOps<unknown> | TagOps | DateOps | FieldRangeOps;
 
 export interface Filter {
-	tags?: TagOps;
-	date?: DateOps;
-	fields?: Record<string, FieldOps>;
-	and?: Filter[];
-	or?: Filter[];
-	not?: Filter;
+	tags?: TagOps | undefined;
+	date?: DateOps | undefined;
+	fields?: Record<string, FieldOps> | undefined;
+	and?: Filter[] | undefined;
+	or?: Filter[] | undefined;
+	not?: Filter | undefined;
 }
 
 export interface SearchScope {
-	path?: string;
+	path?: string | undefined;
 }
 
 export interface SearchInput {
 	query: string;
-	scope?: SearchScope;
-	filters?: Filter;
-	cursor?: string;
-	pageSize?: number;
+	scope?: SearchScope | undefined;
+	filters?: Filter | undefined;
+	cursor?: string | undefined;
+	pageSize?: number | undefined;
 }
 
 export type ScoreType = "bm25" | "filter" | "rrf" | "hybrid";
 export type Retriever = "bm25" | "filter";
+
+/** Discriminator for `SearchResult` and the `fragments.anchor_kind` column (D31). */
+export type AnchorKind = "heading" | "preamble" | "file";
+
+/** `search.scope.path` resolves to one of these per `fs.stat` classification. */
+export type SearchScopeKind = "vault" | "subtree" | "file";
 
 export interface SearchResultCommon {
 	file: string;

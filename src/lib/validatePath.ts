@@ -31,7 +31,8 @@ import { constants as fsConstants, type Stats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize, relative, sep } from "node:path";
 import type { PathRejectionReason, SafePath, VaultError } from "../types.js";
-import { errorMessage, vaultError } from "./error.js";
+import { errorMessage, getErrnoCode, vaultError } from "./error.js";
+import { indexCacheFiles } from "./index/sqlite.js";
 import { MAX_PATH_DEPTH, MAX_PATH_LENGTH } from "./limits.js";
 
 /**
@@ -85,12 +86,87 @@ export async function validateVaultRoot(input: string): Promise<VaultRoot> {
 	// fails with ENOENT instead of silently accepting the CWD.
 	const normalized = input === "" ? "" : normalize(input);
 	const trimmed = normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
+	await assertRealDirectory(trimmed, { label: "Vault root" });
+	return { absolute: await realpath(trimmed) };
+}
+
+/**
+ * Refuse to open the SQLite cache path if its parent directory is a
+ * symlink (or anything other than a real directory). Without this guard,
+ * a hostile vault that pre-plants `.vault-mcp` as a symlink would
+ * redirect all index writes outside the vault — `mkdir(..., recursive)`
+ * silently follows symlinks, and the subsequent `Database` open follows
+ * them too. ENOENT is fine: the caller will mkdir a fresh directory.
+ */
+export async function ensureIndexDirIsRealDir(dirAbsolute: string): Promise<void> {
+	await assertRealDirectory(dirAbsolute, { label: "Index directory", allowEnoent: true });
+}
+
+/**
+ * Refuse to open the SQLite cache file (or its WAL/SHM sidecars) if any
+ * exist as anything other than a regular file. Symlinks redirect index
+ * writes outside the vault; directories crash startup; FIFOs hang on
+ * read; block devices redirect writes onto a real partition. ENOENT is
+ * fine: SQLite will create the file fresh.
+ *
+ * WAL mode (`PRAGMA journal_mode = WAL` in `sqlite.ts`) creates only the
+ * `-wal` and `-shm` sidecars; the legacy rollback `-journal` is not used
+ * and `-master-journal` is multi-DB-only.
+ *
+ * Residual TOCTOU window between this lstat and `new Database(dbPath)`
+ * is the same class as `validatePath`'s segment-walk → `O_NOFOLLOW`
+ * window (THREAT_MODEL V1/V6). Closing it requires `O_NOFOLLOW` on the
+ * SQLite open, which better-sqlite3 doesn't expose.
+ */
+export async function assertIndexFilesAreRegular(dbPath: string): Promise<void> {
+	for (const path of indexCacheFiles(dbPath)) {
+		let stat: Stats;
+		try {
+			stat = await lstat(path);
+		} catch (cause) {
+			if (isENOENT(cause)) continue;
+			throw new PathValidationError(
+				vaultError("PATH_OUTSIDE_VAULT", `Failed to stat index file: ${path}`, {
+					param: "vault",
+					reason: "STAT_FAILED" satisfies PathRejectionReason,
+					cause: errorMessage(cause),
+				}),
+			);
+		}
+		if (stat.isSymbolicLink()) {
+			throw new PathValidationError(
+				vaultError("PATH_OUTSIDE_VAULT", `Index file is a symlink: ${path}`, {
+					param: "vault",
+					reason: "INDEX_FILE_SYMLINK" satisfies PathRejectionReason,
+				}),
+			);
+		}
+		if (!stat.isFile()) {
+			throw new PathValidationError(
+				vaultError("PATH_OUTSIDE_VAULT", `Index file is not a regular file: ${path}`, {
+					param: "vault",
+					reason: "INDEX_FILE_NOT_REGULAR" satisfies PathRejectionReason,
+				}),
+			);
+		}
+	}
+}
+
+/**
+ * Shared `lstat` → reject-symlink → reject-non-directory sequence. Used by
+ * both startup vault-root validation and the index-dir guard. ENOENT is
+ * fatal unless `allowEnoent` is set (the index-dir caller can mkdir
+ * afterwards). All other failures throw {@link PathValidationError}.
+ */
+async function assertRealDirectory(path: string, options: { label: string; allowEnoent?: boolean }): Promise<void> {
+	const { label, allowEnoent = false } = options;
 	let stat: Stats;
 	try {
-		stat = await lstat(trimmed);
+		stat = await lstat(path);
 	} catch (cause) {
+		if (allowEnoent && isENOENT(cause)) return;
 		throw new PathValidationError(
-			vaultError("PATH_OUTSIDE_VAULT", `Vault root not accessible: ${input}`, {
+			vaultError("PATH_OUTSIDE_VAULT", `${label} not accessible: ${path}`, {
 				param: "vault",
 				reason: "VAULT_ROOT_INACCESSIBLE" satisfies PathRejectionReason,
 				cause: errorMessage(cause),
@@ -99,7 +175,7 @@ export async function validateVaultRoot(input: string): Promise<VaultRoot> {
 	}
 	if (stat.isSymbolicLink()) {
 		throw new PathValidationError(
-			vaultError("PATH_OUTSIDE_VAULT", `Vault root is a symlink: ${input}`, {
+			vaultError("PATH_OUTSIDE_VAULT", `${label} is a symlink: ${path}`, {
 				param: "vault",
 				reason: "VAULT_ROOT_SYMLINK" satisfies PathRejectionReason,
 			}),
@@ -107,14 +183,71 @@ export async function validateVaultRoot(input: string): Promise<VaultRoot> {
 	}
 	if (!stat.isDirectory()) {
 		throw new PathValidationError(
-			vaultError("PATH_OUTSIDE_VAULT", `Vault root is not a directory: ${input}`, {
+			vaultError("PATH_OUTSIDE_VAULT", `${label} is not a directory: ${path}`, {
 				param: "vault",
 				reason: "VAULT_ROOT_NOT_DIRECTORY" satisfies PathRejectionReason,
 			}),
 		);
 	}
-	return { absolute: await realpath(trimmed) };
 }
+
+/**
+ * Subset of {@link PathRejectionReason} produced by the sync policy
+ * classifier (no FS I/O). Excludes reasons that require an `lstat` walk
+ * or `realpath`, like `SYMLINK_SEGMENT` or `OUTSIDE_VAULT`.
+ */
+export type SyncPathRejection =
+	| "EMPTY_PATH"
+	| "PATH_TOO_LONG"
+	| "NULL_BYTE"
+	| "PERCENT_ENCODED"
+	| "BACKSLASH"
+	| "ABSOLUTE_PATH"
+	| "TRAVERSAL_SEGMENT"
+	| "TOO_DEEP";
+
+/**
+ * Sync subset of {@link validatePath}'s policy — string-only checks that
+ * never touch the filesystem. Returns the FIRST violation, or `null` if
+ * the relpath would survive the sync portion of validation.
+ *
+ * Used by:
+ *   - {@link validatePath} for early rejection before the segment-walk
+ *     `lstat` chain (single source of truth for policy reasons).
+ *   - `walkVault` in `src/lib/index/scanner.ts` — skips files whose
+ *     paths the tool surface would reject, preserving the invariant
+ *     that every indexed file is addressable via `get_fragment` /
+ *     `note://`.
+ */
+export function classifyRelpathPolicy(input: string): SyncPathRejection | null {
+	if (input === "") return "EMPTY_PATH";
+	if (input.length > MAX_PATH_LENGTH) return "PATH_TOO_LONG";
+	if (input.includes("\x00")) return "NULL_BYTE";
+	if (PERCENT_ENCODED_RE.test(input)) return "PERCENT_ENCODED";
+	if (BACKSLASH_RE.test(input)) return "BACKSLASH";
+	if (isAbsolute(input)) return "ABSOLUTE_PATH";
+
+	const normalized = input.normalize("NFC");
+	const cleaned = normalized.startsWith("./") ? normalized.slice(2) : normalized;
+	const segments = cleaned.split("/").filter((s) => s.length > 0);
+	if (segments.length === 0) return "EMPTY_PATH";
+	for (const seg of segments) {
+		if (seg === "." || seg === "..") return "TRAVERSAL_SEGMENT";
+	}
+	if (segments.length > MAX_PATH_DEPTH) return "TOO_DEEP";
+	return null;
+}
+
+const POLICY_REJECTION_MESSAGES: Record<SyncPathRejection, string> = {
+	EMPTY_PATH: "Path is empty.",
+	PATH_TOO_LONG: `Path exceeds ${MAX_PATH_LENGTH} characters.`,
+	NULL_BYTE: "Path contains NUL byte.",
+	PERCENT_ENCODED: "Path contains percent-encoded octet; pass paths in their decoded form.",
+	BACKSLASH: "Path contains backslash; use forward slashes.",
+	ABSOLUTE_PATH: "Path is absolute; pass vault-relative paths.",
+	TRAVERSAL_SEGMENT: "Path contains traversal segment.",
+	TOO_DEEP: `Path exceeds maximum depth of ${MAX_PATH_DEPTH} segments.`,
+};
 
 /**
  * Validate a vault-relative path string. Throws
@@ -125,16 +258,15 @@ export async function validateVaultRoot(input: string): Promise<VaultRoot> {
  * {@link validateVaultRoot}).
  */
 export async function validatePath(input: string, vaultRoot: VaultRoot): Promise<SafePath> {
-	rejectIf(input === "", "EMPTY_PATH", "Path is empty.");
-	rejectIf(input.length > MAX_PATH_LENGTH, "PATH_TOO_LONG", `Path exceeds ${MAX_PATH_LENGTH} characters.`);
-	rejectIf(input.includes("\x00"), "NULL_BYTE", "Path contains NUL byte.");
-	rejectIf(
-		PERCENT_ENCODED_RE.test(input),
-		"PERCENT_ENCODED",
-		"Path contains percent-encoded octet; pass paths in their decoded form.",
-	);
-	rejectIf(BACKSLASH_RE.test(input), "BACKSLASH", "Path contains backslash; use forward slashes.");
-	rejectIf(isAbsolute(input), "ABSOLUTE_PATH", "Path is absolute; pass vault-relative paths.");
+	const policyReason = classifyRelpathPolicy(input);
+	if (policyReason !== null) {
+		throw new PathValidationError(
+			vaultError("PATH_OUTSIDE_VAULT", POLICY_REJECTION_MESSAGES[policyReason], {
+				param: "file",
+				reason: policyReason,
+			}),
+		);
+	}
 
 	// NFC normalize before any FS operation. macOS APFS lookups are
 	// normalization-insensitive but we keep input form consistent for
@@ -146,12 +278,6 @@ export async function validatePath(input: string, vaultRoot: VaultRoot): Promise
 	// segment elsewhere — the split below ignores it.
 	const cleaned = normalized.startsWith("./") ? normalized.slice(2) : normalized;
 	const segments = cleaned.split("/").filter((s) => s.length > 0);
-
-	rejectIf(segments.length === 0, "EMPTY_PATH", "Path is empty after normalization.");
-	for (const seg of segments) {
-		rejectIf(seg === "." || seg === "..", "TRAVERSAL_SEGMENT", `Path contains traversal segment: ${seg}`);
-	}
-	rejectIf(segments.length > MAX_PATH_DEPTH, "TOO_DEEP", `Path exceeds maximum depth of ${MAX_PATH_DEPTH} segments.`);
 
 	// Segment-walk lstat from vault root. Reject any symlink encountered
 	// — including the leaf. This catches `linked_dir/secret.md` where
@@ -264,21 +390,10 @@ export async function openNoFollow(absolutePath: string): Promise<import("node:f
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-function rejectIf(condition: boolean, reason: PathRejectionReason, message: string): void {
-	if (condition) {
-		throw new PathValidationError(
-			vaultError("PATH_OUTSIDE_VAULT", message, {
-				param: "file",
-				reason,
-			}),
-		);
-	}
-}
-
 function isENOENT(err: unknown): boolean {
-	return typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === "ENOENT";
+	return getErrnoCode(err) === "ENOENT";
 }
 
 function isENOTDIR(err: unknown): boolean {
-	return typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === "ENOTDIR";
+	return getErrnoCode(err) === "ENOTDIR";
 }

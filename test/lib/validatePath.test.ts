@@ -13,6 +13,9 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import {
+	assertIndexFilesAreRegular,
+	classifyRelpathPolicy,
+	ensureIndexDirIsRealDir,
 	openNoFollow,
 	PathValidationError,
 	type VaultRoot,
@@ -172,6 +175,47 @@ describe("validatePath — rejection group (W1 exit criterion)", () => {
 	});
 });
 
+describe("classifyRelpathPolicy — sync subset of validatePath", () => {
+	const POLICY_CASES: Array<{ input: string; reason: PathRejectionReason | null }> = [
+		{ input: "", reason: "EMPTY_PATH" },
+		{ input: "a/b.md", reason: null },
+		{ input: "./a.md", reason: null },
+		{ input: "/abs/path.md", reason: "ABSOLUTE_PATH" },
+		{ input: "a\\b.md", reason: "BACKSLASH" },
+		{ input: "a%2fb.md", reason: "PERCENT_ENCODED" },
+		{ input: "a\x00b.md", reason: "NULL_BYTE" },
+		{ input: "a/../b.md", reason: "TRAVERSAL_SEGMENT" },
+		{ input: "../escape.md", reason: "TRAVERSAL_SEGMENT" },
+	];
+
+	for (const { input, reason } of POLICY_CASES) {
+		const label = reason === null ? "accepts" : `rejects with ${reason}`;
+		test(`${label}: ${JSON.stringify(input)}`, () => {
+			expect(classifyRelpathPolicy(input)).toBe(reason);
+		});
+	}
+
+	test("rejects path > 1024 chars with PATH_TOO_LONG", () => {
+		const longInput = `${"a/".repeat(513)}x.md`;
+		expect(classifyRelpathPolicy(longInput)).toBe("PATH_TOO_LONG");
+	});
+
+	test("rejects path > 32 segments deep with TOO_DEEP", () => {
+		const tooDeep = `${buildDeepPath(33)}/file.md`;
+		expect(classifyRelpathPolicy(tooDeep)).toBe("TOO_DEEP");
+	});
+
+	test("validatePath still throws PATH_OUTSIDE_VAULT for every classifier rejection", async () => {
+		// Confirms the refactor preserved validatePath's behavior — the
+		// policy classifier is the single source, validatePath just
+		// dispatches its result to PathValidationError.
+		for (const { input, reason } of POLICY_CASES) {
+			if (reason === null) continue;
+			await expectPathRejection(() => validatePath(input, root), "PATH_OUTSIDE_VAULT", reason);
+		}
+	});
+});
+
 describe("validatePath — successful path coverage", () => {
 	test("accepts top-level file", async () => {
 		const safe = await validatePath("foo.md", root);
@@ -284,6 +328,168 @@ describe("validatePath — edge cases", () => {
 			}
 		} finally {
 			await cafeVault.cleanup();
+		}
+	});
+});
+
+describe("ensureIndexDirIsRealDir — startup symlink guard for .vault-mcp", () => {
+	test("ENOENT (fresh vault) returns without throwing", async () => {
+		const isolated = await createTempVault({});
+		try {
+			await ensureIndexDirIsRealDir(`${isolated.path}/.vault-mcp`);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("real directory passes through", async () => {
+		const isolated = await createTempVault({ ".vault-mcp": { "keep.txt": "x" } });
+		try {
+			await ensureIndexDirIsRealDir(`${isolated.path}/.vault-mcp`);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("symlinked .vault-mcp rejected with VAULT_ROOT_SYMLINK", async () => {
+		const isolated = await createTempVault({});
+		const exfil = await createTempVault({});
+		try {
+			await createSymlink(exfil.path, `${isolated.path}/.vault-mcp`);
+			await expectPathRejection(
+				() => ensureIndexDirIsRealDir(`${isolated.path}/.vault-mcp`),
+				"PATH_OUTSIDE_VAULT",
+				"VAULT_ROOT_SYMLINK",
+			);
+		} finally {
+			await Promise.all([isolated.cleanup(), exfil.cleanup()]);
+		}
+	});
+
+	test("regular file at .vault-mcp rejected with VAULT_ROOT_NOT_DIRECTORY", async () => {
+		const isolated = await createTempVault({ ".vault-mcp": "not a dir" });
+		try {
+			await expectPathRejection(
+				() => ensureIndexDirIsRealDir(`${isolated.path}/.vault-mcp`),
+				"PATH_OUTSIDE_VAULT",
+				"VAULT_ROOT_NOT_DIRECTORY",
+			);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+});
+
+describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () => {
+	const dbRel = ".vault-mcp/index.sqlite3";
+
+	test("ENOENT on all three paths (cold start) returns without throwing", async () => {
+		const isolated = await createTempVault({ ".vault-mcp": {} });
+		try {
+			await assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("regular SQLite file (no sidecars) passes through", async () => {
+		const isolated = await createTempVault({ ".vault-mcp": { "index.sqlite3": "fake" } });
+		try {
+			await assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("symlinked index.sqlite3 rejected with INDEX_FILE_SYMLINK", async () => {
+		const isolated = await createTempVault({ ".vault-mcp": {} });
+		const exfil = await createTempVault({ "evil.sqlite3": "exfil" });
+		try {
+			await createSymlink(`${exfil.path}/evil.sqlite3`, `${isolated.path}/${dbRel}`);
+			await expectPathRejection(
+				() => assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`),
+				"PATH_OUTSIDE_VAULT",
+				"INDEX_FILE_SYMLINK",
+			);
+		} finally {
+			await Promise.all([isolated.cleanup(), exfil.cleanup()]);
+		}
+	});
+
+	test("symlinked -wal sidecar rejected with INDEX_FILE_SYMLINK", async () => {
+		const isolated = await createTempVault({ ".vault-mcp": { "index.sqlite3": "fake" } });
+		const exfil = await createTempVault({ "evil.wal": "exfil" });
+		try {
+			await createSymlink(`${exfil.path}/evil.wal`, `${isolated.path}/${dbRel}-wal`);
+			await expectPathRejection(
+				() => assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`),
+				"PATH_OUTSIDE_VAULT",
+				"INDEX_FILE_SYMLINK",
+			);
+		} finally {
+			await Promise.all([isolated.cleanup(), exfil.cleanup()]);
+		}
+	});
+
+	test("symlinked -shm sidecar rejected with INDEX_FILE_SYMLINK", async () => {
+		const isolated = await createTempVault({ ".vault-mcp": { "index.sqlite3": "fake" } });
+		const exfil = await createTempVault({ "evil.shm": "exfil" });
+		try {
+			await createSymlink(`${exfil.path}/evil.shm`, `${isolated.path}/${dbRel}-shm`);
+			await expectPathRejection(
+				() => assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`),
+				"PATH_OUTSIDE_VAULT",
+				"INDEX_FILE_SYMLINK",
+			);
+		} finally {
+			await Promise.all([isolated.cleanup(), exfil.cleanup()]);
+		}
+	});
+
+	// Round-22: vault-controlled cache is hostile-input. A pre-planted directory
+	// (or FIFO / device) at the index path bypasses the symlink-only guard and
+	// either crashes openSqlite or — in the block-device case — redirects index
+	// writes onto a real partition.
+	test("directory at index.sqlite3 rejected with INDEX_FILE_NOT_REGULAR", async () => {
+		const isolated = await createTempVault({ ".vault-mcp": { "index.sqlite3": {} } });
+		try {
+			await expectPathRejection(
+				() => assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`),
+				"PATH_OUTSIDE_VAULT",
+				"INDEX_FILE_NOT_REGULAR",
+			);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("directory at -wal sidecar rejected with INDEX_FILE_NOT_REGULAR", async () => {
+		const isolated = await createTempVault({
+			".vault-mcp": { "index.sqlite3": "fake", "index.sqlite3-wal": {} },
+		});
+		try {
+			await expectPathRejection(
+				() => assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`),
+				"PATH_OUTSIDE_VAULT",
+				"INDEX_FILE_NOT_REGULAR",
+			);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("directory at -shm sidecar rejected with INDEX_FILE_NOT_REGULAR", async () => {
+		const isolated = await createTempVault({
+			".vault-mcp": { "index.sqlite3": "fake", "index.sqlite3-shm": {} },
+		});
+		try {
+			await expectPathRejection(
+				() => assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`),
+				"PATH_OUTSIDE_VAULT",
+				"INDEX_FILE_NOT_REGULAR",
+			);
+		} finally {
+			await isolated.cleanup();
 		}
 	});
 });

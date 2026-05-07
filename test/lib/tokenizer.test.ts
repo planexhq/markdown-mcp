@@ -7,11 +7,11 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { estimateTokens, getTokenizerId, TOKENIZER_HEURISTIC } from "../../src/lib/tokenizer.js";
 
-const ORIGINAL_ENV = process.env["VAULT_TOKENIZER"];
+const ORIGINAL_ENV = process.env.VAULT_TOKENIZER;
 
 afterEach(() => {
-	if (ORIGINAL_ENV === undefined) delete process.env["VAULT_TOKENIZER"];
-	else process.env["VAULT_TOKENIZER"] = ORIGINAL_ENV;
+	if (ORIGINAL_ENV === undefined) delete process.env.VAULT_TOKENIZER;
+	else process.env.VAULT_TOKENIZER = ORIGINAL_ENV;
 });
 
 describe("estimateTokens (heuristic/content-aware-v1)", () => {
@@ -26,7 +26,7 @@ describe("estimateTokens (heuristic/content-aware-v1)", () => {
 
 	test("code-fence-dominant content uses 2.7 divisor (smaller divisor → more tokens than prose)", () => {
 		// Make >30% of total chars be inside a code fence.
-		const code = "```\n" + "y".repeat(100) + "\n```"; // 108 fence chars
+		const code = `\`\`\`\n${"y".repeat(100)}\n\`\`\``; // 108 fence chars
 		const prose = "p".repeat(50); // 50 prose chars; ratio ≈68% > 30%
 		const text = `${prose}\n${code}`;
 		const result = estimateTokens(text, TOKENIZER_HEURISTIC);
@@ -83,17 +83,17 @@ describe("estimateTokens (heuristic/content-aware-v1)", () => {
 
 describe("getTokenizerId", () => {
 	test("default is heuristic when env var is unset", () => {
-		delete process.env["VAULT_TOKENIZER"];
+		delete process.env.VAULT_TOKENIZER;
 		expect(getTokenizerId()).toBe(TOKENIZER_HEURISTIC);
 	});
 
 	test("returns env var value when set", () => {
-		process.env["VAULT_TOKENIZER"] = "tiktoken/o200k_base";
+		process.env.VAULT_TOKENIZER = "tiktoken/o200k_base";
 		expect(getTokenizerId()).toBe("tiktoken/o200k_base");
 	});
 
 	test("falls back to heuristic when env var is empty string", () => {
-		process.env["VAULT_TOKENIZER"] = "";
+		process.env.VAULT_TOKENIZER = "";
 		expect(getTokenizerId()).toBe(TOKENIZER_HEURISTIC);
 	});
 });

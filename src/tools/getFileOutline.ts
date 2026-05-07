@@ -12,7 +12,8 @@
  *   - Anything else       → INTERNAL_ERROR (true bug, not a domain error)
  */
 
-import { newMeta, successEnvelope, type ToolErrorEnvelope, type ToolSuccessEnvelope } from "../lib/error.js";
+import { newMetaForHandler, successEnvelope, type ToolErrorEnvelope, type ToolSuccessEnvelope } from "../lib/error.js";
+import type { IndexHandle } from "../lib/index/IndexHandle.js";
 import { readNote } from "../lib/readNote.js";
 import { getTokenizerId } from "../lib/tokenizer.js";
 import { type VaultRoot, validatePath } from "../lib/validatePath.js";
@@ -22,7 +23,11 @@ import { routeToolError } from "./routeError.js";
 export async function handleGetFileOutline(
 	input: GetFileOutlineInput,
 	vaultRoot: VaultRoot,
+	index?: IndexHandle,
 ): Promise<ToolSuccessEnvelope<GetFileOutlineResult> | ToolErrorEnvelope> {
+	// Hoisted before try so the catch can pass meta to routeToolError —
+	// preserves `index_status` and `tokenizer` on error envelopes.
+	const meta = newMetaForHandler(index, { tokenizer: getTokenizerId() });
 	try {
 		const safePath = await validatePath(input.file, vaultRoot);
 		const { parsed } = await readNote(safePath);
@@ -30,8 +35,8 @@ export async function handleGetFileOutline(
 			outline: parsed.outline,
 			blockIndex: parsed.blockIndex,
 		};
-		return successEnvelope(result, newMeta({ tokenizer: getTokenizerId() }));
+		return successEnvelope(result, meta);
 	} catch (err) {
-		return routeToolError(err, "get_file_outline");
+		return routeToolError(err, "get_file_outline", meta);
 	}
 }

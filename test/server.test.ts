@@ -36,10 +36,11 @@ const TOOL_NAMES = [
 
 /**
  * Tools still returning the W1 INTERNAL_ERROR stub. The 3 W2 tools
- * (`get_file_outline`, `get_fragment`, `get_metadata`) now return real
- * responses against the real markdown parser and are tested separately.
+ * (`get_file_outline`, `get_fragment`, `get_metadata`) and the W3
+ * `search` tool now return real responses against the real markdown
+ * parser / FTS5 index and are tested separately.
  */
-const STUBBED_TOOLS = ["get_vault_tree", "search", "get_links"] as const;
+const STUBBED_TOOLS = ["get_vault_tree", "get_links"] as const;
 
 let vault: { path: string; cleanup: () => Promise<void> };
 let connection: TestClient;
@@ -91,7 +92,7 @@ describe("Initialize handshake", () => {
 	test("server reports name + version", () => {
 		const info = connection.client.getServerVersion();
 		expect(info?.name).toBe("vault-mcp");
-		expect(info?.version).toBe("1.0.0-w1");
+		expect(info?.version).toBe("1.0.0-w3");
 	});
 
 	test("server advertises tools + resources capabilities", () => {
@@ -146,9 +147,9 @@ describe("tools/call — INTERNAL_ERROR envelope (W1 stubs)", () => {
 	}
 
 	test("two consecutive calls have different request_ids", async () => {
-		// Use a stubbed tool so structuredContent remains a VaultError.
-		const a = await connection.client.callTool({ name: "search", arguments: { query: "" } });
-		const b = await connection.client.callTool({ name: "search", arguments: { query: "" } });
+		// Use a still-stubbed tool so structuredContent remains a VaultError.
+		const a = await connection.client.callTool({ name: "get_vault_tree", arguments: {} });
+		const b = await connection.client.callTool({ name: "get_vault_tree", arguments: {} });
 		const idA = (a.structuredContent as VaultError).request_id;
 		const idB = (b.structuredContent as VaultError).request_id;
 		expect(idA).toBeTruthy();
@@ -604,11 +605,11 @@ describe("tools/call — W2 real handlers", () => {
 			has_frontmatter: boolean;
 		};
 		expect(structured.has_frontmatter).toBe(true);
-		expect(structured.metadata["title"]).toBe("Test");
-		expect(structured.metadata["tags"]).toEqual(["api", "auth"]);
-		const book = structured.metadata["book"] as Record<string, unknown>;
-		const author = book["author"] as Record<string, unknown>;
-		expect(author["name"]).toBe("Jane Doe");
+		expect(structured.metadata.title).toBe("Test");
+		expect(structured.metadata.tags).toEqual(["api", "auth"]);
+		const book = structured.metadata.book as Record<string, unknown>;
+		const author = book.author as Record<string, unknown>;
+		expect(author.name).toBe("Jane Doe");
 	});
 });
 

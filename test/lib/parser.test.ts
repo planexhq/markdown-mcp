@@ -150,11 +150,11 @@ describe("parser — frontmatter", () => {
 		const parsed = parseFile(source, "parser/frontmatter-nested.md");
 		expect(parsed.hasFrontmatter).toBe(true);
 		const md = parsed.frontmatter as Record<string, unknown>;
-		const book = md["book"] as Record<string, unknown>;
-		const author = book["author"] as Record<string, unknown>;
-		expect(author["name"]).toBe("Jane Doe");
-		expect(book["isbn"]).toBe("978-0-13-110362-7");
-		expect(md["tags"]).toEqual(["api", "auth"]);
+		const book = md.book as Record<string, unknown>;
+		const author = book.author as Record<string, unknown>;
+		expect(author.name).toBe("Jane Doe");
+		expect(book.isbn).toBe("978-0-13-110362-7");
+		expect(md.tags).toEqual(["api", "auth"]);
 	});
 
 	test("malformed YAML throws ParseError reason='syntax'", async () => {
@@ -260,8 +260,8 @@ describe("parser — frontmatter", () => {
 		const parsed = parseFile(source, "x.md");
 		expect(parsed.hasFrontmatter).toBe(true);
 		const fm = parsed.frontmatter as Record<string, unknown>;
-		expect(fm["a"]).toBe("foo");
-		expect(fm["b"]).toBe("foo");
+		expect(fm.a).toBe("foo");
+		expect(fm.b).toBe("foo");
 	});
 });
 
@@ -454,7 +454,7 @@ describe("parser — block IDs", () => {
 	test("blockIndex first-match-wins for duplicates", async () => {
 		const source = await load("duplicate-block-ids.md");
 		const parsed = parseFile(source, "parser/duplicate-block-ids.md");
-		const dupeEntry = parsed.blockIndex["dupe"];
+		const dupeEntry = parsed.blockIndex.dupe;
 		expect(dupeEntry).toBeDefined();
 		// First occurrence is in the first section under "First section"
 		expect(dupeEntry?.heading_path).toEqual(["First section"]);
@@ -505,16 +505,16 @@ describe("parser — block IDs", () => {
 		expect(Object.hasOwn(parsed.blockIndex, "constructor")).toBe(true);
 		expect(Object.hasOwn(parsed.blockIndex, "toString")).toBe(true);
 		expect(Object.hasOwn(parsed.blockIndex, "hasOwnProperty")).toBe(true);
-		expect(parsed.blockIndex["constructor"]?.heading_path).toEqual(["H"]);
-		expect(parsed.blockIndex["toString"]?.heading_path).toEqual(["H"]);
-		expect(parsed.blockIndex["hasOwnProperty"]?.heading_path).toEqual(["H"]);
+		expect(parsed.blockIndex.constructor?.heading_path).toEqual(["H"]);
+		expect(parsed.blockIndex.toString?.heading_path).toEqual(["H"]);
+		expect(parsed.blockIndex.hasOwnProperty?.heading_path).toEqual(["H"]);
 	});
 
 	test("first-match-wins still applies for prototype-key block IDs", () => {
 		const source = "# First\n\nP. ^constructor\n\n# Second\n\nQ. ^constructor\n";
 		const parsed = parseFile(source, "x.md");
 		// First occurrence is under `First`, not `Second`.
-		expect(parsed.blockIndex["constructor"]?.heading_path).toEqual(["First"]);
+		expect(parsed.blockIndex.constructor?.heading_path).toEqual(["First"]);
 		// Both occurrences still listed in `blocks`.
 		const all = parsed.blocks.filter((b) => b.id === "constructor");
 		expect(all.length).toBe(2);

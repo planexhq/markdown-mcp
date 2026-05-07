@@ -14,7 +14,8 @@
  * on the wire.
  */
 
-import { newMeta, successEnvelope, type ToolErrorEnvelope, type ToolSuccessEnvelope } from "../lib/error.js";
+import { newMetaForHandler, successEnvelope, type ToolErrorEnvelope, type ToolSuccessEnvelope } from "../lib/error.js";
+import type { IndexHandle } from "../lib/index/IndexHandle.js";
 import { readNote } from "../lib/readNote.js";
 import { type VaultRoot, validatePath } from "../lib/validatePath.js";
 import type { GetMetadataInput, GetMetadataResult } from "../types.js";
@@ -23,7 +24,12 @@ import { routeToolError } from "./routeError.js";
 export async function handleGetMetadata(
 	input: GetMetadataInput,
 	vaultRoot: VaultRoot,
+	index?: IndexHandle,
 ): Promise<ToolSuccessEnvelope<GetMetadataResult> | ToolErrorEnvelope> {
+	// Hoisted before try so the catch can pass meta to routeToolError —
+	// preserves `index_status` on error envelopes. No `tokenizer` for
+	// this tool per the Brief field-presence table.
+	const meta = newMetaForHandler(index);
 	try {
 		const safePath = await validatePath(input.file, vaultRoot);
 		const { parsed } = await readNote(safePath, { frontmatterOnly: true });
@@ -31,8 +37,8 @@ export async function handleGetMetadata(
 			metadata: parsed.frontmatter ?? {},
 			has_frontmatter: parsed.hasFrontmatter,
 		};
-		return successEnvelope(result, newMeta());
+		return successEnvelope(result, meta);
 	} catch (err) {
-		return routeToolError(err, "get_metadata");
+		return routeToolError(err, "get_metadata", meta);
 	}
 }

@@ -28,11 +28,13 @@ import {
 	headingAmbiguousEnvelope,
 	headingNotFoundEnvelope,
 	internalErrorEnvelope,
-	newMeta,
+	newMetaForHandler,
 	successEnvelope,
 	type ToolErrorEnvelope,
 	type ToolSuccessEnvelope,
 } from "../lib/error.js";
+import { FUZZY_ALGORITHM_ID, type HeadingHistoryRow, recoverStaleStableId } from "../lib/fuzzy.js";
+import type { IndexHandle } from "../lib/index/IndexHandle.js";
 import { type BlockMeta, type HeadingMeta, normalizeHeadingText, type ParsedFile } from "../lib/parser.js";
 import { readNote } from "../lib/readNote.js";
 import { estimateTokens, getTokenizerId } from "../lib/tokenizer.js";
@@ -46,6 +48,7 @@ import type {
 	GetFragmentInput,
 	HeadingCandidate,
 	HeadingFragment,
+	MetaEnvelope,
 	OutgoingLink,
 	PreambleFragment,
 } from "../types.js";
@@ -54,11 +57,14 @@ import { routeToolError } from "./routeError.js";
 export async function handleGetFragment(
 	input: GetFragmentInput,
 	vaultRoot: VaultRoot,
+	index?: IndexHandle,
 ): Promise<ToolSuccessEnvelope<FragmentResult> | ToolErrorEnvelope> {
+	// Hoisted before try so the catch can pass meta to routeToolError —
+	// preserves `index_status` and `tokenizer` on error envelopes.
+	const meta = newMetaForHandler(index, { tokenizer: getTokenizerId() });
 	try {
 		const safePath = await validatePath(input.file, vaultRoot);
 		const { parsed } = await readNote(safePath);
-		const meta = newMeta({ tokenizer: getTokenizerId() });
 
 		// 1. stable_id wins per Brief line 116 ("the precise identifier").
 		if (input.stable_id) {
@@ -67,9 +73,18 @@ export async function handleGetFragment(
 			// `H:ABCDEF...` resolves identically to `h:abcdef...`. The original
 			// input is preserved on stale-error reporting via `requested_stable_id`.
 			const normalized = input.stable_id.toLowerCase();
+			// Outline is authoritative (D27 — `stable_id` is a slot hash). When
+			// the cached id resolves in `parsed.headings`, return it directly,
+			// even if a sibling-swap left an orphaned `heading_history` row
+			// pointing at the previous text — the server cannot distinguish a
+			// cached pre-swap id from a fresh post-swap id.
 			const heading = parsed.headings.find((h) => h.stable_id === normalized);
 			if (heading) {
 				return successEnvelope(buildHeadingFragment(heading, parsed, "fresh"), meta);
+			}
+			const history = index?.getHistoryRow(safePath.relative, normalized) ?? null;
+			if (history !== null) {
+				return resolveStaleStableId(history, parsed, input.stable_id, meta);
 			}
 			return headingNotFoundEnvelope(
 				{
@@ -126,6 +141,7 @@ export async function handleGetFragment(
 				if (!heading) {
 					return internalErrorEnvelope(
 						"get_fragment: heading match list is non-empty but indexable element is undefined.",
+						meta,
 					);
 				}
 				return successEnvelope(buildHeadingFragment(heading, parsed, "fresh"), meta);
@@ -150,8 +166,57 @@ export async function handleGetFragment(
 			}
 		}
 	} catch (err) {
-		return routeToolError(err, "get_fragment");
+		return routeToolError(err, "get_fragment", meta);
 	}
+}
+
+/**
+ * Shared stale-`stable_id` recovery routing — used both when the cached
+ * ID is missing from current `parsed.headings` (D32 + round-9
+ * confidence-gate) AND when it resolves but `heading_history` shows the
+ * slot was reused for a different heading (D32 reused-stable_id rule).
+ *
+ * Fires `recoverStaleStableId` against the existing history row, then
+ * either:
+ *   - returns the success envelope with `stable_id_status: "stale"`,
+ *     `requested_stable_id`, and optional `fuzzy_candidates` when the
+ *     confidence-gated text match yields a primary; or
+ *   - returns `HEADING_NOT_FOUND` with up to 3 structural-proximity
+ *     candidates when no text match is available.
+ *
+ * Always stamps `_meta.fuzzy_algorithm` so callers can distinguish a
+ * fuzzy-resolved response from a fresh-success response.
+ */
+function resolveStaleStableId(
+	history: HeadingHistoryRow,
+	parsed: ParsedFile,
+	requestedStableId: string,
+	meta: MetaEnvelope,
+): ToolSuccessEnvelope<FragmentResult> | ToolErrorEnvelope {
+	const recovery = recoverStaleStableId({ history, currentHeadings: parsed.headings });
+	const candidates = recovery.others.map((c) => ({
+		stable_id: c.heading.stable_id,
+		heading_path: c.heading.headingPath,
+		score: c.score,
+	}));
+	const fuzzyMeta = { ...meta, fuzzy_algorithm: FUZZY_ALGORITHM_ID };
+	if (recovery.primary !== null) {
+		const fragment = buildHeadingFragment(recovery.primary.heading, parsed, "stale");
+		fragment.requested_stable_id = requestedStableId;
+		if (candidates.length > 0) fragment.fuzzy_candidates = candidates;
+		return successEnvelope(fragment, fuzzyMeta);
+	}
+	return headingNotFoundEnvelope(
+		{
+			message: `stable_id ${requestedStableId} not recoverable: heading text no longer present.`,
+			param: "stable_id",
+			requested_stable_id: requestedStableId,
+			stable_id_status: "stale",
+			candidates,
+			suggestion: "Call get_file_outline(file) and choose a current heading.",
+		},
+		fuzzyMeta,
+	);
 }
 
 // ─── Fragment builders ────────────────────────────────────────────────────

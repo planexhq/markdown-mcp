@@ -7,14 +7,10 @@
  * resource read handler throws `McpError` with `-32603` so the SDK
  * surfaces it as a JSON-RPC error with our domain `code` in `data`.
  *
- * Real implementations land:
- *   - get_file_outline, get_fragment, get_metadata → W2
- *   - search, get_links partial, get_vault_tree → W3/W4
- *   - note:// real read, _meta finalization → W5
- *
- * `validatePath` is wired now (D8 + D16): every tool handler validates
- * its path argument first, even though the rest of the handler is a
- * stub. This locks the security invariant from day 1.
+ * Stubbed in v1: `get_links` and `get_vault_tree` return INTERNAL_ERROR;
+ * `note://` reads return JSON-RPC `-32603` with our domain code in
+ * `data`. Every tool's path argument runs through `validatePath` even
+ * for stubs — the security invariant is locked from registration time.
  */
 
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -26,6 +22,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { internalErrorEnvelope, newMeta, toolErrorEnvelope, vaultError } from "./lib/error.js";
+import type { IndexHandle } from "./lib/index/IndexHandle.js";
 import { MIN_PROTOCOL_VERSION } from "./lib/limits.js";
 import { PathValidationError, type VaultRoot, validatePath } from "./lib/validatePath.js";
 import {
@@ -40,6 +37,7 @@ import {
 import { handleGetFileOutline } from "./tools/getFileOutline.js";
 import { handleGetFragment } from "./tools/getFragment.js";
 import { handleGetMetadata } from "./tools/getMetadata.js";
+import { handleSearch } from "./tools/search.js";
 
 /**
  * Server name + version reported in the MCP `initialize` handshake.
@@ -47,7 +45,7 @@ import { handleGetMetadata } from "./tools/getMetadata.js";
  */
 const SERVER_INFO = {
 	name: "vault-mcp",
-	version: "1.0.0-w1",
+	version: "1.0.0-w3",
 } as const;
 
 const INSTRUCTIONS =
@@ -55,10 +53,13 @@ const INSTRUCTIONS =
 
 /**
  * Build a configured `McpServer` for the given vault root. Caller is
- * responsible for connecting it to a transport (stdio in v1, SSE/HTTP
- * deferred per D22).
+ * responsible for connecting it to a transport.
+ *
+ * `index` is mandatory for `search` and powers D32 fuzzy stale-id
+ * recovery in `get_fragment`. Outline / metadata use it only for the
+ * live `_meta.index_status`.
  */
-export function createServer(vaultRoot: VaultRoot): McpServer {
+export function createServer(vaultRoot: VaultRoot, index?: IndexHandle): McpServer {
 	// `tools` and `resources` capabilities are auto-registered by the SDK
 	// when registerTool / registerResource fire; no need to pre-declare.
 	// `subscribe: true` was advertised previously but no subscribe handler
@@ -93,14 +94,14 @@ export function createServer(vaultRoot: VaultRoot): McpServer {
 		};
 	});
 
-	registerTools(server, vaultRoot);
+	registerTools(server, vaultRoot, index);
 	registerNoteResource(server, vaultRoot);
 	return server;
 }
 
 // ─── Tool registration ─────────────────────────────────────────────────────
 
-function registerTools(server: McpServer, vaultRoot: VaultRoot): void {
+function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHandle): void {
 	server.registerTool(
 		"get_vault_tree",
 		{
@@ -118,7 +119,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot): void {
 			description: TOOL_DESCRIPTIONS.get_file_outline,
 			inputSchema: GetFileOutlineSchema,
 		},
-		async (input) => handleGetFileOutline(input, vaultRoot),
+		async (input) => handleGetFileOutline(input, vaultRoot, index),
 	);
 
 	server.registerTool(
@@ -128,7 +129,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot): void {
 			description: TOOL_DESCRIPTIONS.get_fragment,
 			inputSchema: GetFragmentSchema,
 		},
-		async (input) => handleGetFragment(input, vaultRoot),
+		async (input) => handleGetFragment(input, vaultRoot, index),
 	);
 
 	server.registerTool(
@@ -138,7 +139,12 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot): void {
 			description: TOOL_DESCRIPTIONS.search,
 			inputSchema: SearchSchema,
 		},
-		async ({ scope }) => stubWithPathValidation(vaultRoot, scope?.path, "search"),
+		async (input) => {
+			if (index === undefined) {
+				return internalErrorEnvelope("search requires the index handle (server misconfigured).");
+			}
+			return handleSearch(input, vaultRoot, index);
+		},
 	);
 
 	server.registerTool(
@@ -148,7 +154,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot): void {
 			description: TOOL_DESCRIPTIONS.get_metadata,
 			inputSchema: GetMetadataSchema,
 		},
-		async (input) => handleGetMetadata(input, vaultRoot),
+		async (input) => handleGetMetadata(input, vaultRoot, index),
 	);
 
 	server.registerTool(

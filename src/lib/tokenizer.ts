@@ -32,7 +32,7 @@ export const TOKENIZER_HEURISTIC = "heuristic/content-aware-v1" as const;
  * (so tests can mutate the env var between calls without re-importing).
  */
 export function getTokenizerId(): string {
-	const env = process.env["VAULT_TOKENIZER"];
+	const env = process.env.VAULT_TOKENIZER;
 	return env && env.length > 0 ? env : TOKENIZER_HEURISTIC;
 }
 

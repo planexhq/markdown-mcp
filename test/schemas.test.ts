@@ -32,6 +32,16 @@ describe("FieldOps schema (handler does runtime disambiguation)", () => {
 		});
 	});
 
+	test("accepts numeric range bounds (scalar fields like `priority: 5`)", () => {
+		// The compiler's disambiguator routes non-ISO `gte/lte/gt/lt` to the
+		// scalar branch. The schema must let numbers through or the request
+		// is rejected as InvalidParams before disambiguation runs.
+		expect(parseFieldOps({ gte: 5 })).toEqual({ gte: 5 });
+		expect(parseFieldOps({ lte: 10 })).toEqual({ lte: 10 });
+		expect(parseFieldOps({ gt: 0, lt: 100 })).toEqual({ gt: 0, lt: 100 });
+		expect(parseFieldOps({ gte: 1.5 })).toEqual({ gte: 1.5 });
+	});
+
 	test("accepts scalar-only input", () => {
 		expect(parseFieldOps({ eq: 42 })).toEqual({ eq: 42 });
 		expect(parseFieldOps({ in: ["x", "y"] })).toEqual({ in: ["x", "y"] });
@@ -82,6 +92,13 @@ describe("Filter object strict-mode", () => {
 			filters: { and: [{ tags: { has: "api" } }, { date: { gte: "2026-01-01" } }] },
 		});
 		expect(out.filters?.and).toHaveLength(2);
+	});
+
+	test("top-level filter.date rejects numeric range bound", () => {
+		// Top-level `filter.date` is the reserved-date COALESCE chain —
+		// chronological only, so it stays string-only at the schema layer.
+		// Numeric widening only applies to `fields[name]` ranges.
+		expect(() => SearchSchema.parse({ query: "", filters: { date: { gte: 5 } } })).toThrow();
 	});
 });
 

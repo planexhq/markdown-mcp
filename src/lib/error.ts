@@ -35,6 +35,16 @@ export function errorMessage(cause: unknown): string {
 }
 
 /**
+ * Extract the `code` field from an errno-style error (Node fs, SQLite,
+ * etc.). Returns the string code, or `undefined` for any other shape.
+ */
+export function getErrnoCode(err: unknown): string | undefined {
+	if (typeof err !== "object" || err === null) return undefined;
+	const code = (err as { code?: unknown }).code;
+	return typeof code === "string" ? code : undefined;
+}
+
+/**
  * Build a `VaultError` payload. The required fields are `code` and
  * `message`; everything else is optional and code-specific. `request_id`
  * is auto-generated if not supplied (callers usually pass the same ID
@@ -118,6 +128,23 @@ export function newMeta(overrides: MetaOverrides = {}): MetaEnvelope {
 	return meta;
 }
 
+/** Minimal interface that matches `IndexHandle.getStatus()`; lets tool
+ * handlers depend on the meta-construction surface without importing
+ * the full IndexHandle type. */
+interface IndexStatusSource {
+	getStatus(): IndexStatus;
+}
+
+/**
+ * Like {@link newMeta} but resolves `index_status` from an optional
+ * IndexHandle. Handlers that have an index pass it; W2-only paths
+ * pass `undefined` and get the default cold/0 status.
+ */
+export function newMetaForHandler(index: IndexStatusSource | undefined, overrides: MetaOverrides = {}): MetaEnvelope {
+	const status = index?.getStatus();
+	return status ? newMeta({ ...overrides, index_status: status }) : newMeta(overrides);
+}
+
 /**
  * Wrap a `VaultError` in a CallToolResult envelope ready to return from
  * an MCP tool handler. The `_meta` envelope's `request_id` is forced to
@@ -134,11 +161,15 @@ export function toolErrorEnvelope(err: VaultError, meta: MetaEnvelope): ToolErro
 }
 
 /**
- * Convenience: build an INTERNAL_ERROR envelope. Used by W1 tool stubs
- * where the implementation is not yet wired up.
+ * Convenience: build an INTERNAL_ERROR envelope. Callers with a pre-built
+ * envelope (e.g., `routeToolError` after `handleSearch` has populated
+ * `index_status` / `query_algorithm`) pass it as `meta` so the error
+ * response carries the same observability fields the typed branches do.
  */
-export function internalErrorEnvelope(message = "Tool not yet implemented (W1 stub)."): ToolErrorEnvelope {
-	const meta = newMeta();
+export function internalErrorEnvelope(
+	message = "Tool not yet implemented (W1 stub).",
+	meta: MetaEnvelope = newMeta(),
+): ToolErrorEnvelope {
 	const err = vaultError("INTERNAL_ERROR", message, {
 		request_id: meta.request_id,
 	});
@@ -209,8 +240,8 @@ export function markdownParseErrorEnvelope(
 ): ToolErrorEnvelope {
 	const message = options.message ?? defaultParseMessage(reason);
 	const extras: Record<string, unknown> = { reason };
-	if (options.line !== undefined) extras["line"] = options.line;
-	if (options.column !== undefined) extras["column"] = options.column;
+	if (options.line !== undefined) extras.line = options.line;
+	if (options.column !== undefined) extras.column = options.column;
 	const err = vaultError("MARKDOWN_PARSE_ERROR", message, {
 		param,
 		request_id: meta.request_id,
@@ -249,8 +280,8 @@ export function headingNotFoundEnvelope(
 ): ToolErrorEnvelope {
 	const candidates = options.candidates ?? [];
 	const extras: Record<string, unknown> = {};
-	if (options.requested_stable_id) extras["requested_stable_id"] = options.requested_stable_id;
-	if (options.stable_id_status) extras["stable_id_status"] = options.stable_id_status;
+	if (options.requested_stable_id) extras.requested_stable_id = options.requested_stable_id;
+	if (options.stable_id_status) extras.stable_id_status = options.stable_id_status;
 	const errOptions: Parameters<typeof vaultError>[2] = {
 		request_id: meta.request_id,
 		candidates,

@@ -229,7 +229,7 @@ describe("readNote — post-validation TOCTOU window (open errno → domain erro
 			if (e instanceof PathValidationError) {
 				expect(e.payload.code).toBe("PATH_OUTSIDE_VAULT");
 				expect(e.payload.param).toBe("file");
-				expect(e.payload["reason"]).toBe("SYMLINK_SEGMENT");
+				expect(e.payload.reason).toBe("SYMLINK_SEGMENT");
 			}
 		}
 	});
@@ -249,7 +249,7 @@ describe("FILE_TOO_LARGE envelope routing", () => {
 		expect(envelope).toBeDefined();
 		expect(envelope?.structuredContent.code).toBe("FILE_TOO_LARGE");
 		expect(envelope?.structuredContent.param).toBe("file");
-		expect(envelope?.structuredContent["limit_bytes"]).toBe(MAX_FILE_BYTES);
-		expect(envelope?.structuredContent["actual_bytes"]).toBe(oversize);
+		expect(envelope?.structuredContent.limit_bytes).toBe(MAX_FILE_BYTES);
+		expect(envelope?.structuredContent.actual_bytes).toBe(oversize);
 	});
 });

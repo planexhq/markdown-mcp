@@ -22,7 +22,7 @@ let cachedRawEnv: string | undefined;
 let cachedExtensions: ReadonlySet<string> = DEFAULT_EXTENSIONS;
 
 export function getVaultExtensions(): ReadonlySet<string> {
-	const env = process.env["VAULT_EXTENSIONS"];
+	const env = process.env.VAULT_EXTENSIONS;
 	if (env === cachedRawEnv) return cachedExtensions;
 	cachedRawEnv = env;
 	if (!env || env.trim().length === 0) {

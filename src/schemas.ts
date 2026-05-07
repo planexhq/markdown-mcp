@@ -104,11 +104,23 @@ const TagOps = z.strictObject({
 
 const IsoDate = z.string().describe("ISO 8601 date or datetime string (UTC default).");
 
+// Top-level `filter.date` is the reserved-date COALESCE chain — chronological
+// only, so range bounds stay string-only.
 const DateOps = z.strictObject({
 	gte: IsoDate.optional(),
 	lte: IsoDate.optional(),
 	gt: IsoDate.optional(),
 	lt: IsoDate.optional(),
+});
+
+// `fields[name]` range ops accept string OR number — date-typed fields use
+// ISO strings; scalar fields (e.g. `priority: 5`) use numbers. Compiler's
+// disambiguator routes by value type per D12 Note.
+const FieldRangeOps = z.strictObject({
+	gte: z.union([z.string(), z.number()]).optional(),
+	lte: z.union([z.string(), z.number()]).optional(),
+	gt: z.union([z.string(), z.number()]).optional(),
+	lt: z.union([z.string(), z.number()]).optional(),
 });
 
 const ScalarOps = z.strictObject({
@@ -128,7 +140,7 @@ const ScalarOps = z.strictObject({
 const FieldOps = z.strictObject({
 	...ScalarOps.shape,
 	...TagOps.shape,
-	...DateOps.shape,
+	...FieldRangeOps.shape,
 });
 
 // Recursive Filter via z.lazy. The explicit `| undefined` on optional
