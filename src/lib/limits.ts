@@ -56,3 +56,17 @@ export const DEFAULT_PAGE_SIZE = 50;
  * pattern); per-tool handlers (W3+) clamp to this value.
  */
 export const MAX_PAGE_SIZE = 200;
+
+/**
+ * Shared `pageSize` clamp used by every paginated tool handler (search,
+ * get_links, get_vault_tree). Non-finite / negative / zero → default;
+ * otherwise floor + clamp to MAX. Mirrors the Brief's "silent clamp"
+ * contract so a `pageSize: 1000` request returns 200 rows rather than
+ * an `InvalidParams` error.
+ */
+export function clampPageSize(input: number | undefined): number {
+	if (input === undefined || !Number.isFinite(input)) return DEFAULT_PAGE_SIZE;
+	const n = Math.floor(input);
+	if (n < 1) return DEFAULT_PAGE_SIZE;
+	return Math.min(n, MAX_PAGE_SIZE);
+}

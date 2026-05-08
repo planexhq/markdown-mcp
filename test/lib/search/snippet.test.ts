@@ -62,7 +62,7 @@ describe("bm25-fragment-v1 — windowed selection", () => {
 	});
 });
 
-describe("bm25-fragment-v1 — body→code fallback (round 19)", () => {
+describe("bm25-fragment-v1 — body→code fallback", () => {
 	test("term-empty body, term-rich code → snippet from code with highlight", () => {
 		// Code-only section: scanner.extractFtsTexts strips fenced code from
 		// `body` and routes it to `code`. A query that hits the code column
@@ -124,12 +124,12 @@ describe("filter-preview-v1", () => {
 		expect(buildFilterPreview({ body: "", code: "" })).toBe("");
 	});
 
-	test("empty body, code non-empty → preview from code (round 19)", () => {
+	test("empty body, code non-empty → preview from code", () => {
 		const out = buildFilterPreview({ body: "", code: "npm install vault-mcp" });
 		expect(out).toContain("npm install");
 	});
 
-	test("whitespace-only body, code non-empty → preview from code (round 19)", () => {
+	test("whitespace-only body, code non-empty → preview from code", () => {
 		const out = buildFilterPreview({ body: "   \n\n  ", code: "ls -la" });
 		expect(out).toContain("ls -la");
 	});
@@ -154,11 +154,12 @@ describe("filter-preview-v1", () => {
 	});
 });
 
-describe("bm25-fragment-v1 — prefix-stem matching (round 21)", () => {
+describe("bm25-fragment-v1 — prefix-stem matching", () => {
 	test("prefix `auth*` highlights body word `Authentication` (porter stem differs from `auth`)", () => {
-		// Pre-fix: stem("auth")="auth" vs stem("authentication")="authent",
-		// exact-set lookup misses. FTS5 prefix-matches the row but the
-		// snippet falls back to first 200 chars without highlighting.
+		// stem("auth")="auth" vs stem("authentication")="authent" — an
+		// exact-stem-set lookup misses. FTS5 prefix-matches the row but
+		// the snippet falls back to first 200 chars without highlighting
+		// unless the matcher is also prefix-stem-aware.
 		const body = "OAuth2 setup. Authentication via tokens.";
 		const out = buildBm25Snippet({ body, code: "", terms: ["auth*"] });
 		expect(out).toContain("**Authentication**");

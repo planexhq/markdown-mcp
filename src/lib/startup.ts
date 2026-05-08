@@ -30,10 +30,16 @@ export function chooseStartupState(inputs: StartupStateInputs): StartupStateDeci
 		};
 	}
 	// SIGTERM mid-reconcile or failed-subtree warm restart: prior clean scan
-	// existed (`ever_complete=true`), `scan_complete=false`, but on-disk
-	// fragments still serve a usable snapshot. Mirrors scanner.ts's
+	// existed (`ever_complete=true`), `scan_complete=false`. On-disk
+	// fragments serve a usable snapshot. Mirrors scanner.ts's
 	// failed-subtree-warm-restart branch.
-	if (inputs.preexisted && inputs.everComplete && inputs.fileCount > 0) {
+	//
+	// Empty-vault case (`fileCount=0`) also resolves to warm: the prior
+	// clean scan indexed zero files, the persisted snapshot is honest
+	// about that, and async reconcile picks up any files added during
+	// the interruption. Serving an empty snapshot beats wedging vault-
+	// wide tools at INDEX_WARMING for an empty vault.
+	if (inputs.preexisted && inputs.everComplete) {
 		return {
 			state: "warm",
 			log: `vault-mcp index: warm (preexisted; ${inputs.fileCount} files indexed; last scan incomplete); reconciling on startup.`,

@@ -1,8 +1,11 @@
 /**
- * Single read+parse serializer per D16 — shared by `get_fragment` (W2)
- * and the W5 `note://{path}` resource. Centralizing here means the
- * security invariants (`O_NOFOLLOW`, file-size cap, encoding detection)
- * have one implementation, one test surface.
+ * D16 read serializer — one read implementation shared by every direct-read
+ * surface (`get_fragment`, `get_file_outline`, `get_metadata`, `get_links`,
+ * and the `note://` resource). `readSource` returns the raw decoded source;
+ * `readNote` layers `parseFile` above it for callers that need the AST.
+ *
+ * Centralizing means the security invariants (`O_NOFOLLOW`, file-size cap,
+ * encoding detection) have one implementation, one test surface.
  *
  * Order is load-bearing:
  *   1. `openNoFollow` — refuses leaf-symlink swap that occurred between
@@ -15,7 +18,9 @@
  *   3. UTF-8 decode with `fatal: true` — invalid byte sequences surface
  *      as `MARKDOWN_PARSE_ERROR.reason: "encoding_failed"` rather than
  *      replacement characters that would silently corrupt fragments.
- *   4. `parseFile` — propagates {@link ParseError} for syntax / AST cap.
+ *   4. `parseFile` (in `readNote` only) — propagates {@link ParseError}
+ *      for syntax / AST cap. The `note://` resource skips this step so a
+ *      parse-only failure doesn't block the literal source it advertises.
  *
  * Errors are typed: caller catches {@link FileTooLargeError},
  * {@link ParseError}, and {@link PathValidationError} (from the prior
@@ -23,9 +28,10 @@
  */
 
 import type { FileHandle } from "node:fs/promises";
+import { lstat } from "node:fs/promises";
 
 import type { PathRejectionReason, SafePath } from "../types.js";
-import { errorMessage, vaultError } from "./error.js";
+import { errorMessage, isVanishedErrno, vaultError } from "./error.js";
 import { isHiddenPath } from "./hiddenPath.js";
 import { MAX_FILE_BYTES } from "./limits.js";
 import { type ParsedFile, ParseError, type ParseFileOptions, parseFile } from "./parser.js";
@@ -57,10 +63,43 @@ export class FileTooLargeError extends Error {
 	}
 }
 
+function assertNotePathString(safePath: SafePath): void {
+	if (!isMarkdownPath(safePath.relative)) {
+		throw pathNotFound(`Path is not a markdown note: ${safePath.relative}`);
+	}
+	if (isHiddenPath(safePath.relative)) {
+		// Brief line 928: hidden files are policy-excluded from every direct-read
+		// surface by default. `--include-hidden` will gate this at the call site (W5).
+		throw pathNotFound(`Path is hidden (excluded by default): ${safePath.relative}`);
+	}
+}
+
 /**
- * Read and parse the file at `safePath`. The caller must have already
- * run `validatePath`. `safePath.relative` is used as the input to the
- * D27 stable_id hash.
+ * Policy gates (extension, hidden, regular-file via `lstat`) for callers
+ * that skip the read/parse. The `lstat` gate has a TOCTOU window; callers
+ * that subsequently open the file get a stricter post-open `fstat` from
+ * `readSource`.
+ */
+export async function assertNotePathPolicy(safePath: SafePath): Promise<void> {
+	assertNotePathString(safePath);
+	let stat: Awaited<ReturnType<typeof lstat>>;
+	try {
+		stat = await lstat(safePath.absolute);
+	} catch (cause) {
+		if (isVanishedErrno(cause)) {
+			throw pathNotFound(`Path does not exist: ${safePath.relative}`);
+		}
+		throw cause;
+	}
+	if (!stat.isFile()) {
+		throw pathNotFound(`Path is not a regular file: ${safePath.relative}`);
+	}
+}
+
+/**
+ * Read the file source (decoded as UTF-8) without parsing. Shared between
+ * `readNote` (which then runs the parser) and the `note://` resource handler
+ * (which surfaces literal contents).
  *
  * Non-note extensions are rejected before any syscall (saves an open +
  * stat for the common "agent passed a `.txt` asset" case). The
@@ -68,18 +107,8 @@ export class FileTooLargeError extends Error {
  * during the validation window still can't bypass it; `O_NONBLOCK` on
  * the open keeps the FIFO from hanging the server.
  */
-export async function readNote(safePath: SafePath, options: ParseFileOptions = {}): Promise<NoteData> {
-	if (!isMarkdownPath(safePath.relative)) {
-		throw pathNotFound(`Path is not a markdown note: ${safePath.relative}`);
-	}
-	if (isHiddenPath(safePath.relative)) {
-		// Brief line 928: hidden files are policy-excluded from every direct-read
-		// surface by default. Code is `PATH_NOT_FOUND` (Brief line 361 verbatim),
-		// not `PATH_OUTSIDE_VAULT`, since the file exists on disk and the rejection
-		// is policy, not a security boundary. `--include-hidden` will gate this
-		// predicate at the call site (W5).
-		throw pathNotFound(`Path is hidden (excluded by default): ${safePath.relative}`);
-	}
+export async function readSource(safePath: SafePath): Promise<string> {
+	assertNotePathString(safePath);
 	let fh: FileHandle | undefined;
 	try {
 		try {
@@ -91,7 +120,7 @@ export async function readNote(safePath: SafePath, options: ParseFileOptions = {
 			// became a symlink (ELOOP, caught by O_NOFOLLOW). All three
 			// have validatePath analogues; route to the same envelopes
 			// instead of leaking as INTERNAL_ERROR.
-			if (isFsErrorCode(cause, "ENOENT") || isFsErrorCode(cause, "ENOTDIR")) {
+			if (isVanishedErrno(cause)) {
 				throw pathNotFound(`Path does not exist: ${safePath.relative}`);
 			}
 			if (isFsErrorCode(cause, "ELOOP")) {
@@ -129,17 +158,25 @@ export async function readNote(safePath: SafePath, options: ParseFileOptions = {
 			throw new FileTooLargeError(safePath.relative, MAX_FILE_BYTES, total);
 		}
 		const buf = total === buffer.length ? buffer : buffer.subarray(0, total);
-		let source: string;
 		try {
-			source = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+			return new TextDecoder("utf-8", { fatal: true }).decode(buf);
 		} catch (cause) {
 			throw new ParseError("encoding_failed", `File is not valid UTF-8: ${errorMessage(cause)}`);
 		}
-		const parsed = parseFile(source, safePath.relative, options);
-		return { source, parsed };
 	} finally {
 		if (fh !== undefined) await fh.close();
 	}
+}
+
+/**
+ * Read and parse the file at `safePath`. The caller must have already
+ * run `validatePath`. `safePath.relative` is used as the input to the
+ * D27 stable_id hash.
+ */
+export async function readNote(safePath: SafePath, options: ParseFileOptions = {}): Promise<NoteData> {
+	const source = await readSource(safePath);
+	const parsed = parseFile(source, safePath.relative, options);
+	return { source, parsed };
 }
 
 function isFsErrorCode(err: unknown, code: string): boolean {

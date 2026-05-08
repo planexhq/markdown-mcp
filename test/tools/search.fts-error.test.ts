@@ -14,6 +14,7 @@ import { describe, expect, test, vi } from "vitest";
 import type { IndexHandle } from "../../src/lib/index/IndexHandle.js";
 import { handleSearch } from "../../src/tools/search.js";
 import type { MetaEnvelope, SearchOutput, VaultError } from "../../src/types.js";
+import { FAKE_VAULT_ROOT } from "../helpers/vault.js";
 
 class FakeSqliteError extends Error {
 	override readonly name = "SqliteError";
@@ -33,14 +34,12 @@ function stubIndex(throwOnQuery: () => never): IndexHandle {
 	} as unknown as IndexHandle;
 }
 
-const VAULT_ROOT = { absolute: "/tmp/vault-mcp-fts-error-test" };
-
 describe("search — FTS fallback narrowing", () => {
 	test("fts5: syntax error → fallback-defanged success", async () => {
 		const index = stubIndex(() => {
 			throw new FakeSqliteError("SQLITE_ERROR", 'fts5: syntax error near "foo"');
 		});
-		const r = await handleSearch({ query: "foo" }, VAULT_ROOT, index);
+		const r = await handleSearch({ query: "foo" }, FAKE_VAULT_ROOT, index);
 		expect(r.isError).toBeFalsy();
 		const out = r.structuredContent as SearchOutput;
 		expect(out.items).toEqual([]);
@@ -52,7 +51,7 @@ describe("search — FTS fallback narrowing", () => {
 		const index = stubIndex(() => {
 			throw new FakeSqliteError("SQLITE_ERROR", "no such table: fragments");
 		});
-		const r = await handleSearch({ query: "foo" }, VAULT_ROOT, index);
+		const r = await handleSearch({ query: "foo" }, FAKE_VAULT_ROOT, index);
 		expect(r.isError).toBe(true);
 		const err = r.structuredContent as VaultError;
 		expect(err.code).toBe("INTERNAL_ERROR");
@@ -69,7 +68,7 @@ describe("search — FTS fallback narrowing", () => {
 		const index = stubIndex(() => {
 			throw new Error("unexpected runtime failure");
 		});
-		const r = await handleSearch({ query: "foo" }, VAULT_ROOT, index);
+		const r = await handleSearch({ query: "foo" }, FAKE_VAULT_ROOT, index);
 		expect(r.isError).toBe(true);
 		const err = r.structuredContent as VaultError;
 		expect(err.code).toBe("INTERNAL_ERROR");
@@ -84,7 +83,7 @@ describe("search — FTS fallback narrowing", () => {
 			if (calls === 1) throw new FakeSqliteError("SQLITE_ERROR", 'fts5: syntax error near "+"');
 			throw new FakeSqliteError("SQLITE_IOERR", "disk I/O error");
 		});
-		const r = await handleSearch({ query: "+foo" }, VAULT_ROOT, index);
+		const r = await handleSearch({ query: "+foo" }, FAKE_VAULT_ROOT, index);
 		expect(r.isError).toBe(true);
 		const err = r.structuredContent as VaultError;
 		expect(err.code).toBe("INTERNAL_ERROR");

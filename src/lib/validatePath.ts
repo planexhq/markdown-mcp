@@ -31,7 +31,8 @@ import { constants as fsConstants, type Stats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize, relative, sep } from "node:path";
 import type { PathRejectionReason, SafePath, VaultError } from "../types.js";
-import { errorMessage, getErrnoCode, vaultError } from "./error.js";
+import { errorMessage, getErrnoCode, isVanishedErrno, vaultError } from "./error.js";
+import { isNonNfc } from "./hiddenPath.js";
 import { indexCacheFiles } from "./index/sqlite.js";
 import { MAX_PATH_DEPTH, MAX_PATH_LENGTH } from "./limits.js";
 
@@ -65,6 +66,29 @@ export class PathValidationError extends Error {
 const PERCENT_ENCODED_RE = /%[0-9a-fA-F]{2}/;
 const BACKSLASH_RE = /\\/;
 const PARENT_REL_PREFIX = `..${sep}`;
+
+/**
+ * `path.relative(vaultRoot, ...)` returns an escape path iff it equals
+ * `..`, starts with `../` (or `..\\` on Windows), or is absolute. A
+ * filename like `..draft.md` is legal — `startsWith("..")` would falsely
+ * flag it.
+ */
+function isEscapePath(rel: string): boolean {
+	return rel === ".." || rel.startsWith(PARENT_REL_PREFIX) || isAbsolute(rel);
+}
+
+/**
+ * Combined gate for "would this relpath be addressable through the
+ * tool surface?" — sync portion of `validatePath` plus the NFC check.
+ * Used by every walker that yields candidate paths (scanner, merkle,
+ * tree) to skip files whose rows would dangle behind a `validatePath`
+ * reject from the read side.
+ */
+export function passesPathPolicy(rel: string): boolean {
+	if (classifyRelpathPolicy(rel) !== null) return false;
+	if (isNonNfc(rel)) return false;
+	return true;
+}
 
 /**
  * Validate the configured vault path at startup. Order is load-bearing
@@ -291,7 +315,7 @@ export async function validatePath(input: string, vaultRoot: VaultRoot): Promise
 		} catch (cause) {
 			// ENOTDIR: traversing through a regular file (e.g. `foo.md/bar`).
 			// Same domain answer as ENOENT — the deeper path doesn't exist.
-			if (isENOENT(cause) || isENOTDIR(cause)) {
+			if (isVanishedErrno(cause)) {
 				throw new PathValidationError(
 					vaultError("PATH_NOT_FOUND", `Path does not exist: ${input}`, {
 						param: "file",
@@ -339,10 +363,8 @@ export async function validatePath(input: string, vaultRoot: VaultRoot): Promise
 		);
 	}
 
-	// Segment-aware: `startsWith("..")` falsely catches files literally
-	// named `..draft.md` whose relative form is `..draft.md` (no separator).
 	const rel = relative(vaultRoot.absolute, real);
-	if (rel === "" || rel === ".." || rel.startsWith(PARENT_REL_PREFIX) || isAbsolute(rel)) {
+	if (rel === "" || isEscapePath(rel)) {
 		throw new PathValidationError(
 			vaultError("PATH_OUTSIDE_VAULT", `Path resolves outside the vault: ${input}`, {
 				param: "file",
@@ -392,8 +414,4 @@ export async function openNoFollow(absolutePath: string): Promise<import("node:f
 
 function isENOENT(err: unknown): boolean {
 	return getErrnoCode(err) === "ENOENT";
-}
-
-function isENOTDIR(err: unknown): boolean {
-	return getErrnoCode(err) === "ENOTDIR";
 }

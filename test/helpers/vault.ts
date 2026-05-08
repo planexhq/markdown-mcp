@@ -13,6 +13,8 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+import type { VaultRoot } from "../../src/lib/validatePath.js";
+
 /**
  * Recursive vault structure descriptor.
  *
@@ -22,6 +24,14 @@ import { dirname, join } from "node:path";
 export type VaultStructure = {
 	[name: string]: string | VaultStructure;
 };
+
+/**
+ * Placeholder `VaultRoot` for unit tests that exercise handler logic
+ * without touching the filesystem (the handler short-circuits before any
+ * FS operation). The path is non-existent on purpose: any accidental syscall
+ * fails fast rather than silently reading a real vault.
+ */
+export const FAKE_VAULT_ROOT: VaultRoot = { absolute: "/nonexistent-vault-root-for-tests" };
 
 /**
  * Create a fresh temp directory and populate it with the described

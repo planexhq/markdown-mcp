@@ -100,6 +100,18 @@ function mockReaddirErrnoFor(predicate: (path: string) => boolean, code: string)
 	}) as typeof fsPromises.readdir);
 }
 
+/** Filter directory entries by name, leaving the directory itself enumerable. */
+function mockReaddirFilterEntry(filterName: string): void {
+	vi.mocked(fsPromises.readdir).mockImplementation(((path: import("node:fs").PathLike, opts?: unknown) => {
+		return (realFs.readdir as (p: import("node:fs").PathLike, o?: unknown) => Promise<unknown>)(path, opts).then(
+			(out) => {
+				const arr = out as Array<{ name: string } | string>;
+				return arr.filter((e) => (typeof e === "string" ? e !== filterName : e.name !== filterName));
+			},
+		);
+	}) as typeof fsPromises.readdir);
+}
+
 /** Same shape as {@link mockStatErrnoFor} but for `lstat`. */
 function mockLstatErrnoFor(predicate: (path: string) => boolean, code: string): void {
 	vi.mocked(fsPromises.lstat).mockImplementation(((path: import("node:fs").PathLike) => {
@@ -109,16 +121,18 @@ function mockLstatErrnoFor(predicate: (path: string) => boolean, code: string): 
 }
 
 /**
- * Install an `lstat` mock that returns a synthetic symlink Stats for paths
- * matching `predicate`. Used to simulate a parent-dir or leaf swapped to
- * a symlink between scans (validatePath rejects with SYMLINK_SEGMENT).
+ * Install an `lstat` mock that returns a synthetic Stats of the requested
+ * non-regular type for paths matching `predicate`. `"symlink"` simulates a
+ * parent-dir or leaf swapped to a symlink (validatePath rejects with
+ * SYMLINK_SEGMENT); `"directory"` simulates a file replaced by a directory
+ * at the same path.
  */
-function mockLstatSymlinkFor(predicate: (path: string) => boolean): void {
+function mockLstatType(predicate: (path: string) => boolean, kind: "symlink" | "directory"): void {
 	vi.mocked(fsPromises.lstat).mockImplementation(((path: import("node:fs").PathLike) => {
 		if (typeof path === "string" && predicate(path)) {
 			return Promise.resolve({
-				isSymbolicLink: () => true,
-				isDirectory: () => false,
+				isSymbolicLink: () => kind === "symlink",
+				isDirectory: () => kind === "directory",
 				isFile: () => false,
 			} as unknown as import("node:fs").Stats);
 		}
@@ -160,7 +174,10 @@ describe("F3 — scanner stat errno partition", () => {
 		// between walkVault and indexOne." readdir still lists b.md so it
 		// reaches indexOne, which catches the stat error and returns
 		// "vanished" → b.md is excluded from `stillOnDisk` → prune drops it.
+		// `pruneVanishedFiles` uses lstat (not stat) to also detect file→
+		// symlink/directory swaps, so mock both.
 		mockStatErrnoFor((p) => p.endsWith("b.md"), "ENOENT");
+		mockLstatErrnoFor((p) => p.endsWith("b.md"), "ENOENT");
 
 		// scan_complete must have been true coming in so skipUnchanged is
 		// active for a.md (sanity check the test setup).
@@ -207,8 +224,13 @@ describe("F2 — scanner readdir errno partition", () => {
 
 		// Make readdir on `sub/` throw ENOENT — simulating the directory
 		// being deleted between scans. This is the legitimate "vanished"
-		// path where pruning the subtree's rows is correct.
+		// path where pruning the subtree's rows is correct. The prune pass
+		// stat-confirms before removing rows (defense against watcher race),
+		// so the subtree files must also fail lstat (the prune pass uses
+		// lstat to also catch non-regular swaps).
 		mockReaddirErrnoFor((p) => p.endsWith("/sub"), "ENOENT");
+		mockStatErrnoFor((p) => p.endsWith("/sub/b.md") || p.endsWith("/sub"), "ENOENT");
+		mockLstatErrnoFor((p) => p.endsWith("/sub/b.md") || p.endsWith("/sub"), "ENOENT");
 
 		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
 		expect(s.index.listIndexedFiles()).toEqual(["a.md"]);
@@ -298,7 +320,7 @@ describe("scanner end-state — failed subtrees gate `state`, not just `scan_com
 			expect(s.index.listIndexedFiles()).toEqual(["a.md"]);
 			expect(s.index.getScanComplete()).toBe(false);
 			expect(s.index.getStatus().state).toBe("warming");
-			// Round-14: a partial-finish scan must NOT promote ever_complete.
+			// A partial-finish scan must NOT promote ever_complete.
 			// Otherwise startup after restart would mark this state as warm.
 			expect(s.index.getEverComplete()).toBe(false);
 		} finally {
@@ -431,7 +453,7 @@ describe("scanVault — indexOne re-validates path before reading", () => {
 		s.index.setScanComplete(false);
 
 		const fooAbs = `${s.vaultRoot.absolute}/foo`;
-		mockLstatSymlinkFor((p) => p === fooAbs);
+		mockLstatType((p) => p === fooAbs, "symlink");
 
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		try {
@@ -458,7 +480,7 @@ describe("scanVault — indexOne re-validates path before reading", () => {
 		expect(s.index.getScanComplete()).toBe(true);
 
 		const fooAbs = `${s.vaultRoot.absolute}/foo`;
-		mockLstatSymlinkFor((p) => p === fooAbs);
+		mockLstatType((p) => p === fooAbs, "symlink");
 
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		try {
@@ -492,6 +514,9 @@ describe("scanVault — PATH_NOT_FOUND classification", () => {
 		// walk hits ENOENT → throws PathValidationError(PATH_NOT_FOUND).
 		const aMdAbs = `${s.vaultRoot.absolute}/a.md`;
 		mockLstatErrnoFor((p) => p === aMdAbs, "ENOENT");
+		// Prune now stat-confirms before removing rows; if the file is
+		// genuinely vanished, stat must also fail.
+		mockStatErrnoFor((p) => p === aMdAbs, "ENOENT");
 
 		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
 		// "vanished" outcome: a.md excluded from stillOnDisk → prune pass
@@ -534,7 +559,7 @@ describe("scanVault — PATH_NOT_FOUND classification", () => {
 
 		// Leaf swapped to symlink between scans → SYMLINK_SEGMENT.
 		const aMdAbs = `${s.vaultRoot.absolute}/a.md`;
-		mockLstatSymlinkFor((p) => p === aMdAbs);
+		mockLstatType((p) => p === aMdAbs, "symlink");
 
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		try {
@@ -543,10 +568,86 @@ describe("scanVault — PATH_NOT_FOUND classification", () => {
 			expect(s.index.listIndexedFiles()).toEqual(["a.md"]);
 			// failedFiles increments → scan_complete stays false (retry signal).
 			expect(s.index.getScanComplete()).toBe(false);
-			// Warm restart with per-file failure stays warm (round-17 contract).
+			// Warm restart with per-file failure stays warm: the prior
+			// snapshot still serves vault-wide reads while the failure
+			// retry signal lives on `scan_complete=false`.
 			expect(s.index.getStatus().state).toBe("warm");
 		} finally {
 			errSpy.mockRestore();
 		}
+	});
+});
+
+describe("pruneVanishedFiles regular-file gate", () => {
+	// `walkVault` only yields regular markdown files; if the on-disk
+	// entity at an indexed path becomes a directory, symlink, FIFO, etc.,
+	// a `stat()` that follows symlinks and doesn't gate on isFile would
+	// preserve the row even though direct-read tools now reject the path.
+	// `lstat()` + `!isFile()` closes the gap.
+
+	test("file replaced by directory at same path → row pruned", async () => {
+		const s = await setup({ "swap.md": "# Swap\n\nbody" });
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles()).toEqual(["swap.md"]);
+
+		// walkVault yields directories into the recursion, not the file
+		// emit — we filter the entry out so it's not enumerated, simulating
+		// the readdir step seeing it as a non-yielding entity. lstat reports
+		// the new on-disk type so the prune pass's `!isFile()` fires.
+		mockReaddirFilterEntry("swap.md");
+		const swapAbs = `${s.vaultRoot.absolute}/swap.md`;
+		mockLstatType((p) => p === swapAbs, "directory");
+
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles()).toEqual([]);
+	});
+
+	test("file replaced by symlink at same path → row pruned", async () => {
+		const s = await setup({ "swap.md": "# Swap\n\nbody" });
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles()).toEqual(["swap.md"]);
+
+		mockReaddirFilterEntry("swap.md");
+		const swapAbs = `${s.vaultRoot.absolute}/swap.md`;
+		mockLstatType((p) => p === swapAbs, "symlink");
+
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles()).toEqual([]);
+	});
+
+	test("counter — regular file at indexed path is preserved (watcher-race tolerance)", async () => {
+		// Mirror of N3: file IS still a regular markdown file but walkVault
+		// missed enumerating it (e.g., readdir filtered or scan races a
+		// concurrent write). lstat returns isFile=true → prune=false → row
+		// stays — the regular-file gate must NOT regress this guarantee.
+		const s = await setup({ "race.md": "# Race\n" });
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles()).toEqual(["race.md"]);
+
+		mockReaddirFilterEntry("race.md");
+		// No lstat mock — call-through to real fs returns isFile=true.
+
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles()).toEqual(["race.md"]);
+	});
+});
+
+describe("scanVault — N3 watcher-race prune defense", () => {
+	test("file on disk + indexed but missing from walkVault enumeration is preserved", async () => {
+		// Watcher-vs-scan race: watcher add-event lands in the index between
+		// walkVault's enumeration and the prune pass. The file is on disk +
+		// indexed but absent from `stillOnDisk`; the stat-check is the only
+		// thing keeping its row alive.
+		const s = await setup({ "a.md": "# A\n", "race.md": "# Race\n" });
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles().sort()).toEqual(["a.md", "race.md"]);
+
+		// Mock readdir to filter race.md out of the next walk → simulates the
+		// scan having missed the watcher-added file. stat(race.md) still
+		// succeeds (real fs), so the prune pass preserves the row.
+		mockReaddirFilterEntry("race.md");
+
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles().sort()).toEqual(["a.md", "race.md"]);
 	});
 });

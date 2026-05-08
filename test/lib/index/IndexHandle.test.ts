@@ -119,11 +119,11 @@ describe("replaceFile — round-trip", () => {
 		expect(index.isFileUnchanged({ file: "rs.md", mtime: 1000, size: 200 })).toBe(false);
 	});
 
-	test("isFileUnchanged false when stored size is NULL (v3 migration self-heal)", () => {
-		// Schema v3 ALTERs `fragments` to add `size`; existing rows have NULL
-		// until the next replaceFile populates them. NULL must force a re-
-		// index — otherwise upgraders would skip every file on next scan and
-		// keep stored size NULL forever.
+	test("isFileUnchanged false when stored size is NULL (self-heal channel)", () => {
+		// `fragments.size = NULL` is the runtime self-heal marker: any path
+		// (corruption-recovery rebuild, manual surgery) can NULL the size to
+		// force re-parse on next scan. NULL must return false here, otherwise
+		// the skip-path would silently keep stale rows past the marker.
 		index.replaceFile({
 			file: "legacy.md",
 			mtime: 1000,
@@ -257,6 +257,31 @@ describe("replaceFile — D32 retirement-diff", () => {
 			frontmatter: { created: null, updated: null, fields_json: "{}", tags: [] },
 		});
 		expect(historyRowCount(opened.db, "survivor.md")).toBe(0);
+	});
+});
+
+describe("removeFile — snapshot bump gate", () => {
+	test("never-indexed path is a no-op: snapshot + filesIndexed unchanged", () => {
+		// No-op writes must preserve `snapshot_mtime` so in-flight
+		// cursors stay valid.
+		const beforeSnap = index.getSnapshot();
+		const beforeCount = index.countFiles();
+		index.removeFile("never-indexed.png", Date.now());
+		expect(index.getSnapshot()).toBe(beforeSnap);
+		expect(index.countFiles()).toBe(beforeCount);
+	});
+
+	test("indexed path: snapshot bumps after removeFile", () => {
+		index.replaceFile({
+			file: "real.md",
+			mtime: 1000,
+			size: 100,
+			fragments: [headingRow({ stable_id: "h:1", heading_path: ["A"], heading_text: "A", structural_path: "h1[1]" })],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: [] },
+		});
+		const before = index.getSnapshot();
+		index.removeFile("real.md", Date.now());
+		expect(index.getSnapshot()).toBeGreaterThan(before);
 	});
 });
 
@@ -688,6 +713,135 @@ describe("searchFilterMode + reserved date COALESCE chain (UDF gate)", () => {
 		const filter = compileFilter({ date: { lt: "2024-05-01" } });
 		const rows = index.searchFilterMode({ scope: { kind: "vault" }, filter, pageSize: 10 });
 		expect(rows.map((r) => r.file)).toEqual(["bogus.md"]);
+	});
+});
+
+describe("pendingRetries — incremental write semantics + scanInProgress gate", () => {
+	test("addPendingRetry adds; hasPendingRetries reflects the size", () => {
+		expect(index.hasPendingRetries()).toBe(false);
+		index.addPendingRetry("a.md");
+		expect(index.hasPendingRetries()).toBe(true);
+		index.addPendingRetry("b.md");
+		expect(index.hasPendingRetries()).toBe(true);
+	});
+
+	test("clearPendingRetry while scanInProgress=true removes from set but does NOT fire markScanFinalized", () => {
+		// Gate keeps watcher recoveries from finalizing ahead of
+		// scanner's own end-of-scan if-check.
+		index.addPendingRetry("a.md");
+		index.setScanInProgress(true);
+		const drained = index.clearPendingRetry("a.md");
+		expect(drained).toBe(false);
+		expect(index.hasPendingRetries()).toBe(false);
+		expect(index.getScanComplete()).toBe(false);
+	});
+
+	test("clearPendingRetry while scanInProgress=false drains set AND fires markScanFinalized", () => {
+		index.setStatus("warming");
+		index.addPendingRetry("a.md");
+		index.setScanInProgress(false);
+		const drained = index.clearPendingRetry("a.md");
+		expect(drained).toBe(true);
+		expect(index.getScanComplete()).toBe(true);
+		expect(index.getStatus().state).toBe("warm");
+	});
+
+	test("post-release clearPendingRetry on a fresh entry finalizes", () => {
+		// A clear that happens while gated removes the entry but doesn't
+		// finalize. The next clear after the gate is released — even on a
+		// freshly-added entry — must finalize.
+		index.setStatus("warming");
+		index.addPendingRetry("a.md");
+		index.setScanInProgress(true);
+		expect(index.clearPendingRetry("a.md")).toBe(false);
+		index.setScanInProgress(false);
+		index.addPendingRetry("b.md");
+		expect(index.clearPendingRetry("b.md")).toBe(true);
+		expect(index.getScanComplete()).toBe(true);
+		expect(index.getStatus().state).toBe("warm");
+	});
+
+	test("clearPendingRetry blocked by failedSubtreesPresent gate", () => {
+		// Scenario: scan exited with failedSubtrees=non-empty +
+		// pendingRetries=non-empty → setStatus("warming") +
+		// setScanInProgress(false) + setFailedSubtreesPresent(true). A
+		// later watcher recovery on the last pending entry must NOT
+		// finalize because the failed subtree is still uncovered.
+		index.setStatus("warming");
+		index.addPendingRetry("bar.md");
+		index.setScanInProgress(false);
+		index.setFailedSubtreesPresent(true);
+
+		const drained = index.clearPendingRetry("bar.md");
+		expect(drained).toBe(false);
+		expect(index.hasPendingRetries()).toBe(false);
+		expect(index.getScanComplete()).toBe(false);
+		expect(index.getStatus().state).toBe("warming");
+	});
+
+	test("clearPendingRetry finalizes once failedSubtreesPresent flips to false", () => {
+		// After a clean follow-up scan that successfully enumerated the
+		// previously-failed subtree, the next watcher recovery should
+		// finalize.
+		index.setStatus("warming");
+		index.addPendingRetry("bar.md");
+		index.setScanInProgress(false);
+		index.setFailedSubtreesPresent(true);
+		expect(index.clearPendingRetry("bar.md")).toBe(false);
+
+		// Counter-case: gate releases. A fresh entry's clear must
+		// finalize since nothing else is blocking.
+		index.setFailedSubtreesPresent(false);
+		index.addPendingRetry("baz.md");
+		expect(index.clearPendingRetry("baz.md")).toBe(true);
+		expect(index.getScanComplete()).toBe(true);
+		expect(index.getStatus().state).toBe("warm");
+	});
+
+	test("clearPendingRetry blocked by scanIncomplete gate", () => {
+		// A scan that aborted before its end-of-scan check has an
+		// incomplete walk. Draining the last pendingRetry must not
+		// finalize `scan_complete=true` — that would advertise truncated
+		// data as warm on the next startup.
+		index.setStatus("warming");
+		index.addPendingRetry("bar.md");
+		index.setScanInProgress(false);
+		index.setFailedSubtreesPresent(false);
+		index.setScanIncomplete(true);
+
+		const drained = index.clearPendingRetry("bar.md");
+		expect(drained).toBe(false);
+		expect(index.hasPendingRetries()).toBe(false);
+		expect(index.getScanComplete()).toBe(false);
+		expect(index.getStatus().state).toBe("warming");
+	});
+
+	test("clearPendingRetry finalizes when scanIncomplete is false", () => {
+		index.setStatus("warming");
+		index.addPendingRetry("bar.md");
+		index.setScanInProgress(false);
+		index.setFailedSubtreesPresent(false);
+		index.setScanIncomplete(false);
+
+		expect(index.clearPendingRetry("bar.md")).toBe(true);
+		expect(index.getScanComplete()).toBe(true);
+		expect(index.getStatus().state).toBe("warm");
+	});
+
+	test("markScanFinalized self-clears scanIncomplete", () => {
+		// Merkle's clean-finish calls markScanFinalized directly. The
+		// flag must self-clear so a subsequent watcher-driven
+		// clearPendingRetry isn't blocked by stale residue.
+		index.setStatus("warming");
+		index.setScanIncomplete(true);
+		index.markScanFinalized();
+		expect(index.getScanComplete()).toBe(true);
+		expect(index.getStatus().state).toBe("warm");
+
+		index.addPendingRetry("baz.md");
+		index.setScanInProgress(false);
+		index.setFailedSubtreesPresent(false);
+		expect(index.clearPendingRetry("baz.md")).toBe(true);
 	});
 });
 

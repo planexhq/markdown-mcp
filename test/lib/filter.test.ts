@@ -427,7 +427,7 @@ describe("compileFilter — non-ISO range ops on custom fields", () => {
 	});
 });
 
-describe("compileFilter — typed-comparison guards on custom fields (round 20)", () => {
+describe("compileFilter — typed-comparison guards on custom fields", () => {
 	// Without these guards SQLite's heterogeneous storage-class lex order
 	// (TEXT > INTEGER) lets stringy frontmatter values satisfy numeric
 	// ranges, and raw frontmatter date typos lex-pass canonical ISO bounds.

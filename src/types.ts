@@ -209,10 +209,10 @@ export interface VaultTreeItem {
 }
 
 export interface GetVaultTreeInput {
-	path?: string;
-	depth?: number;
-	cursor?: string;
-	pageSize?: number;
+	path?: string | undefined;
+	depth?: number | undefined;
+	cursor?: string | undefined;
+	pageSize?: number | undefined;
 }
 
 export interface GetVaultTreeResult {
@@ -245,6 +245,14 @@ export interface OutlineNode {
 export interface BlockIndexEntry {
 	range: Range;
 	heading_path: string[];
+	/**
+	 * stable_id of the containing heading, or null if the block sits in
+	 * preamble (no enclosing heading). D27 stable_ids encode structural
+	 * slot, so duplicate-heading files (`# A ... # A`) get distinct ids
+	 * — without this field, narrowing-by-stable_id mis-attributes block
+	 * links to the first match by heading_path.
+	 */
+	containing_stable_id: string | null;
 }
 
 export interface GetFileOutlineInput {
@@ -462,7 +470,7 @@ export interface GetMetadataResult {
 	has_frontmatter: boolean;
 }
 
-// ─── Links (Brief lines 312–372, D34 + round-9 cursor rename) ──────────────
+// ─── Links (Brief lines 312–372, D34) ──────────────────────────────────────
 
 export type LinkDirection = "in" | "out" | "both";
 
@@ -501,11 +509,11 @@ export interface ResolvedAnchor {
 
 export interface GetLinksInput {
 	file: string;
-	direction?: LinkDirection;
-	heading_path?: string | string[];
-	stable_id?: string;
-	cursor?: string;
-	pageSize?: number;
+	direction?: LinkDirection | undefined;
+	heading_path?: string | string[] | undefined;
+	stable_id?: string | undefined;
+	cursor?: string | undefined;
+	pageSize?: number | undefined;
 }
 
 export interface GetLinksResult {

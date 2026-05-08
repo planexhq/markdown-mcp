@@ -2,28 +2,19 @@
  * `get_fragment` — heading / block / preamble / file resolution per
  * Brief lines 92–204 + D29 (discriminated union over `anchor_kind`).
  *
- * W2 scope:
- *   - `stable_id` lookup: in-memory only against parsed.headings. Stale
- *     `stable_id` returns `HEADING_NOT_FOUND` directly with empty
- *     `candidates` (CLAUDE.md gotcha + plan W2 round 8) — durable
- *     fuzzy recovery via `heading_history` lands W3.
- *   - `anchor: { kind: "heading_path", path }`: array OR string ("A > B")
- *     accepted; ambiguity → `HEADING_AMBIGUOUS` with all candidates.
- *   - `anchor: { kind: "block", id }`: in-memory blockIndex lookup;
- *     missing id → `HEADING_NOT_FOUND` (no separate BLOCK_NOT_FOUND code
- *     in the v1 ErrorCode union, by design — same disambiguation surface).
- *   - `anchor: { kind: "file" }`: whole file minus frontmatter.
- *   - `expand_embeds` is accepted but a no-op — wikilink/embed resolution
- *     is W4. Embeds are populated with `resolved: false`, `expanded: false`.
+ * Outgoing wikilinks resolve against the vault index (Obsidian three-
+ * phase). When `index` is provided, `OutgoingLink` and `Embed` rows
+ * carry `resolved`, `target_file?`, `target_heading_path?`,
+ * `target_block_id?`, and `candidates?`.
  *
- * Outgoing-link / embed extraction is regex-on-content in W2; targets are
- * UNRESOLVED (`resolved: false`, no `target_file`). W4 will replace the
- * extractor with the real Obsidian three-phase resolver.
+ * `expand_embeds` triggers recursive expansion (cycle-detected,
+ * depth-capped at 10) into `Embed.expanded_content` / `expansion_error`.
+ * `bodyTokensApprox` is NOT changed by expansion (D11 — counts source
+ * body, not expanded).
  */
 
-import { extname } from "node:path";
-
-import { type ExcludedRange, isInsideAny } from "../lib/blockIds.js";
+import { stripBlockIdMarker } from "../lib/blockIds.js";
+import { type EmbedExpansionContext, expandEmbed, makeFragmentCycleKey } from "../lib/embeds.js";
 import {
 	headingAmbiguousEnvelope,
 	headingNotFoundEnvelope,
@@ -35,14 +26,30 @@ import {
 } from "../lib/error.js";
 import { FUZZY_ALGORITHM_ID, type HeadingHistoryRow, recoverStaleStableId } from "../lib/fuzzy.js";
 import type { IndexHandle } from "../lib/index/IndexHandle.js";
-import { type BlockMeta, type HeadingMeta, normalizeHeadingText, type ParsedFile } from "../lib/parser.js";
+import { isReadyForIndexLookup } from "../lib/index_status.js";
+import {
+	type BlockMeta,
+	fileBodyStartOffset,
+	type HeadingMeta,
+	headingPathsEqual,
+	normalizeHeadingPath,
+	type ParsedFile,
+} from "../lib/parser.js";
 import { readNote } from "../lib/readNote.js";
 import { estimateTokens, getTokenizerId } from "../lib/tokenizer.js";
 import { type VaultRoot, validatePath } from "../lib/validatePath.js";
+import {
+	buildEmbed,
+	buildOutgoingLink,
+	extractWikilinks,
+	type ResolvedWikilink,
+	resolveWikilink,
+	type VaultFileIndex,
+} from "../lib/wikilinks.js";
 import type {
 	BlockFragment,
 	Embed,
-	EmbedKind,
+	ExpandEmbedsOption,
 	FileFragment,
 	FragmentResult,
 	GetFragmentInput,
@@ -53,6 +60,8 @@ import type {
 	PreambleFragment,
 } from "../types.js";
 import { routeToolError } from "./routeError.js";
+
+const MAX_EMBED_DEPTH = 10;
 
 export async function handleGetFragment(
 	input: GetFragmentInput,
@@ -65,6 +74,15 @@ export async function handleGetFragment(
 	try {
 		const safePath = await validatePath(input.file, vaultRoot);
 		const { parsed } = await readNote(safePath);
+		// Defer link resolution and embed expansion until the index has a
+		// usable snapshot — pre-warm, basename/heading maps are a strict
+		// subset of the eventual vault, so `[[foo]]` can resolve uniquely
+		// against the only-so-far-seen `notes/foo.md` even when a later
+		// `archive/foo.md` would have made it ambiguous. Bounded reads
+		// (heading/block/preamble/file body, frontmatter) still work
+		// because they're parsed on demand. The agent sees
+		// `index_status.state` in `_meta` and can re-query when warm.
+		const vaultIndex = index && isReadyForIndexLookup(index.getStatus().state) ? index : undefined;
 
 		// 1. stable_id wins per Brief line 116 ("the precise identifier").
 		if (input.stable_id) {
@@ -80,11 +98,13 @@ export async function handleGetFragment(
 			// cached pre-swap id from a fresh post-swap id.
 			const heading = parsed.headings.find((h) => h.stable_id === normalized);
 			if (heading) {
-				return successEnvelope(buildHeadingFragment(heading, parsed, "fresh"), meta);
+				const fragment = buildHeadingFragment(heading, parsed, "fresh", vaultIndex);
+				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+				return successEnvelope(fragment, meta);
 			}
 			const history = index?.getHistoryRow(safePath.relative, normalized) ?? null;
 			if (history !== null) {
-				return resolveStaleStableId(history, parsed, input.stable_id, meta);
+				return resolveStaleStableId(history, parsed, input.stable_id, meta, vaultRoot, vaultIndex, input.expand_embeds);
 			}
 			return headingNotFoundEnvelope(
 				{
@@ -101,15 +121,20 @@ export async function handleGetFragment(
 
 		// 2. Dispatch on anchor.kind.
 		switch (input.anchor.kind) {
-			case "file":
-				return successEnvelope(buildFileFragment(parsed), meta);
+			case "file": {
+				const fragment = buildFileFragment(parsed, vaultIndex);
+				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+				return successEnvelope(fragment, meta);
+			}
 
 			case "heading_path": {
 				const path = normalizeHeadingPath(input.anchor.path);
 				if (path.length === 0) {
-					return successEnvelope(buildPreambleFragment(parsed), meta);
+					const fragment = buildPreambleFragment(parsed, vaultIndex);
+					await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+					return successEnvelope(fragment, meta);
 				}
-				const matches = parsed.headings.filter((h) => arraysEqual(h.headingPath, path));
+				const matches = parsed.headings.filter((h) => headingPathsEqual(h.headingPath, path));
 				if (matches.length === 0) {
 					return headingNotFoundEnvelope(
 						{
@@ -144,7 +169,9 @@ export async function handleGetFragment(
 						meta,
 					);
 				}
-				return successEnvelope(buildHeadingFragment(heading, parsed, "fresh"), meta);
+				const fragment = buildHeadingFragment(heading, parsed, "fresh", vaultIndex);
+				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+				return successEnvelope(fragment, meta);
 			}
 
 			case "block": {
@@ -162,7 +189,9 @@ export async function handleGetFragment(
 						meta,
 					);
 				}
-				return successEnvelope(buildBlockFragment(block, parsed), meta);
+				const fragment = buildBlockFragment(block, parsed, vaultIndex);
+				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+				return successEnvelope(fragment, meta);
 			}
 		}
 	} catch (err) {
@@ -171,10 +200,9 @@ export async function handleGetFragment(
 }
 
 /**
- * Shared stale-`stable_id` recovery routing — used both when the cached
- * ID is missing from current `parsed.headings` (D32 + round-9
- * confidence-gate) AND when it resolves but `heading_history` shows the
- * slot was reused for a different heading (D32 reused-stable_id rule).
+ * Shared stale-`stable_id` recovery routing — used when the cached
+ * ID is missing from current `parsed.headings` (D32 confidence-gated
+ * fuzzy resolver).
  *
  * Fires `recoverStaleStableId` against the existing history row, then
  * either:
@@ -187,12 +215,15 @@ export async function handleGetFragment(
  * Always stamps `_meta.fuzzy_algorithm` so callers can distinguish a
  * fuzzy-resolved response from a fresh-success response.
  */
-function resolveStaleStableId(
+async function resolveStaleStableId(
 	history: HeadingHistoryRow,
 	parsed: ParsedFile,
 	requestedStableId: string,
 	meta: MetaEnvelope,
-): ToolSuccessEnvelope<FragmentResult> | ToolErrorEnvelope {
+	vaultRoot: VaultRoot,
+	vaultIndex: VaultFileIndex | undefined,
+	expandEmbedsOpt: ExpandEmbedsOption | undefined,
+): Promise<ToolSuccessEnvelope<FragmentResult> | ToolErrorEnvelope> {
 	const recovery = recoverStaleStableId({ history, currentHeadings: parsed.headings });
 	const candidates = recovery.others.map((c) => ({
 		stable_id: c.heading.stable_id,
@@ -201,9 +232,10 @@ function resolveStaleStableId(
 	}));
 	const fuzzyMeta = { ...meta, fuzzy_algorithm: FUZZY_ALGORITHM_ID };
 	if (recovery.primary !== null) {
-		const fragment = buildHeadingFragment(recovery.primary.heading, parsed, "stale");
+		const fragment = buildHeadingFragment(recovery.primary.heading, parsed, "stale", vaultIndex);
 		fragment.requested_stable_id = requestedStableId;
 		if (candidates.length > 0) fragment.fuzzy_candidates = candidates;
+		await maybeExpandEmbeds(fragment, expandEmbedsOpt, vaultRoot, vaultIndex);
 		return successEnvelope(fragment, fuzzyMeta);
 	}
 	return headingNotFoundEnvelope(
@@ -221,9 +253,19 @@ function resolveStaleStableId(
 
 // ─── Fragment builders ────────────────────────────────────────────────────
 
-function buildHeadingFragment(heading: HeadingMeta, parsed: ParsedFile, status: "fresh" | "stale"): HeadingFragment {
+function buildHeadingFragment(
+	heading: HeadingMeta,
+	parsed: ParsedFile,
+	status: "fresh" | "stale",
+	vaultIndex: VaultFileIndex | undefined,
+): HeadingFragment {
 	const content = parsed.source.slice(heading.offsetRange.start, heading.offsetRange.end);
-	const { outgoing, embeds } = extractWikilinks(content, heading.offsetRange.start, parsed.excludedRanges);
+	const { outgoing, embeds } = buildLinksAndEmbeds(
+		parsed,
+		heading.offsetRange.start,
+		heading.offsetRange.end,
+		vaultIndex,
+	);
 	return {
 		anchor_kind: "heading",
 		file: parsed.relpath,
@@ -239,12 +281,11 @@ function buildHeadingFragment(heading: HeadingMeta, parsed: ParsedFile, status: 
 	};
 }
 
-function buildPreambleFragment(parsed: ParsedFile): PreambleFragment {
-	const content = parsed.preamble
-		? parsed.source.slice(parsed.preamble.offsetRange.start, parsed.preamble.offsetRange.end)
-		: "";
-	const sliceStart = parsed.preamble?.offsetRange.start ?? 0;
-	const { outgoing, embeds } = extractWikilinks(content, sliceStart, parsed.excludedRanges);
+function buildPreambleFragment(parsed: ParsedFile, vaultIndex: VaultFileIndex | undefined): PreambleFragment {
+	const start = parsed.preamble?.offsetRange.start ?? 0;
+	const end = parsed.preamble?.offsetRange.end ?? 0;
+	const content = parsed.preamble ? parsed.source.slice(start, end) : "";
+	const { outgoing, embeds } = buildLinksAndEmbeds(parsed, start, end, vaultIndex);
 	return {
 		anchor_kind: "preamble",
 		file: parsed.relpath,
@@ -255,7 +296,11 @@ function buildPreambleFragment(parsed: ParsedFile): PreambleFragment {
 	};
 }
 
-function buildBlockFragment(block: BlockMeta, parsed: ParsedFile): BlockFragment {
+function buildBlockFragment(
+	block: BlockMeta,
+	parsed: ParsedFile,
+	vaultIndex: VaultFileIndex | undefined,
+): BlockFragment {
 	const raw = parsed.source.slice(block.offsetRange.start, block.offsetRange.end);
 	// Extract wikilinks from `raw` BEFORE stripping the marker — the strip
 	// can excise chars mid-`raw` (nested-list parent: ` ^p` between the
@@ -264,16 +309,8 @@ function buildBlockFragment(block: BlockMeta, parsed: ParsedFile): BlockFragment
 	// offsets) and leak code-span wikilinks in child items as graph edges.
 	// Marker text is `[a-zA-Z0-9-]+` so the wikilink regex matches nothing
 	// inside `^${id}` — running over `raw` is safe.
-	const { outgoing, embeds } = extractWikilinks(raw, block.offsetRange.start, parsed.excludedRanges);
-	// Strip the addressing marker for display. The `(?:^|[ \t])` prefix
-	// avoids matching `^2` in `Value x^2` (no preceding whitespace, not a
-	// block ID per BLOCK_ID_RE) and consuming the leading space avoids a
-	// dangling trailer before the newline in the nested-list case.
-	// Known edge: deferred-form addressing where literal `^${id}` text
-	// appears at an internal line-end of `raw` strips the literal. Fix
-	// would thread the parser-accepted match offset through BlockMeta.
-	const trimRe = new RegExp(String.raw`(?:^|[ \t])\^${block.id}\s*$`, "m");
-	const content = raw.replace(trimRe, "").trimEnd();
+	const { outgoing, embeds } = buildLinksAndEmbeds(parsed, block.offsetRange.start, block.offsetRange.end, vaultIndex);
+	const content = stripBlockIdMarker(raw, block.id);
 	const result: BlockFragment = {
 		anchor_kind: "block",
 		file: parsed.relpath,
@@ -290,21 +327,12 @@ function buildBlockFragment(block: BlockMeta, parsed: ParsedFile): BlockFragment
 	return result;
 }
 
-function buildFileFragment(parsed: ParsedFile): FileFragment {
+function buildFileFragment(parsed: ParsedFile, vaultIndex: VaultFileIndex | undefined): FileFragment {
 	// File fragment excludes frontmatter (Brief decision matrix line 785).
-	// Fallback chain: preamble offset (when present) → first heading start
-	// (skips a whitespace-only gap between frontmatter and heading, e.g.
-	// `---\n...\n---\n\n# H\n`) → first block start → raw frontmatter end
-	// for the truly empty / frontmatter-only case. Plain `preamble ??
-	// frontmatterEndOffset` would emit a stray leading `\n` on
-	// frontmatter+blank+heading files.
-	const start =
-		parsed.preamble?.offsetRange.start ??
-		parsed.headings[0]?.offsetRange.start ??
-		parsed.blocks[0]?.offsetRange.start ??
-		parsed.frontmatterEndOffset;
+	const start = fileBodyStartOffset(parsed);
 	const content = parsed.source.slice(start);
-	const { outgoing, embeds } = extractWikilinks(content, start, parsed.excludedRanges);
+	const end = parsed.source.length;
+	const { outgoing, embeds } = buildLinksAndEmbeds(parsed, start, end, vaultIndex);
 	return {
 		anchor_kind: "file",
 		file: parsed.relpath,
@@ -315,101 +343,94 @@ function buildFileFragment(parsed: ParsedFile): FileFragment {
 	};
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────
+// ─── Outgoing + embed extraction/resolution helper ────────────────────────
 
-function normalizeHeadingPath(path: string | string[]): string[] {
-	const components = typeof path === "string" ? path.split(/\s*>\s*/) : path;
-	return components.map(normalizeHeadingText).filter((s) => s.length > 0);
-}
-
-function arraysEqual(a: string[], b: string[]): boolean {
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-	return true;
-}
-
-const WIKILINK_RE = /(!)?\[\[([^\]\n]+)\]\]/g;
-
-interface WikilinkExtraction {
-	outgoing: OutgoingLink[];
-	embeds: Embed[];
-}
-
-/**
- * Single-pass wikilink scan: one regex iteration produces both outgoing
- * links and embeds. Keeps `link_ordinal` consistent across calls and
- * avoids two full-content scans per fragment.
- *
- * Matches whose absolute offset (`sliceStart + match.index`) falls inside
- * a `code` / `inlineCode` range are skipped — Obsidian doesn't resolve
- * wikilinks in code, so emitting them creates phantom graph edges.
- */
-function extractWikilinks(
-	content: string,
-	sliceStart: number,
-	excludedRanges: ReadonlyArray<ExcludedRange>,
-): WikilinkExtraction {
+function buildLinksAndEmbeds(
+	parsed: ParsedFile,
+	start: number,
+	end: number,
+	vaultIndex: VaultFileIndex | undefined,
+): { outgoing: OutgoingLink[]; embeds: Embed[] } {
+	const slice = parsed.source.slice(start, end);
+	const extracted = extractWikilinks({
+		source: slice,
+		sliceStart: start,
+		excludedRanges: parsed.excludedRanges,
+	});
 	const outgoing: OutgoingLink[] = [];
 	const embeds: Embed[] = [];
-	let ord = 0;
-	for (const m of content.matchAll(WIKILINK_RE)) {
-		if (m.index === undefined) continue;
-		if (isInsideAny(sliceStart + m.index, excludedRanges)) continue;
-		// CommonMark §2.4 backslash-escape: an odd count of backslashes
-		// immediately before the match escapes its first character (`!` or `[`),
-		// rendering the wikilink syntax inert. Obsidian honors the same rule.
-		// Even count is a literal `\` followed by an unescaped match. Without
-		// this filter `\[[NoLink]]` emits a phantom link AND shifts every
-		// subsequent `link_ordinal` (breaks `get_links` cursor stability).
-		if (isBackslashEscaped(content, m.index)) continue;
-		const raw = m[2] ?? "";
-		const pipeIdx = raw.indexOf("|");
-		const target = pipeIdx >= 0 ? raw.slice(0, pipeIdx) : raw;
-		const alias = pipeIdx >= 0 ? raw.slice(pipeIdx + 1) : undefined;
-		if (m[1]) {
-			embeds.push({
-				raw_target: raw,
-				kind: guessEmbedKind(target),
-				resolved: false,
-				expanded: false,
-			});
-			continue;
-		}
-		ord++;
-		const link: OutgoingLink = {
-			raw_target: target,
-			link_text: alias ?? target,
-			resolved: false,
-			link_ordinal: ord,
-		};
-		if (alias !== undefined) link.alias = alias;
-		outgoing.push(link);
+	for (const e of extracted) {
+		const resolved: ResolvedWikilink = vaultIndex
+			? resolveWikilink(e.rawTarget, parsed.relpath, vaultIndex)
+			: { rawTarget: e.rawTarget, resolved: false };
+		if (e.isEmbed) embeds.push(buildEmbed(e, resolved));
+		else outgoing.push(buildOutgoingLink(e, resolved));
 	}
 	return { outgoing, embeds };
 }
 
-function isBackslashEscaped(content: string, idx: number): boolean {
-	let count = 0;
-	let i = idx - 1;
-	while (i >= 0 && content[i] === "\\") {
-		count++;
-		i--;
+// ─── Embed expansion ──────────────────────────────────────────────────────
+
+function computeMaxDepth(opt: ExpandEmbedsOption | undefined): number {
+	if (opt === true) return MAX_EMBED_DEPTH;
+	if (opt && typeof opt === "object") {
+		const requested = opt.max_depth ?? MAX_EMBED_DEPTH;
+		return Math.min(Math.max(1, requested), MAX_EMBED_DEPTH);
 	}
-	return count % 2 === 1;
+	return 0;
 }
 
-const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "svg", "webp"]);
-const MEDIA_EXTS = new Set(["mp3", "mp4", "mov", "webm", "wav", "m4a", "ogg"]);
+/**
+ * Walk `fragment.embeds` and expand each. Mutates the embed objects in
+ * place: sets `expanded`, `expanded_content`, and `expansion_error`. No-op
+ * when `maxDepth === 0` (i.e., `expand_embeds` was `false` / `undefined`)
+ * or when `vaultIndex === undefined`.
+ *
+ * Loader is memoized per call so cycle-detected re-visits are cheap.
+ */
+async function maybeExpandEmbeds(
+	fragment: FragmentResult,
+	opt: ExpandEmbedsOption | undefined,
+	vaultRoot: VaultRoot,
+	vaultIndex: VaultFileIndex | undefined,
+): Promise<void> {
+	const maxDepth = computeMaxDepth(opt);
+	if (maxDepth <= 0 || !vaultIndex) return;
+	if (fragment.embeds.length === 0) return;
 
-function guessEmbedKind(target: string): EmbedKind {
-	// Strip Obsidian fragment (`#page=2`, `#t=10`, `#Section`) before extname:
-	// `extname("paper.pdf#page=2")` is `.pdf#page=2`, mis-classifying as note.
-	const hashIdx = target.indexOf("#");
-	const path = hashIdx >= 0 ? target.slice(0, hashIdx) : target;
-	const ext = extname(path).slice(1).toLowerCase();
-	if (ext === "") return "note";
-	if (IMAGE_EXTS.has(ext)) return "image";
-	if (ext === "pdf") return "pdf";
-	if (MEDIA_EXTS.has(ext)) return "media";
-	return "note";
+	const fileCache = new Map<string, ParsedFile | null>();
+	const loadFile = async (relpath: string): Promise<ParsedFile | null> => {
+		if (fileCache.has(relpath)) return fileCache.get(relpath) ?? null;
+		try {
+			const safePath = await validatePath(relpath, vaultRoot);
+			const note = await readNote(safePath);
+			fileCache.set(relpath, note.parsed);
+			return note.parsed;
+		} catch {
+			fileCache.set(relpath, null);
+			return null;
+		}
+	};
+	const ctx: EmbedExpansionContext = {
+		vaultIndex,
+		vaultRoot,
+		loadFile,
+		// Seed `visited` with the host fragment so `a → b → a` is detected
+		// at the second `a` rather than one level deeper. An empty seed
+		// would let b's `![[a]]` re-expand the host body inside b's
+		// content, with the cycle tripping only at the next `b` reference.
+		visited: new Set<string>([makeFragmentCycleKey(fragment)]),
+		maxDepth,
+	};
+
+	for (const embed of fragment.embeds) {
+		// Re-resolve to recover the internal `headingResolutionFailed` flag
+		// (not on the persisted `Embed`); without it `![[note#missing]]`
+		// falls through to whole-file expansion.
+		const resolved = resolveWikilink(embed.raw_target, fragment.file, vaultIndex);
+		const result = await expandEmbed(resolved, fragment.file, ctx, 1);
+		embed.expanded = result.expanded;
+		if (result.expanded_content !== undefined) embed.expanded_content = result.expanded_content;
+		if (result.expansion_error !== undefined) embed.expansion_error = result.expansion_error;
+	}
 }

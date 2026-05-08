@@ -11,7 +11,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { TOKENIZER_HEURISTIC } from "../../src/lib/tokenizer.js";
 import type { MetaEnvelope, SearchOutput, VaultError } from "../../src/types.js";
-import { spawnTestServer, type TestClient } from "../helpers/mcp-client.js";
+import { spawnTestServer, type TestClient, waitForWarm } from "../helpers/mcp-client.js";
 import { createTempVault, DEFAULT_VAULT_STRUCTURE, type VaultStructure } from "../helpers/vault.js";
 
 const SEARCH_FIXTURE: VaultStructure = {
@@ -47,10 +47,10 @@ const SEARCH_FIXTURE: VaultStructure = {
 	// `json_type` guard.
 	"priority-text.md": "---\npriority: low\n---\n\n# Text Priority\n\nbody\n",
 	// Code-only section: scanner.extractFtsTexts strips the fenced block from
-	// the `body` column and routes it to `code`. Round-19 snippet builder
-	// must fall back to `code` so a query that hits the code column
-	// produces a non-empty snippet.
-	"code-only.md": "---\ntags: [round19-code-only]\n---\n\n# Setup\n\n```bash\nnpm install vaultcli\n```\n",
+	// the `body` column and routes it to `code`. The snippet builder must
+	// fall back to `code` so a query that hits the code column produces a
+	// non-empty snippet.
+	"code-only.md": "---\ntags: [code-only-fixture]\n---\n\n# Setup\n\n```bash\nnpm install vaultcli\n```\n",
 };
 
 let vault: { path: string; cleanup: () => Promise<void> };
@@ -59,16 +59,7 @@ let conn: TestClient;
 beforeAll(async () => {
 	vault = await createTempVault({ ...DEFAULT_VAULT_STRUCTURE, ...SEARCH_FIXTURE });
 	conn = await spawnTestServer(vault.path);
-	// Server warm-up: with W3 the scanner runs on cold start. Poll until
-	// the index reaches `warm` so the test corpus is fully populated. The
-	// `cold → warming → warm` transition can pass through `warming`
-	// briefly with partial counts; tests need the final count.
-	for (let i = 0; i < 100; i++) {
-		const r = await conn.client.callTool({ name: "search", arguments: { query: "x" } });
-		const meta = r._meta as MetaEnvelope | undefined;
-		if (meta?.index_status?.state === "warm") break;
-		await new Promise((resolve) => setTimeout(resolve, 100));
-	}
+	await waitForWarm(conn.client);
 }, 30_000);
 
 afterAll(async () => {
@@ -106,13 +97,14 @@ describe("search — query mode (D33)", () => {
 		expect(meta.snippet_algorithm).toBe("bm25-fragment-v1");
 	});
 
-	test("prefix query highlights stem-extended body match in snippet (round 21)", async () => {
+	test("prefix query highlights stem-extended body match in snippet", async () => {
 		// oauth.md body: "OAuth2 setup. Authentication via tokens."
-		// FTS5 prefix `auth*` matches via stem("authentication")="authent",
-		// but the snippet's exact-stem set lookup pre-fix found stem("auth")
-		// vs stem("authentication") differ → snippet fell back to first 200
-		// chars without highlighting. Round-21 carries the `*` marker
-		// through `outcome.tokens` and switches the matcher to prefix-stem.
+		// FTS5 prefix `auth*` matches via stem("authentication")="authent";
+		// the snippet's exact-stem set lookup compares stem("auth") to
+		// stem("authentication"), which differ — without prefix-stem
+		// matching the snippet falls back to first 200 chars without
+		// highlighting. The sanitizer carries the `*` marker through
+		// `outcome.tokens` so the matcher can switch to prefix-stem.
 		const r = await callSearch({ query: "auth*" });
 		expect(r.isError).toBeFalsy();
 		const out = r.structuredContent as SearchOutput;
@@ -121,7 +113,7 @@ describe("search — query mode (D33)", () => {
 		expect(oauth?.snippet).toContain("**Authentication**");
 	});
 
-	test("code-only section: query that hits the code column → snippet from code (round 19)", async () => {
+	test("code-only section: query that hits the code column → snippet from code", async () => {
 		const r = await callSearch({ query: "vaultcli" });
 		expect(r.isError).toBeFalsy();
 		const out = r.structuredContent as SearchOutput;
@@ -130,8 +122,8 @@ describe("search — query mode (D33)", () => {
 		expect(item?.snippet).toContain("vaultcli");
 	});
 
-	test("filter-only mode: code-only section → preview from code (round 19)", async () => {
-		const r = await callSearch({ query: "", filters: { tags: { has: "round19-code-only" } } });
+	test("filter-only mode: code-only section → preview from code", async () => {
+		const r = await callSearch({ query: "", filters: { tags: { has: "code-only-fixture" } } });
 		expect(r.isError).toBeFalsy();
 		const out = r.structuredContent as SearchOutput;
 		const item = out.items.find((i) => i.file === "code-only.md");
@@ -332,7 +324,7 @@ describe("search — fields[name] custom date range", () => {
 	});
 
 	test("custom date gte still matches canonical stored value", async () => {
-		// Regression on the round-9 normalization contract:
+		// Regression on the index-time normalization contract:
 		// due-task.md's `due: 2024-06-01` is stored as `2024-06-01T00:00:00Z`,
 		// which the UDF accepts and the lex-compare matches.
 		const r = await callSearch({ query: "", filters: { fields: { due: { gte: "2024-01-01" } } } });
@@ -344,8 +336,9 @@ describe("search — fields[name] custom date range", () => {
 
 describe("search — fields[tag] scalar/array dispatch", () => {
 	test("has on scalar string field matches that file", async () => {
-		// Regression: pre-fix, json_each on the bare SQL text returned by
-		// json_extract raised "malformed JSON" and the whole query failed.
+		// Regression: passing the bare SQL text returned by json_extract
+		// to json_each raises "malformed JSON" — the value is a SQL string,
+		// not a JSON document, so json_each must be skipped for scalars.
 		const r = await callSearch({ query: "", filters: { fields: { aliases: { has: "foo" } } } });
 		expect(r.isError).toBeFalsy();
 		const out = r.structuredContent as SearchOutput;

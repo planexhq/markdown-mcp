@@ -16,7 +16,7 @@
 import { randomUUID } from "node:crypto";
 import type { ErrorCode, HeadingCandidate, IndexStatus, MetaEnvelope, VaultError } from "../types.js";
 import { MAX_FILE_BYTES } from "./limits.js";
-import type { ParseErrorReason } from "./parser.js";
+import type { ParseError } from "./parser.js";
 
 /**
  * Generate a fresh server-side request ID. Always UUID v4 per D13.
@@ -42,6 +42,17 @@ export function getErrnoCode(err: unknown): string | undefined {
 	if (typeof err !== "object" || err === null) return undefined;
 	const code = (err as { code?: unknown }).code;
 	return typeof code === "string" ? code : undefined;
+}
+
+/**
+ * `true` iff the error is a `lstat`/`stat`/`open` errno indicating the
+ * path genuinely vanished (ENOENT) or a path component is not a
+ * directory (ENOTDIR). Other errno (EACCES, EMFILE, EIO, …) are
+ * transient blips and must not be treated as vanish.
+ */
+export function isVanishedErrno(err: unknown): boolean {
+	const code = getErrnoCode(err);
+	return code === "ENOENT" || code === "ENOTDIR";
 }
 
 /**
@@ -176,7 +187,38 @@ export function internalErrorEnvelope(
 	return toolErrorEnvelope(err, meta);
 }
 
+/**
+ * Shared INDEX_WARMING envelope — vault-wide tools (`search`, `get_links`,
+ * `get_vault_tree`) all return this shape when the persisted index is not
+ * usable yet (cold/warming). The progress payload's `phase` is hardcoded
+ * `"scanning"` because finer-grained phases (parsing / fts_populating) are
+ * not currently surfaced by the scanner. `files_total_estimate` mirrors
+ * `files_indexed` for the same reason.
+ */
+export function indexWarmingEnvelope(
+	meta: MetaEnvelope,
+	options: { filesIndexed: number; message: string; suggestion: string },
+): ToolErrorEnvelope {
+	const err = vaultError("INDEX_WARMING", options.message, {
+		retry_after_ms: 1000,
+		request_id: meta.request_id,
+		progress: {
+			files_indexed: options.filesIndexed,
+			files_total_estimate: options.filesIndexed,
+			phase: "scanning",
+		},
+		suggestion: options.suggestion,
+	});
+	return toolErrorEnvelope(err, meta);
+}
+
 // ─── W2 envelope builders ─────────────────────────────────────────────────
+
+/** Additional content blocks the SDK accepts on a `CallToolResult`. */
+export type ExtraContentBlock =
+	| { type: "resource_link"; uri: string; name: string; mimeType?: string; description?: string }
+	| { type: "image"; data: string; mimeType: string }
+	| { type: "audio"; data: string; mimeType: string };
 
 /**
  * Shape of a CallToolResult success envelope. Mirrors {@link ToolErrorEnvelope}
@@ -191,7 +233,7 @@ export function internalErrorEnvelope(
  */
 export interface ToolSuccessEnvelope<T> {
 	[extra: string]: unknown;
-	content: Array<{ type: "text"; text: string }>;
+	content: Array<{ type: "text"; text: string } | ExtraContentBlock>;
 	structuredContent: T & Record<string, unknown>;
 	_meta: MetaEnvelope;
 }
@@ -199,11 +241,21 @@ export interface ToolSuccessEnvelope<T> {
 /**
  * Wrap a typed payload + meta envelope as a successful tool result. The
  * `content[0].text` mirrors `structuredContent` as JSON for clients that
- * don't read structured content.
+ * don't read structured content. Optional `extraBlocks` are appended
+ * after the JSON block — used by `get_vault_tree` to emit
+ * `resource_link` blocks for markdown items.
  */
-export function successEnvelope<T extends object>(structuredContent: T, meta: MetaEnvelope): ToolSuccessEnvelope<T> {
+export function successEnvelope<T extends object>(
+	structuredContent: T,
+	meta: MetaEnvelope,
+	extraBlocks?: ReadonlyArray<ExtraContentBlock>,
+): ToolSuccessEnvelope<T> {
+	const content: ToolSuccessEnvelope<T>["content"] = [
+		{ type: "text", text: JSON.stringify(structuredContent, null, 2) },
+		...(extraBlocks ?? []),
+	];
 	return {
-		content: [{ type: "text", text: JSON.stringify(structuredContent, null, 2) }],
+		content,
 		structuredContent: structuredContent as T & Record<string, unknown>,
 		_meta: meta,
 	};
@@ -230,41 +282,39 @@ export function fileTooLargeEnvelope(
 }
 
 /**
- * `MARKDOWN_PARSE_ERROR` with reason routing per CLAUDE.md hard-cap rules.
+ * `MARKDOWN_PARSE_ERROR` payload from a `ParseError` instance — shared
+ * between Tool surface (`routeError.ts`) and Resource surface
+ * (`server.ts` `note://`) so both report identical `{reason, line?,
+ * column?}` for the same parser failure. `messagePrefix` lets the
+ * Resource side prepend `"note:// parse failed: "` to disambiguate.
  */
-export function markdownParseErrorEnvelope(
+export function markdownParseErrorPayload(
+	err: ParseError,
 	param: string,
-	reason: ParseErrorReason,
-	options: { message?: string; line?: number; column?: number } = {},
-	meta: MetaEnvelope = newMeta(),
-): ToolErrorEnvelope {
-	const message = options.message ?? defaultParseMessage(reason);
-	const extras: Record<string, unknown> = { reason };
-	if (options.line !== undefined) extras.line = options.line;
-	if (options.column !== undefined) extras.column = options.column;
-	const err = vaultError("MARKDOWN_PARSE_ERROR", message, {
+	options: { messagePrefix?: string; requestId?: string } = {},
+): VaultError {
+	const message = options.messagePrefix !== undefined ? `${options.messagePrefix}${err.message}` : err.message;
+	return vaultError("MARKDOWN_PARSE_ERROR", message, {
 		param,
-		request_id: meta.request_id,
-		...extras,
+		reason: err.reason,
+		...(options.requestId !== undefined ? { request_id: options.requestId } : {}),
+		...(err.line !== undefined ? { line: err.line } : {}),
+		...(err.column !== undefined ? { column: err.column } : {}),
 	});
-	return toolErrorEnvelope(err, meta);
 }
 
-function defaultParseMessage(reason: ParseErrorReason): string {
-	switch (reason) {
-		case "syntax":
-			return "Markdown parse failed (syntax).";
-		case "ast_node_cap_exceeded":
-			return "Markdown parse failed (AST node cap exceeded).";
-		case "encoding_failed":
-			return "Markdown parse failed (file is not valid UTF-8).";
-	}
+export function markdownParseErrorEnvelope(
+	err: ParseError,
+	param: string,
+	meta: MetaEnvelope = newMeta(),
+): ToolErrorEnvelope {
+	return toolErrorEnvelope(markdownParseErrorPayload(err, param, { requestId: meta.request_id }), meta);
 }
 
 /**
- * `HEADING_NOT_FOUND` flat payload per round 8 (CLAUDE.md): stale-recovery
- * fields sit directly on `VaultError`, NOT inside a nested `structured`
- * sub-object. `requested_stable_id` is present on a stale-stable_id miss;
+ * `HEADING_NOT_FOUND` flat payload: stale-recovery fields sit directly
+ * on `VaultError`, NOT inside a nested `structured` sub-object.
+ * `requested_stable_id` is present on a stale-stable_id miss;
  * `stable_id_status: "stale"` likewise.
  */
 export function headingNotFoundEnvelope(

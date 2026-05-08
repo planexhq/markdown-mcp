@@ -39,12 +39,7 @@ export function routeToolError(err: unknown, toolName: string, meta?: MetaEnvelo
 	const baseMeta = meta ?? newMeta();
 	if (err instanceof PathValidationError) return toolErrorEnvelope(err.payload, baseMeta);
 	if (err instanceof FileTooLargeError) return fileTooLargeEnvelope("file", err.actualBytes, baseMeta);
-	if (err instanceof ParseError) {
-		const opts: Parameters<typeof markdownParseErrorEnvelope>[2] = { message: err.message };
-		if (err.line !== undefined) opts.line = err.line;
-		if (err.column !== undefined) opts.column = err.column;
-		return markdownParseErrorEnvelope("file", err.reason, opts, baseMeta);
-	}
+	if (err instanceof ParseError) return markdownParseErrorEnvelope(err, "file", baseMeta);
 	if (err instanceof FilterSyntaxError) {
 		const payload = vaultError("FILTER_SYNTAX_ERROR", err.message, {
 			param: err.param,

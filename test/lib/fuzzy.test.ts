@@ -1,5 +1,5 @@
 /**
- * D32 + round-9 confidence-gating tests for `stable-id-fuzzy-v1`.
+ * D32 confidence-gating tests for `stable-id-fuzzy-v1`.
  *
  * The reorder-without-rename counter-example is the load-bearing case:
  * lookup of stale_id_old_B must return Beta (text identity) rather
@@ -71,7 +71,7 @@ describe("recoverStaleStableId — rename-only", () => {
 	});
 });
 
-describe("recoverStaleStableId — reorder-without-rename counter-example (round 9)", () => {
+describe("recoverStaleStableId — reorder-without-rename counter-example", () => {
 	test("lookup of stale_id_B returns Beta (text identity), NOT Alpha at B's old slot", () => {
 		// Original: Page/[Alpha at h2[1], Beta at h2[2]]
 		// After reorder: Page/[Beta at h2[1], Alpha at h2[2]]
@@ -83,12 +83,14 @@ describe("recoverStaleStableId — reorder-without-rename counter-example (round
 		];
 		const result = recoverStaleStableId({ history, currentHeadings: headings });
 		expect(result.primary).not.toBeNull();
-		// Round-9 partition: primary MUST come from text_match.
+		// Confidence-gating: primary MUST come from text_match (a sibling
+		// reorder must NOT silently surface the heading now occupying the
+		// old slot as the recovered target).
 		expect(result.primary?.heading.pathText).toBe("Beta");
 	});
 });
 
-describe("recoverStaleStableId — rename-and-reorder (round 9 confidence-gate)", () => {
+describe("recoverStaleStableId — rename-and-reorder (text_match empty)", () => {
 	test("text_match empty → primary=null + top-3 structural neighbors", () => {
 		// History row was for "Old Beta" at h2[2]. After edits, Old Beta
 		// is gone (renamed AND reordered), so text identity is unrecoverable.

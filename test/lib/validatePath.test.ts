@@ -446,10 +446,10 @@ describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () =
 		}
 	});
 
-	// Round-22: vault-controlled cache is hostile-input. A pre-planted directory
-	// (or FIFO / device) at the index path bypasses the symlink-only guard and
-	// either crashes openSqlite or — in the block-device case — redirects index
-	// writes onto a real partition.
+	// Vault-controlled cache is hostile input: a pre-planted directory
+	// (or FIFO / device) at the index path bypasses the symlink-only guard
+	// and either crashes openSqlite or — in the block-device case —
+	// redirects index writes onto a real partition.
 	test("directory at index.sqlite3 rejected with INDEX_FILE_NOT_REGULAR", async () => {
 		const isolated = await createTempVault({ ".vault-mcp": { "index.sqlite3": {} } });
 		try {

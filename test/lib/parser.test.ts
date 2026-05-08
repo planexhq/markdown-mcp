@@ -221,9 +221,10 @@ describe("parser — frontmatter", () => {
 	});
 
 	test("line counters reach EOF on bare-CR sources (heading range.end is not collapsed to 1)", () => {
-		// Round 14 enabled bare-CR at the frontmatter layer; `countLines`
-		// must agree so a heading's `range.end` reaches the body's last
-		// line instead of collapsing to the heading's own line.
+		// Bare-CR sources need `countLines` to agree with the
+		// frontmatter-layer parse so a heading's `range.end` reaches
+		// the body's last line instead of collapsing to the heading's
+		// own line.
 		const source = "# H\rbody line two\rbody line three\r";
 		const parsed = parseFile(source, "bare-cr-lines.md");
 		const heading = parsed.headings[0];
@@ -654,5 +655,31 @@ describe("parser — content kinds", () => {
 	test("Obsidian callout still detected via blockquote scan", () => {
 		const parsed = parseFile("# Section\n\n> [!note]\n> Body of callout.\n", "x.md");
 		expect(parsed.headings[0]?.contentKinds).toContain("callout");
+	});
+});
+
+describe("parser — preamble content kinds", () => {
+	test("headingless code-only file → preamble.contentKinds includes 'code'", () => {
+		const parsed = parseFile("```\nfoo\n```\n", "x.md");
+		expect(parsed.headings).toEqual([]);
+		expect(parsed.preamble?.contentKinds).toContain("code");
+	});
+
+	test("preamble with image before first heading → preamble.contentKinds includes 'image'", () => {
+		const parsed = parseFile("![alt](pic.png)\n\n# Section\n\nBody.\n", "x.md");
+		expect(parsed.preamble?.contentKinds).toContain("image");
+		// First heading body has no image — kinds didn't leak.
+		expect(parsed.headings[0]?.contentKinds ?? []).not.toContain("image");
+	});
+
+	test("headingless table-only file → preamble.contentKinds includes 'table'", () => {
+		const parsed = parseFile("| a | b |\n|---|---|\n| 1 | 2 |\n", "x.md");
+		expect(parsed.headings).toEqual([]);
+		expect(parsed.preamble?.contentKinds).toContain("table");
+	});
+
+	test("preamble with no notable content → preamble.contentKinds is empty", () => {
+		const parsed = parseFile("Plain text intro.\n\n# Section\n\nBody.\n", "x.md");
+		expect(parsed.preamble?.contentKinds).toEqual([]);
 	});
 });

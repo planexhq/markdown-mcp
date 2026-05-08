@@ -6,18 +6,24 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Database from "better-sqlite3";
+import type { Database as DatabaseType } from "better-sqlite3";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
 	closeSqlite,
+	detectPreW4Schema,
 	openSqlite,
 	openSqliteWithRecovery,
 	runMigrationV1,
-	runMigrationV2,
-	runMigrationV3,
 	wipeIndexCache,
 } from "../../../src/lib/index/sqlite.js";
+
+function listMaster(db: DatabaseType, type: "table" | "index"): string[] {
+	const rows = db.prepare("SELECT name FROM sqlite_master WHERE type = ? ORDER BY name").all(type) as Array<{
+		name: string;
+	}>;
+	return rows.map((r) => r.name);
+}
 
 const opens: ReturnType<typeof openSqlite>[] = [];
 
@@ -56,6 +62,40 @@ describe("openSqlite", () => {
 		expect(["memory", "wal"]).toContain(journal.journal_mode.toLowerCase());
 		const fk = db.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number };
 		expect(fk.foreign_keys).toBe(1);
+	});
+
+	test("consolidated schema creates every expected table + index", () => {
+		const { db } = open();
+		expect(listMaster(db, "table")).toEqual(
+			expect.arrayContaining([
+				"file_metrics",
+				"fragments",
+				"frontmatter",
+				"frontmatter_tags",
+				"heading_history",
+				"index_meta",
+				"schema_version",
+				"snapshot",
+				"wikilinks",
+			]),
+		);
+		expect(listMaster(db, "index")).toEqual(
+			expect.arrayContaining([
+				"fragments_by_file",
+				"fragments_by_kind_file",
+				"fragments_by_stable_id",
+				"frontmatter_tags_by_tag",
+				"wikilinks_by_lc_raw_target",
+				"wikilinks_by_raw_target",
+				"wikilinks_by_source",
+			]),
+		);
+	});
+
+	test("index_meta has scan_complete + ever_complete columns", () => {
+		const { db } = open();
+		const cols = (db.prepare("PRAGMA table_info(index_meta)").all() as Array<{ name: string }>).map((c) => c.name);
+		expect(cols.sort()).toEqual(["ever_complete", "id", "scan_complete"]);
 	});
 });
 
@@ -119,112 +159,59 @@ describe("FTS5 trigger correctness", () => {
 	});
 });
 
+describe("detectPreW4Schema", () => {
+	test("fresh DB (both tables empty) → false (no fragments to suspect)", () => {
+		const { db } = open();
+		expect(detectPreW4Schema(db)).toBe(false);
+	});
+
+	test("fragments populated AND file_metrics empty → true (pre-W4 state)", () => {
+		const { db } = open();
+		db.prepare(
+			"INSERT INTO fragments (file, anchor_kind, range_start, range_end, body, code, headings, mtime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		).run("a.md", "file", 0, 10, "body", "", "stem", 1000);
+		expect(detectPreW4Schema(db)).toBe(true);
+	});
+
+	test("fragments populated AND file_metrics populated → false (W4-native)", () => {
+		const { db } = open();
+		db.prepare(
+			"INSERT INTO fragments (file, anchor_kind, range_start, range_end, body, code, headings, mtime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		).run("a.md", "file", 0, 10, "body", "", "stem", 1000);
+		db.prepare(
+			"INSERT INTO file_metrics (file, body_tokens_approx, descendant_tokens_approx, content_kinds_json) VALUES (?, ?, ?, ?)",
+		).run("a.md", 5, 5, "[]");
+		expect(detectPreW4Schema(db)).toBe(false);
+	});
+
+	test("partial: fragments + ONE file_metrics row → false (mixed state, not flagged)", () => {
+		// Strict `count = 0` form: any file_metrics row at all skips
+		// detection so an in-progress rebuild isn't re-triggered. Trade-
+		// off accepted: a hand-corrupted DB with stale fragments + one
+		// orphan metrics row would slip through, but no normal code
+		// path produces that state.
+		const { db } = open();
+		db.prepare(
+			"INSERT INTO fragments (file, anchor_kind, range_start, range_end, body, code, headings, mtime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		).run("a.md", "file", 0, 10, "body", "", "stem", 1000);
+		db.prepare(
+			"INSERT INTO fragments (file, anchor_kind, range_start, range_end, body, code, headings, mtime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		).run("b.md", "file", 0, 10, "body", "", "stem", 1000);
+		db.prepare(
+			"INSERT INTO file_metrics (file, body_tokens_approx, descendant_tokens_approx, content_kinds_json) VALUES (?, ?, ?, ?)",
+		).run("a.md", 5, 5, "[]");
+		expect(detectPreW4Schema(db)).toBe(false);
+	});
+});
+
 describe("migration idempotency", () => {
-	test("running migration on already-migrated DB is a no-op (no error, schema unchanged)", () => {
+	test("re-running runMigrationV1 on an already-migrated DB is a no-op", () => {
 		const { db } = open();
-		// Re-import + re-run via the same connection — the IF-NOT-EXISTS DDL
-		// must be safe.
-		const v1 = db.prepare("SELECT version FROM schema_version").get() as { version: number };
-		expect(v1.version).toBe(1);
-	});
-});
-
-describe("migration v2 (ever_complete)", () => {
-	test("fresh DB has ever_complete=0 after openSqlite", () => {
-		const { db } = open();
-		const row = db.prepare("SELECT ever_complete FROM index_meta WHERE id = 1").get() as { ever_complete: number };
-		expect(row.ever_complete).toBe(0);
-	});
-
-	test("v1-shaped DB with scan_complete=1 backfills ever_complete=1", () => {
-		// Simulate a DB that pre-dates the v2 migration: run v1 only, then
-		// flip scan_complete=1 (modeling a previously-clean scan), THEN run
-		// v2. The migration must add the column AND backfill from
-		// scan_complete.
-		const db = new Database(":memory:");
-		try {
-			runMigrationV1(db);
-			db.prepare("UPDATE index_meta SET scan_complete = 1 WHERE id = 1").run();
-			runMigrationV2(db);
-			const row = db.prepare("SELECT ever_complete FROM index_meta WHERE id = 1").get() as {
-				ever_complete: number;
-			};
-			expect(row.ever_complete).toBe(1);
-		} finally {
-			db.close();
-		}
-	});
-
-	test("v1-shaped DB with scan_complete=0 leaves ever_complete=0 (conservative)", () => {
-		// Round-13 buggy state: scan_complete=0 + count>0. Backfill MUST
-		// stay 0 here — otherwise upgraders re-inherit the partial-warm
-		// bug that round 14 fixes.
-		const db = new Database(":memory:");
-		try {
-			runMigrationV1(db);
-			expect(
-				(db.prepare("SELECT scan_complete FROM index_meta WHERE id = 1").get() as { scan_complete: number })
-					.scan_complete,
-			).toBe(0);
-			runMigrationV2(db);
-			const row = db.prepare("SELECT ever_complete FROM index_meta WHERE id = 1").get() as {
-				ever_complete: number;
-			};
-			expect(row.ever_complete).toBe(0);
-		} finally {
-			db.close();
-		}
-	});
-
-	test("running v2 twice is idempotent (no error, no duplicate column)", () => {
-		const db = new Database(":memory:");
-		try {
-			runMigrationV1(db);
-			runMigrationV2(db);
-			expect(() => runMigrationV2(db)).not.toThrow();
-			const cols = db.prepare("PRAGMA table_info(index_meta)").all() as Array<{ name: string }>;
-			const everCount = cols.filter((c) => c.name === "ever_complete").length;
-			expect(everCount).toBe(1);
-		} finally {
-			db.close();
-		}
-	});
-});
-
-describe("migration v3 (fragments.size)", () => {
-	test("fresh DB has size column on fragments after openSqlite", () => {
-		const { db } = open();
-		const cols = db.prepare("PRAGMA table_info(fragments)").all() as Array<{ name: string }>;
-		expect(cols.some((c) => c.name === "size")).toBe(true);
-	});
-
-	test("v1-only DB with existing row gets size=NULL after v3 (no backfill — self-heal on next scan)", () => {
-		const db = new Database(":memory:");
-		try {
-			runMigrationV1(db);
-			db.prepare(
-				"INSERT INTO fragments (file, anchor_kind, stable_id, heading_path_json, heading_text, structural_path, range_start, range_end, body, code, headings, mtime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			).run("a.md", "heading", "h:abcd1234567890", '["A"]', "A", "h2[1]", 0, 100, "hello", "", "A", 1000);
-			runMigrationV3(db);
-			const row = db.prepare("SELECT size FROM fragments WHERE file = 'a.md'").get() as { size: number | null };
-			expect(row.size).toBeNull();
-		} finally {
-			db.close();
-		}
-	});
-
-	test("running v3 twice is idempotent (no error, no duplicate column)", () => {
-		const db = new Database(":memory:");
-		try {
-			runMigrationV1(db);
-			runMigrationV3(db);
-			expect(() => runMigrationV3(db)).not.toThrow();
-			const cols = db.prepare("PRAGMA table_info(fragments)").all() as Array<{ name: string }>;
-			const sizeCount = cols.filter((c) => c.name === "size").length;
-			expect(sizeCount).toBe(1);
-		} finally {
-			db.close();
-		}
+		const tablesBefore = listMaster(db, "table");
+		const indexesBefore = listMaster(db, "index");
+		expect(() => runMigrationV1(db)).not.toThrow();
+		expect(listMaster(db, "table")).toEqual(tablesBefore);
+		expect(listMaster(db, "index")).toEqual(indexesBefore);
 	});
 });
 

@@ -84,7 +84,7 @@ describe("query-sanitize-v1 — defensive", () => {
 	});
 });
 
-describe("query-sanitize-v1 — token shape carries prefix marker (round 21)", () => {
+describe("query-sanitize-v1 — token shape carries prefix marker", () => {
 	test("prefix token retains trailing `*` so the snippet matcher knows to do prefix-stem matching", () => {
 		const outcome = sanitizeQuery("auth*");
 		expect(outcome.kind).toBe("ok");

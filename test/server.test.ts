@@ -17,6 +17,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { MAX_PATH_LENGTH, MIN_PROTOCOL_VERSION } from "../src/lib/limits.js";
@@ -35,12 +36,12 @@ const TOOL_NAMES = [
 ] as const;
 
 /**
- * Tools still returning the W1 INTERNAL_ERROR stub. The 3 W2 tools
- * (`get_file_outline`, `get_fragment`, `get_metadata`) and the W3
- * `search` tool now return real responses against the real markdown
- * parser / FTS5 index and are tested separately.
+ * After W4 every tool has a real handler. STUBBED_TOOLS is empty; the
+ * test below that iterates it is preserved as a regression hook so a
+ * future regression that re-adds a stub fails loudly. The
+ * `note://{path}` resource is still stubbed (W5).
  */
-const STUBBED_TOOLS = ["get_vault_tree", "get_links"] as const;
+const STUBBED_TOOLS: ReadonlyArray<(typeof TOOL_NAMES)[number]> = [];
 
 let vault: { path: string; cleanup: () => Promise<void> };
 let connection: TestClient;
@@ -55,36 +56,62 @@ afterAll(async () => {
 	await vault.cleanup();
 });
 
+/**
+ * Spawn a fresh server, send a single hand-rolled `initialize` request
+ * with the given protocol version, and return the parsed JSON-RPC
+ * response. The SDK Client always sends `LATEST_PROTOCOL_VERSION`, so
+ * any test that needs to exercise a different version on the wire
+ * must bypass it.
+ */
+async function sendInitialize(
+	vaultPath: string,
+	protocolVersion: string,
+): Promise<{ error?: { code: number; message: string }; result?: { protocolVersion: string } }> {
+	const child = spawn(process.execPath, [SERVER_BIN, "--vault", vaultPath], {
+		stdio: ["pipe", "pipe", "inherit"],
+	});
+	try {
+		const initialize = `${JSON.stringify({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "initialize",
+			params: {
+				protocolVersion,
+				capabilities: {},
+				clientInfo: { name: "init-test-client", version: "0.0.0" },
+			},
+		})}\n`;
+		child.stdin.write(initialize);
+		const responseLine = await new Promise<string>((resolve, reject) => {
+			child.stdout.once("data", (chunk: Buffer) => resolve(chunk.toString().split("\n")[0] ?? ""));
+			child.once("error", reject);
+			child.once("exit", (code) => reject(new Error(`server exited prematurely with code ${code}`)));
+		});
+		return JSON.parse(responseLine);
+	} finally {
+		child.kill();
+	}
+}
+
 describe("Initialize handshake — D22 minimum protocol version", () => {
 	test("rejects pre-2025-06-18 clients with InvalidRequest", async () => {
-		// SDK Client always sends LATEST, so we hand-roll the JSON-RPC
-		// frame to simulate an older host. Spawn fresh; killed in finally.
-		const child = spawn(process.execPath, [SERVER_BIN, "--vault", vault.path], {
-			stdio: ["pipe", "pipe", "inherit"],
-		});
-		try {
-			const initialize = `${JSON.stringify({
-				jsonrpc: "2.0",
-				id: 1,
-				method: "initialize",
-				params: {
-					protocolVersion: "2024-11-05",
-					capabilities: {},
-					clientInfo: { name: "old-client", version: "0.0.0" },
-				},
-			})}\n`;
-			child.stdin.write(initialize);
-			const responseLine = await new Promise<string>((resolve, reject) => {
-				child.stdout.once("data", (chunk: Buffer) => resolve(chunk.toString().split("\n")[0] ?? ""));
-				child.once("error", reject);
-				child.once("exit", (code) => reject(new Error(`server exited prematurely with code ${code}`)));
-			});
-			const response = JSON.parse(responseLine);
-			expect(response.error?.code).toBe(-32600);
-			expect(response.error?.message).toContain(MIN_PROTOCOL_VERSION);
-		} finally {
-			child.kill();
-		}
+		const response = await sendInitialize(vault.path, "2024-11-05");
+		expect(response.error?.code).toBe(-32600);
+		expect(response.error?.message).toContain(MIN_PROTOCOL_VERSION);
+	});
+
+	test("clamps newer-than-SUPPORTED protocol version to LATEST", async () => {
+		const response = await sendInitialize(vault.path, "2030-01-01");
+		expect(response.error).toBeUndefined();
+		expect(response.result?.protocolVersion).toBe(LATEST_PROTOCOL_VERSION);
+	});
+
+	test("echoes a SUPPORTED in-window version unchanged", async () => {
+		// Regression: clamp branch must not rewrite a supported version
+		// to LATEST.
+		const response = await sendInitialize(vault.path, MIN_PROTOCOL_VERSION);
+		expect(response.error).toBeUndefined();
+		expect(response.result?.protocolVersion).toBe(MIN_PROTOCOL_VERSION);
 	});
 });
 
@@ -92,7 +119,7 @@ describe("Initialize handshake", () => {
 	test("server reports name + version", () => {
 		const info = connection.client.getServerVersion();
 		expect(info?.name).toBe("vault-mcp");
-		expect(info?.version).toBe("1.0.0-w3");
+		expect(info?.version).toBe("1.0.0-w4");
 	});
 
 	test("server advertises tools + resources capabilities", () => {
@@ -128,7 +155,10 @@ describe("tools/list", () => {
 	});
 });
 
-describe("tools/call — INTERNAL_ERROR envelope (W1 stubs)", () => {
+describe("tools/call — INTERNAL_ERROR envelope regression hook", () => {
+	// W4 wires every tool to a real handler. Loop body retained as a
+	// regression sentry: if a future change re-stubs something, the
+	// expected INTERNAL_ERROR shape is still asserted.
 	for (const name of STUBBED_TOOLS) {
 		test(`${name} returns isError + structuredContent + _meta`, async () => {
 			const args = stubArgsFor(name);
@@ -146,10 +176,12 @@ describe("tools/call — INTERNAL_ERROR envelope (W1 stubs)", () => {
 		});
 	}
 
-	test("two consecutive calls have different request_ids", async () => {
-		// Use a still-stubbed tool so structuredContent remains a VaultError.
-		const a = await connection.client.callTool({ name: "get_vault_tree", arguments: {} });
-		const b = await connection.client.callTool({ name: "get_vault_tree", arguments: {} });
+	test("two consecutive calls produce distinct request_ids on a deterministic error path", async () => {
+		// Use `get_metadata` against a non-existent file — guaranteed to
+		// produce a domain error envelope on every invocation, so we can
+		// inspect `request_id` deterministically.
+		const a = await connection.client.callTool({ name: "get_metadata", arguments: { file: "definitely-missing.md" } });
+		const b = await connection.client.callTool({ name: "get_metadata", arguments: { file: "definitely-missing.md" } });
 		const idA = (a.structuredContent as VaultError).request_id;
 		const idB = (b.structuredContent as VaultError).request_id;
 		expect(idA).toBeTruthy();
@@ -634,9 +666,14 @@ describe("tools/call — path validation wired in W1 stubs (D8 + D16)", () => {
 		expectVaultError(err, "PATH_OUTSIDE_VAULT", "TRAVERSAL_SEGMENT");
 	});
 
-	test("get_vault_tree with no path arg still returns the W1 INTERNAL_ERROR stub", async () => {
-		const err = await callToolForError("get_vault_tree", {});
-		expectVaultError(err, "INTERNAL_ERROR");
+	test("get_vault_tree with no path arg returns the vault root tree", async () => {
+		// Post-W4 this is a real handler — vault root walk should succeed
+		// and emit at least one item from the fixture vault.
+		const result = await connection.client.callTool({ name: "get_vault_tree", arguments: {} });
+		expect(result.isError).toBeFalsy();
+		const structured = result.structuredContent as { items: Array<{ path: string; dfs_rank: number }> };
+		expect(structured.items.length).toBeGreaterThan(0);
+		expect(structured.items[0]?.dfs_rank).toBe(1);
 	});
 
 	test("empty path returns PATH_OUTSIDE_VAULT/EMPTY_PATH envelope", async () => {
@@ -682,25 +719,37 @@ describe("resources/list + resources/templates/list", () => {
 });
 
 describe("resources/read", () => {
-	test("note:// stub returns InternalError with INTERNAL_ERROR data code", async () => {
-		const data = await captureReadResourceData("note://foo.md");
-		expectVaultError(data, "INTERNAL_ERROR");
+	test("note:// returns the literal file source for an existing markdown file", async () => {
+		const result = await connection.client.readResource({ uri: "note://foo.md" });
+		expect(result.contents).toHaveLength(1);
+		const item = result.contents[0] as { uri: string; mimeType: string; text: string };
+		expect(item.mimeType).toBe("text/markdown");
+		expect(item.text).toBe("# foo\n");
 	});
 
-	test("note:// with nested path reaches the W1 stub", async () => {
-		const data = await captureReadResourceData("note://sub/nested.md");
-		expectVaultError(data, "INTERNAL_ERROR");
+	test("note:// nested path reads successfully", async () => {
+		const result = await connection.client.readResource({ uri: "note://sub/nested.md" });
+		const item = result.contents[0] as { mimeType: string; text: string };
+		expect(item.mimeType).toBe("text/markdown");
+		expect(item.text).toBe("# nested\n");
 	});
 
 	test("note:// with percent-encoded path decodes before validatePath", async () => {
-		const data = await captureReadResourceData("note://unicode-%C3%A9.md");
-		expectVaultError(data, "INTERNAL_ERROR");
+		const result = await connection.client.readResource({ uri: "note://unicode-%C3%A9.md" });
+		const item = result.contents[0] as { text: string };
+		expect(item.text).toBe("# unicode\n");
 	});
 
 	test("note:// with traversal path returns PATH_OUTSIDE_VAULT", async () => {
 		const data = await captureReadResourceData("note://../../etc/passwd");
 		expectVaultError(data, "PATH_OUTSIDE_VAULT", "TRAVERSAL_SEGMENT");
 		// Resource surface — the bad input is the request URI, not a `file` arg.
+		expect(data.param).toBe("uri");
+	});
+
+	test("note:// with missing file returns PATH_NOT_FOUND", async () => {
+		const data = await captureReadResourceData("note://does-not-exist.md");
+		expectVaultError(data, "PATH_NOT_FOUND");
 		expect(data.param).toBe("uri");
 	});
 
@@ -712,12 +761,50 @@ describe("resources/read", () => {
 	});
 
 	test("%2e%2e segments are URL-normalized before template match", async () => {
-		// `note://sub/%2e%2e/nested.md` rewrites to `note://sub/nested.md`
-		// per URL spec (path-position `..` collapses against host-rooted
-		// segments, never escapes past the host root). Catches any SDK
-		// change that drops this normalization.
-		const data = await captureReadResourceData("note://sub/%2e%2e/nested.md");
-		expectVaultError(data, "INTERNAL_ERROR");
+		// `note://sub/%2e%2e/nested.md`: WHATWG URL parses `sub` as host,
+		// `/%2e%2e/nested.md` as path. Path-position `..` collapses against
+		// the host-rooted segments and never escapes past the host root, so
+		// the captured `path` template variable resolves to `nested.md` for
+		// the subsequent validatePath. Catches any SDK change that drops this
+		// normalization.
+		const result = await connection.client.readResource({ uri: "note://sub/%2e%2e/nested.md" });
+		const item = result.contents[0] as { text: string };
+		expect(item.text).toBe("# nested\n");
+	});
+
+	test("note:// with invalid UTF-8 returns MARKDOWN_PARSE_ERROR/encoding_failed", async () => {
+		// Resource and tool surfaces must produce identical domain errors
+		// for the same parse failure on the same file.
+		const { writeFile } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const badRel = "bad-utf8.md";
+		// 0x80-0x82 are UTF-8 continuation bytes without a leading byte: invalid.
+		await writeFile(join(vault.path, badRel), Buffer.from([0x80, 0x81, 0x82]));
+
+		const data = await captureReadResourceData(`note://${badRel}`);
+		expect(data.code).toBe("MARKDOWN_PARSE_ERROR");
+		expect(data.param).toBe("uri");
+		expect((data as VaultError & { reason?: string }).reason).toBe("encoding_failed");
+	});
+
+	test("note:// over the 10 MB cap returns FILE_TOO_LARGE with limit_bytes/actual_bytes", async () => {
+		// Mirror the tool path's `fileTooLargeEnvelope` payload — clients
+		// keying off `limit_bytes`/`actual_bytes` must see both fields.
+		const { writeFile } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const bigRel = "huge.md";
+		const bigBytes = 10 * 1024 * 1024 + 256; // just over the 10 MB cap
+		const buf = Buffer.alloc(bigBytes, 0x61); // 'a' bytes
+		await writeFile(join(vault.path, bigRel), buf);
+
+		const data = (await captureReadResourceData(`note://${bigRel}`)) as VaultError & {
+			limit_bytes?: number;
+			actual_bytes?: number;
+		};
+		expect(data.code).toBe("FILE_TOO_LARGE");
+		expect(data.param).toBe("uri");
+		expect(data.limit_bytes).toBe(10 * 1024 * 1024);
+		expect(data.actual_bytes).toBe(bigBytes);
 	});
 });
 

@@ -176,6 +176,33 @@ export function isWhitespaceRange(
 }
 
 /**
+ * Strip the trailing `^id` block-addressing marker from a raw source
+ * slice. The `(?:^|[ \t])` prefix avoids matching `^2` in `Value x^2`
+ * (no preceding whitespace, not a block ID per BLOCK_ID_RE) and
+ * consuming the leading space avoids a dangling trailer before the
+ * newline in nested-list cases.
+ *
+ * Strips the LAST `^id` occurrence (not the first). The marker is
+ * always at the end of the original block per Obsidian spec, but embed
+ * expansion can splice nested content into the slice that incidentally
+ * contains literal `^id` text matching the parent's blockId. Per-line
+ * regex matching with `/m` would strip the first such occurrence,
+ * leaving the actual marker intact and corrupting the embedded text;
+ * matching the last occurrence puts the strip back on the parent's own
+ * marker since splices land before it.
+ */
+export function stripBlockIdMarker(raw: string, blockId: string): string {
+	const trimRe = new RegExp(String.raw`(?:^|[ \t])\^${blockId}\s*$`, "gm");
+	const matches = [...raw.matchAll(trimRe)];
+	if (matches.length === 0) return raw.trimEnd();
+	const last = matches[matches.length - 1];
+	if (!last || last.index === undefined) return raw.trimEnd();
+	const start = last.index;
+	const end = start + last[0].length;
+	return (raw.slice(0, start) + raw.slice(end)).trimEnd();
+}
+
+/**
  * Index of the deepest block in `sortedBlocks` whose offset range contains
  * `offset`. Returns -1 if none matches.
  */

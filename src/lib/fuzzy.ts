@@ -1,24 +1,22 @@
 /**
- * `stable-id-fuzzy-v1` — durable stale-ID recovery (D32 + round-9
- * confidence-gating).
+ * `stable-id-fuzzy-v1` — durable stale-ID recovery (D32 confidence-gated).
  *
  * Pure scoring against `HeadingMeta[]` (current headings of the file)
  * and one {@link HeadingHistoryRow} (the retired heading's last-known
  * state). The IndexHandle queries `heading_history` for the row; this
  * module makes the recovery decision.
  *
- * Round-9 partition rule:
+ * Confidence-gating partition rule:
  *   1. Split `currentHeadings` into `text_match` (heading whose
  *      normalized text equals the history's last text) and
  *      `no_text_match` (everything else).
  *   2. If `text_match` is empty → `primary: null`. The caller emits
  *      `HEADING_NOT_FOUND` with up to 3 structural-proximity candidates
- *      from `no_text_match` so the agent has navigation hints. This
- *      gate is the round-9 fix: a sibling-slot match without text
- *      identity is NOT confidence enough to surface as the recovered
- *      heading (counter-example: rename-and-reorder → would otherwise
- *      pick the heading occupying the old slot whose text bears no
- *      relation to the retired one).
+ *      from `no_text_match` so the agent has navigation hints. A sibling-
+ *      slot match without text identity is NOT enough confidence to
+ *      surface as the recovered heading (counter-example: rename-and-
+ *      reorder would otherwise pick the heading occupying the old slot
+ *      whose text bears no relation to the retired one).
  *   3. Otherwise `primary` is the highest-scoring `text_match`;
  *      `others` is the remaining `text_match` plus top `no_text_match`
  *      by structural proximity, capped at 3.

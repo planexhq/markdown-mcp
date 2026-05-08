@@ -8,7 +8,12 @@
 
 import { describe, expect, test } from "vitest";
 
-import { type BlockableNodeRange, type ExcludedRange, extractBlockIds } from "../../src/lib/blockIds.js";
+import {
+	type BlockableNodeRange,
+	type ExcludedRange,
+	extractBlockIds,
+	stripBlockIdMarker,
+} from "../../src/lib/blockIds.js";
 
 function makeBlock(source: string, marker: string): BlockableNodeRange {
 	const start = source.indexOf(marker);
@@ -153,5 +158,33 @@ describe("extractBlockIds", () => {
 		const idBlock = makeBlock(source, "^after-fence");
 		const matches = extractBlockIds(source, [para, idBlock], []);
 		expect(matches).toHaveLength(0);
+	});
+});
+
+describe("stripBlockIdMarker", () => {
+	test("strips inline marker at end of paragraph", () => {
+		expect(stripBlockIdMarker("body text ^foo", "foo")).toBe("body text");
+	});
+
+	test("strips deferred-form marker on its own line", () => {
+		expect(stripBlockIdMarker("body line\n^foo", "foo")).toBe("body line");
+	});
+
+	test("returns trimEnd when no marker present", () => {
+		expect(stripBlockIdMarker("body text\n", "missing")).toBe("body text");
+	});
+
+	test("does NOT match `^2` in `Value x^2` (no preceding whitespace)", () => {
+		expect(stripBlockIdMarker("Value x^2", "2")).toBe("Value x^2");
+	});
+
+	test("strips the LAST occurrence when content has multiple matches", () => {
+		// Embed expansion can splice content with the SAME blockId text
+		// at end-of-line into the parent slice. The actual marker is
+		// always at the end of the original block, so post-expansion the
+		// last match is the one to strip — first-match would corrupt the
+		// embedded text and leave the real marker.
+		const raw = "see ^foo\nmiddle text\nactual block end ^foo";
+		expect(stripBlockIdMarker(raw, "foo")).toBe("see ^foo\nmiddle text\nactual block end");
 	});
 });

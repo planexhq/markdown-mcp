@@ -48,3 +48,8 @@ export function isMarkdownPath(relpath: string, exts?: ReadonlySet<string>): boo
 	if (ext === "") return false;
 	return (exts ?? getVaultExtensions()).has(ext);
 }
+
+/** True iff `relpath` has a non-markdown extension (e.g. `.png`, `.pdf`). */
+export function isAssetPath(relpath: string, exts?: ReadonlySet<string>): boolean {
+	return extname(relpath) !== "" && !isMarkdownPath(relpath, exts);
+}

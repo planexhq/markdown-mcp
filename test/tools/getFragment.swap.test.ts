@@ -150,7 +150,7 @@ describe("handleGetFragment — stable_id resolution (D27 outline-authoritative)
 		// Pre-edit: # A then ## B (B is a child of A — structural_path
 		// `h1[0]/h2[0]`). Post-edit: # A then # B (B promoted to top-level
 		// — structural_path `h1[1]`). The cached B-ID is no longer in the
-		// outline; round-9 confidence-gated fuzzy recovers via text match.
+		// outline; confidence-gated fuzzy recovers via text match.
 		const s = await setup("# A\n\n## B\n\nbody\n", "slot.md");
 		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
 		const cachedBId = listHeadingIds(s.opened.db, "slot.md").B;
@@ -193,6 +193,77 @@ describe("handleGetFragment — stable_id resolution (D27 outline-authoritative)
 		expect(err.code).toBe("HEADING_NOT_FOUND");
 		expect(err.stable_id_status).toBe("stale");
 		expect(err.candidates).toHaveLength(0);
+	});
+});
+
+describe("handleGetFragment — embed expansion preserves missing-heading state", () => {
+	test("![[target#missing]] returns unresolved_heading, NOT whole-file content", async () => {
+		// `headingResolutionFailed` lives only on `ResolvedWikilink` (not on
+		// the persisted `Embed`), so handleGetFragment must re-resolve from
+		// `raw_target` to recover it; otherwise `![[target#missing]]` falls
+		// through to whole-file expansion and leaks target.md's body.
+		const vault = await createTempVault({
+			"host.md": "![[target#nope]]\n",
+			"target.md": "# Other\n\nSecret content that must not leak.\n",
+		});
+		const opened = openSqlite({ dbPath: ":memory:" });
+		const index = createIndexHandle(opened.db);
+		const vaultRoot: VaultRoot = await validateVaultRoot(vault.path);
+		setups.push({
+			vault,
+			opened,
+			index,
+			vaultRoot,
+			teardown: async () => {
+				closeSqlite(opened.db);
+				await vault.cleanup();
+			},
+		});
+		await scanVault({ vaultRoot, index, concurrency: 1 });
+
+		const result = await handleGetFragment(
+			{ file: "host.md", anchor: { kind: "file" }, expand_embeds: true },
+			vaultRoot,
+			index,
+		);
+		expect(result.isError).toBeFalsy();
+		const fragment = result.structuredContent as FragmentResult;
+		expect(fragment.embeds).toHaveLength(1);
+		const embed = fragment.embeds[0];
+		expect(embed?.expansion_error).toBe("unresolved_heading");
+		expect(embed?.expanded).toBe(false);
+		expect(embed?.expanded_content).toBeUndefined();
+	});
+
+	test("![[target]] without anchor still expands the whole file (counter-test)", async () => {
+		// Confirms N1's fix doesn't regress the heading-less embed path.
+		const vault = await createTempVault({
+			"host.md": "![[target]]\n",
+			"target.md": "# Other\n\nWhole-file body.\n",
+		});
+		const opened = openSqlite({ dbPath: ":memory:" });
+		const index = createIndexHandle(opened.db);
+		const vaultRoot: VaultRoot = await validateVaultRoot(vault.path);
+		setups.push({
+			vault,
+			opened,
+			index,
+			vaultRoot,
+			teardown: async () => {
+				closeSqlite(opened.db);
+				await vault.cleanup();
+			},
+		});
+		await scanVault({ vaultRoot, index, concurrency: 1 });
+
+		const result = await handleGetFragment(
+			{ file: "host.md", anchor: { kind: "file" }, expand_embeds: true },
+			vaultRoot,
+			index,
+		);
+		const fragment = result.structuredContent as FragmentResult;
+		expect(fragment.embeds[0]?.expanded).toBe(true);
+		expect(fragment.embeds[0]?.expanded_content).toContain("Whole-file body");
 	});
 });
 

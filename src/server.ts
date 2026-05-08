@@ -1,29 +1,31 @@
 /**
  * MCP server skeleton.
  *
- * Registers all 6 tools and the `note://` resource. In W1, every tool
- * handler returns the `INTERNAL_ERROR` domain envelope (D13 hybrid:
- * successful tool result + `isError: true` + `structuredContent`); the
+ * Registers all 6 tools and the `note://` resource. Tool handlers
+ * return the D13 hybrid envelope (successful JSON-RPC result with
+ * `isError: true` + `structuredContent` for domain errors); the
  * resource read handler throws `McpError` with `-32603` so the SDK
  * surfaces it as a JSON-RPC error with our domain `code` in `data`.
  *
- * Stubbed in v1: `get_links` and `get_vault_tree` return INTERNAL_ERROR;
- * `note://` reads return JSON-RPC `-32603` with our domain code in
- * `data`. Every tool's path argument runs through `validatePath` even
- * for stubs — the security invariant is locked from registration time.
+ * Every tool's path argument runs through `validatePath` — the
+ * security invariant is locked from registration time.
  */
 
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
 	ErrorCode,
 	InitializeRequestSchema,
+	LATEST_PROTOCOL_VERSION,
 	McpError,
 	type ServerCapabilities,
+	SUPPORTED_PROTOCOL_VERSIONS,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { internalErrorEnvelope, newMeta, toolErrorEnvelope, vaultError } from "./lib/error.js";
+import { errorMessage, internalErrorEnvelope, markdownParseErrorPayload, vaultError } from "./lib/error.js";
 import type { IndexHandle } from "./lib/index/IndexHandle.js";
 import { MIN_PROTOCOL_VERSION } from "./lib/limits.js";
+import { ParseError } from "./lib/parser.js";
+import { FileTooLargeError, readSource } from "./lib/readNote.js";
 import { PathValidationError, type VaultRoot, validatePath } from "./lib/validatePath.js";
 import {
 	GetFileOutlineSchema,
@@ -36,8 +38,11 @@ import {
 } from "./schemas.js";
 import { handleGetFileOutline } from "./tools/getFileOutline.js";
 import { handleGetFragment } from "./tools/getFragment.js";
+import { handleGetLinks } from "./tools/getLinks.js";
 import { handleGetMetadata } from "./tools/getMetadata.js";
+import { handleGetVaultTree } from "./tools/getVaultTree.js";
 import { handleSearch } from "./tools/search.js";
+import type { ErrorCode as VaultErrorCode } from "./types.js";
 
 /**
  * Server name + version reported in the MCP `initialize` handshake.
@@ -45,7 +50,7 @@ import { handleSearch } from "./tools/search.js";
  */
 const SERVER_INFO = {
 	name: "vault-mcp",
-	version: "1.0.0-w3",
+	version: "1.0.0-w4",
 } as const;
 
 const INSTRUCTIONS =
@@ -80,6 +85,11 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle): McpServ
 				`vault-mcp requires MCP protocol version ${MIN_PROTOCOL_VERSION} or newer; client requested ${requested}.`,
 			);
 		}
+		// Per MCP spec: when the client requests a version the server does
+		// not support, respond with the latest version it does. Echoing a
+		// future date verbatim would let the client believe the server
+		// implements a protocol it actually doesn't.
+		const negotiated = SUPPORTED_PROTOCOL_VERSIONS.includes(requested) ? requested : LATEST_PROTOCOL_VERSION;
 		// `_capabilities` is the SDK's authoritative snapshot, populated by
 		// the registerTool/registerResource calls below. The public
 		// `registerCapabilities` is a mutator only; no public getter exists,
@@ -87,7 +97,7 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle): McpServ
 		// SDK's own `_oninitialize` returns.
 		const capabilities = (server.server as unknown as { _capabilities: ServerCapabilities })._capabilities;
 		return {
-			protocolVersion: requested,
+			protocolVersion: negotiated,
 			capabilities,
 			serverInfo: SERVER_INFO,
 			instructions: INSTRUCTIONS,
@@ -109,7 +119,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHan
 			description: TOOL_DESCRIPTIONS.get_vault_tree,
 			inputSchema: GetVaultTreeSchema,
 		},
-		async ({ path }) => stubWithPathValidation(vaultRoot, path, "get_vault_tree"),
+		async (input) => handleGetVaultTree(input, vaultRoot, index),
 	);
 
 	server.registerTool(
@@ -164,33 +174,13 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHan
 			description: TOOL_DESCRIPTIONS.get_links,
 			inputSchema: GetLinksSchema,
 		},
-		async ({ file }) => stubWithPathValidation(vaultRoot, file, "get_links"),
-	);
-}
-
-/**
- * Run `validatePath` on the user-supplied file path (skipped if undefined,
- * for tools where path is optional like `search.scope.path`); on success
- * return the W1 stub `INTERNAL_ERROR` envelope, on failure return the
- * `PATH_OUTSIDE_VAULT` (or `PATH_NOT_FOUND`) envelope. Wires the D8/D16
- * invariant from W1 even though the read handlers are stubs.
- */
-async function stubWithPathValidation(
-	vaultRoot: VaultRoot,
-	file: string | undefined,
-	toolName: string,
-): Promise<ReturnType<typeof internalErrorEnvelope>> {
-	if (file !== undefined) {
-		try {
-			await validatePath(file, vaultRoot);
-		} catch (err) {
-			if (err instanceof PathValidationError) {
-				return toolErrorEnvelope(err.payload, newMeta());
+		async (input) => {
+			if (index === undefined) {
+				return internalErrorEnvelope("get_links requires the index handle (server misconfigured).");
 			}
-			throw err;
-		}
-	}
-	return internalErrorEnvelope(`${toolName} not yet implemented (W1 stub).`);
+			return handleGetLinks(input, vaultRoot, index);
+		},
+	);
 }
 
 // ─── Resource registration ─────────────────────────────────────────────────
@@ -215,7 +205,7 @@ function registerNoteResource(server: McpServer, vaultRoot: VaultRoot): void {
 				"Full markdown of one vault file (frontmatter included). Vault-relative path; same validatePath rules as tools.",
 			mimeType: "text/markdown",
 		},
-		async (_uri, variables) => {
+		async (uri, variables) => {
 			// SDK URL-normalizes `request.params.uri` BEFORE this handler runs
 			// (mcp.js setResourceRequestHandlers): `new URL(uri)` collapses both
 			// path-position `..` and `%2e%2e` segments. Per URL spec these
@@ -228,47 +218,80 @@ function registerNoteResource(server: McpServer, vaultRoot: VaultRoot): void {
 			// reimplementing the SDK's URI-template matcher to gain raw-URI
 			// access. Deferred per cost/benefit; vault escape is already
 			// prevented.
-			const rawPath = Array.isArray(variables.path) ? variables.path.join("/") : variables.path;
-			if (typeof rawPath !== "string" || rawPath.length === 0) {
-				const err = vaultError("PATH_NOT_FOUND", "note:// URI is missing the path component.", {
-					param: "uri",
-				});
-				throw new McpError(ErrorCode.InvalidParams, err.message, err);
-			}
-			// URI Templates capture raw URI substrings; per RFC 3986 the
-			// caller percent-encodes reserved/non-ASCII characters in the
-			// URI form. Decode once before path-domain validation, else
-			// `My%20Note.md` and `unicode-%C3%A9.md` are wrongly rejected
-			// as PERCENT_ENCODED. Decoding then validating is safe:
-			// `note://%2e%2e/etc` decodes to `../etc` and validatePath
-			// rejects it as TRAVERSAL_SEGMENT.
-			let decodedPath: string;
 			try {
-				decodedPath = decodeURIComponent(rawPath);
-			} catch {
-				const err = vaultError("PATH_NOT_FOUND", "note:// URI has malformed percent-encoding.", {
-					param: "uri",
-				});
-				throw new McpError(ErrorCode.InvalidParams, err.message, err);
-			}
-			try {
-				await validatePath(decodedPath, vaultRoot);
-			} catch (err) {
-				if (err instanceof PathValidationError) {
-					// validatePath's payload sets `param: "file"` (Tool surface);
-					// rebrand for the Resource surface — the bad input here is
-					// the request URI, not a file argument.
-					const payload = { ...err.payload, param: "uri" };
-					throw new McpError(ErrorCode.InvalidParams, payload.message, payload);
+				const rawPath = Array.isArray(variables.path) ? variables.path.join("/") : variables.path;
+				if (typeof rawPath !== "string" || rawPath.length === 0) {
+					throw new ResourceUriError("PATH_NOT_FOUND", "note:// URI is missing the path component.");
 				}
-				throw err;
+				// URI Templates capture raw URI substrings; per RFC 3986 the
+				// caller percent-encodes reserved/non-ASCII characters in the
+				// URI form. Decode once before path-domain validation, else
+				// `My%20Note.md` and `unicode-%C3%A9.md` are wrongly rejected
+				// as PERCENT_ENCODED. Decoding then validating is safe:
+				// `note://%2e%2e/etc` decodes to `../etc` and validatePath
+				// rejects it as TRAVERSAL_SEGMENT.
+				let decodedPath: string;
+				try {
+					decodedPath = decodeURIComponent(rawPath);
+				} catch {
+					throw new ResourceUriError("PATH_NOT_FOUND", "note:// URI has malformed percent-encoding.");
+				}
+				const safePath = await validatePath(decodedPath, vaultRoot);
+				// `readSource` (not `readNote`) returns the literal on-disk
+				// file including frontmatter, the brief's contract for
+				// `note://`. Skipping the parser also lets a parse-only
+				// failure like AST cap not block a readable file.
+				const source = await readSource(safePath);
+				return {
+					contents: [{ uri: uri.toString(), mimeType: "text/markdown", text: source }],
+				};
+			} catch (err) {
+				throw resourceErrorToMcp(err);
 			}
-			// W1 stub: validation passed but read is not wired up yet.
-			// Surface as -32603 with our domain code so clients can
-			// distinguish a server-side stub from a real -32603 transport
-			// failure.
-			const stubErr = vaultError("INTERNAL_ERROR", "note:// read not yet implemented (W1 stub).", { param: "uri" });
-			throw new McpError(ErrorCode.InternalError, stubErr.message, stubErr);
 		},
 	);
+}
+
+/**
+ * Local marker for path-domain rejections raised inside the resource handler
+ * body (missing path, malformed percent-encoding). Caught by the handler's
+ * single mapping path so the body stays free of `new McpError(...)` plumbing.
+ */
+class ResourceUriError extends Error {
+	readonly code: VaultErrorCode;
+	constructor(code: VaultErrorCode, message: string) {
+		super(message);
+		this.code = code;
+	}
+}
+
+function resourceErrorToMcp(err: unknown): McpError {
+	if (err instanceof McpError) return err;
+	if (err instanceof ResourceUriError) {
+		const payload = vaultError(err.code, err.message, { param: "uri" });
+		return new McpError(ErrorCode.InvalidParams, payload.message, payload);
+	}
+	if (err instanceof PathValidationError) {
+		// validatePath's payload sets `param: "file"` (Tool surface); rebrand
+		// for the Resource surface — the bad input here is the URI.
+		const payload = { ...err.payload, param: "uri" };
+		return new McpError(ErrorCode.InvalidParams, payload.message, payload);
+	}
+	if (err instanceof FileTooLargeError) {
+		// Mirror the tool path's `fileTooLargeEnvelope` (error.ts) — clients
+		// keying off `limit_bytes`/`actual_bytes` to surface the cap and
+		// observed size need both fields on the resource path too.
+		const payload = vaultError("FILE_TOO_LARGE", err.message, {
+			param: "uri",
+			limit_bytes: err.limitBytes,
+			actual_bytes: err.actualBytes,
+		});
+		return new McpError(ErrorCode.InternalError, payload.message, payload);
+	}
+	if (err instanceof ParseError) {
+		const payload = markdownParseErrorPayload(err, "uri", { messagePrefix: "note:// parse failed: " });
+		return new McpError(ErrorCode.InvalidParams, payload.message, payload);
+	}
+	const payload = vaultError("INTERNAL_ERROR", `note:// read failed: ${errorMessage(err)}`, { param: "uri" });
+	return new McpError(ErrorCode.InternalError, payload.message, payload);
 }

@@ -50,6 +50,11 @@ export interface LinksKeysetKey {
 	source_file: string;
 	source_heading_path: string[] | null;
 	link_ordinal: number;
+	/**
+	 * Wikilinks row PK — final tiebreaker so duplicate-heading sections paginate
+	 * without skipping. Optional on the wire; legacy clients omit it.
+	 */
+	id: number;
 	phase?: "in" | "out";
 }
 
@@ -163,6 +168,20 @@ export function validateCursor(env: CursorEnvelope, ctx: ValidateContext): void 
 	}
 }
 
+/**
+ * Decode + validate the optional `cursor` arg every paginated handler
+ * receives. Returns `undefined` when the input is empty/missing (first
+ * page). On bad encoding or sort/hash/snapshot drift, throws — callers
+ * route the throw through `routeToolError` to a `CURSOR_INVALID` domain
+ * envelope (D26).
+ */
+export function decodeOptionalCursor(raw: string | undefined, ctx: ValidateContext): CursorEnvelope | undefined {
+	if (raw === undefined || raw.length === 0) return undefined;
+	const env = decodeCursor(raw);
+	validateCursor(env, ctx);
+	return env;
+}
+
 // ─── Schema validation ────────────────────────────────────────────────────
 
 function validateEnvelopeShape(value: unknown): CursorEnvelope {
@@ -226,13 +245,21 @@ function parseId(value: unknown): number {
 	return value;
 }
 
+function parseOptionalId(value: unknown, fallback: number): number {
+	if (value === undefined) return fallback;
+	return parseId(value);
+}
+
 function validateLinksKeysetKey(v: Record<string, unknown>): LinksKeysetKey {
 	const file = v.source_file;
 	if (typeof file !== "string") throw new CursorDecodeError("bad-source_file");
 	const ord = v.link_ordinal;
 	if (typeof ord !== "number" || !Number.isInteger(ord)) throw new CursorDecodeError("bad-link_ordinal");
 	const headingPath = parseHeadingPath(v.source_heading_path);
-	const out: LinksKeysetKey = { source_file: file, source_heading_path: headingPath, link_ordinal: ord };
+	// Optional on the wire; legacy clients omit `id`. Wikilinks rowids are
+	// positive auto-increments so `id > 0` matches every row.
+	const id = parseOptionalId(v.id, 0);
+	const out: LinksKeysetKey = { source_file: file, source_heading_path: headingPath, link_ordinal: ord, id };
 	const phase = v.phase;
 	if (phase === "in" || phase === "out") out.phase = phase;
 	return out;

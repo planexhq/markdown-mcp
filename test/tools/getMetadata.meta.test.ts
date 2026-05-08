@@ -11,14 +11,14 @@ import { describe, expect, test } from "vitest";
 import { handleGetMetadata } from "../../src/tools/getMetadata.js";
 import type { GetMetadataInput, MetaEnvelope, VaultError } from "../../src/types.js";
 import { stubIndex } from "../helpers/stubIndex.js";
+import { FAKE_VAULT_ROOT } from "../helpers/vault.js";
 
-const VAULT_ROOT = { absolute: "/tmp/vault-mcp-metadata-meta-test" };
 const TRAVERSE_INPUT: GetMetadataInput = { file: "../escape.md" };
 
 describe("get_metadata — error envelope `_meta` preservation", () => {
 	test("PathValidationError on warm index → _meta.index_status reflects warm; no tokenizer", async () => {
 		const index = stubIndex("warm", 42);
-		const r = await handleGetMetadata(TRAVERSE_INPUT, VAULT_ROOT, index);
+		const r = await handleGetMetadata(TRAVERSE_INPUT, FAKE_VAULT_ROOT, index);
 		expect(r.isError).toBe(true);
 		const err = r.structuredContent as VaultError;
 		expect(err.code).toBe("PATH_OUTSIDE_VAULT");

@@ -1,10 +1,10 @@
 /**
  * SQLite + FTS5 schema, pragmas, and migration runner. Single home for
- * raw DDL; all DML routes through {@link IndexHandle}. Schema v1 is
- * applied idempotently on every open via `CREATE ... IF NOT EXISTS` +
- * `INSERT OR IGNORE`, so reopening an existing DB is effectively a
- * no-op (better-sqlite3's `prepare` throws on missing tables, ruling
- * out a cheap pre-check short-circuit).
+ * raw DDL; all DML routes through {@link IndexHandle}. Pre-deployment
+ * the schema collapses to a single v1 migration that creates the full
+ * shape in one transaction; `CREATE … IF NOT EXISTS` + `INSERT OR
+ * IGNORE` keep reopens idempotent (better-sqlite3's `prepare` throws on
+ * missing tables, ruling out a cheap pre-check short-circuit).
  */
 
 import { existsSync } from "node:fs";
@@ -60,8 +60,6 @@ export function openSqlite(options: OpenSqliteOptions): OpenedSqlite {
 	for (const pragma of PRAGMAS) db.exec(pragma);
 	registerUdfs(db);
 	runMigrationV1(db);
-	runMigrationV2(db);
-	runMigrationV3(db);
 	return { db, preexisted };
 }
 
@@ -165,6 +163,18 @@ export function closeSqlite(db: DatabaseType): void {
 	db.close();
 }
 
+/**
+ * Single fresh-DB schema. Pre-deployment: no users to upgrade, so every
+ * column / table / index / trigger that the running code touches lives
+ * here. Idempotent via `CREATE … IF NOT EXISTS` + `INSERT OR IGNORE`,
+ * wrapped in one transaction so a crash mid-DDL rolls back cleanly.
+ *
+ * The `fragments.size` column is nullable on purpose: NULL is the
+ * runtime self-heal channel for corruption-recovery rebuilds.
+ * `isFileUnchanged` returns false for NULL sizes → forces re-index;
+ * merkle's `sizeDrift` likewise. No migration NULLs sizes today, but
+ * the channel stays available.
+ */
 export function runMigrationV1(db: DatabaseType): void {
 	db.transaction(() => {
 		db.exec(SCHEMA_V1_DDL);
@@ -172,64 +182,16 @@ export function runMigrationV1(db: DatabaseType): void {
 }
 
 /**
- * Idempotent `ALTER TABLE … ADD COLUMN` with optional in-txn backfill.
- *
- * Skipped via `PRAGMA table_info` (cheap metadata read) rather than a
- * `schema_version` bump because v1's `CHECK (version = 1)` pins the row
- * and widening it would require a table rebuild — not worth it for
- * single-column adds.
- *
- * `postAdd` runs inside the same transaction as the ALTER, so a crash
- * between the column add and the backfill rolls both back together.
+ * True iff `fragments` has rows but `file_metrics` is empty — the
+ * migrated-but-not-backfilled state CLAUDE.md's pre-W4 guard fixes.
+ * `replaceFile` always writes a `file_metrics` row alongside fragments,
+ * so the strict `count = 0` form has no false positives.
  */
-function alterAddColumn(
-	db: DatabaseType,
-	table: string,
-	column: string,
-	ddl: string,
-	postAdd?: (db: DatabaseType) => void,
-): void {
-	const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-	if (cols.some((c) => c.name === column)) return;
-	db.transaction(() => {
-		db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
-		postAdd?.(db);
-	})();
-}
-
-/**
- * v2 adds `index_meta.ever_complete`: a one-way persistent flag set on the
- * first clean scan finish. `chooseStartupState` uses it to distinguish a
- * partial first scan (no usable snapshot) from an interrupted reconcile of
- * a previously-complete index. Without this flag, a partial first scan with
- * any rows would advertise itself as warm at restart, silently truncating
- * vault-wide search to the indexed subset.
- */
-export function runMigrationV2(db: DatabaseType): void {
-	alterAddColumn(db, "index_meta", "ever_complete", "ever_complete INTEGER NOT NULL DEFAULT 0", (d) => {
-		// Backfill: existing DBs with `scan_complete=1` definitely had a clean
-		// scan. Existing partial-state DBs (`scan_complete=0` + count>0) are
-		// conservatively treated as never-complete — they get a one-time
-		// rescan to gain warm status, which is the correct behavior; the
-		// alternative (backfill from `EXISTS rows`) would re-introduce the
-		// round-13 partial-warm bug for upgraders.
-		d.exec("UPDATE index_meta SET ever_complete = 1 WHERE scan_complete = 1");
-	});
-}
-
-/**
- * v3 adds `fragments.size`: the on-disk file size in bytes, captured at
- * `replaceFile` time. The warm-restart skip path keys on `(mtime, size)` so
- * `rsync -t` / `cp -p` / `tar -p` (which preserve source mtime on a content-
- * changed copy) can no longer slip through and leave stale FTS / frontmatter
- * rows in place.
- *
- * No backfill: existing rows stay NULL. `isFileUnchanged` treats NULL as
- * "stored size unknown → cannot trust the skip" and returns false, forcing
- * a one-time re-index that populates size on every file. Self-healing.
- */
-export function runMigrationV3(db: DatabaseType): void {
-	alterAddColumn(db, "fragments", "size", "size INTEGER");
+export function detectPreW4Schema(db: DatabaseType): boolean {
+	const f = db.prepare("SELECT COUNT(DISTINCT file) AS n FROM fragments").get() as { n: number };
+	if (f.n === 0) return false;
+	const m = db.prepare("SELECT COUNT(*) AS n FROM file_metrics").get() as { n: number };
+	return m.n === 0;
 }
 
 // One `db.exec` so a crash mid-CREATE rolls back the txn cleanly. The
@@ -248,6 +210,13 @@ CREATE TABLE IF NOT EXISTS snapshot (
 );
 INSERT OR IGNORE INTO snapshot (id, value) VALUES (1, 0);
 
+CREATE TABLE IF NOT EXISTS index_meta (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  scan_complete INTEGER NOT NULL DEFAULT 0,
+  ever_complete INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO index_meta (id, scan_complete, ever_complete) VALUES (1, 0, 0);
+
 CREATE TABLE IF NOT EXISTS fragments (
   id                INTEGER PRIMARY KEY,
   file              TEXT    NOT NULL,
@@ -262,6 +231,7 @@ CREATE TABLE IF NOT EXISTS fragments (
   code              TEXT    NOT NULL,
   headings          TEXT    NOT NULL,
   mtime             INTEGER NOT NULL,
+  size              INTEGER,
   CHECK (
     (anchor_kind = 'heading'  AND stable_id IS NOT NULL AND heading_path_json IS NOT NULL AND heading_text IS NOT NULL AND structural_path IS NOT NULL)
  OR (anchor_kind = 'preamble' AND stable_id IS NULL     AND heading_path_json IS NULL     AND heading_text IS NULL     AND structural_path IS NULL)
@@ -308,11 +278,24 @@ CREATE TABLE IF NOT EXISTS frontmatter_tags (
 );
 CREATE INDEX IF NOT EXISTS frontmatter_tags_by_tag ON frontmatter_tags(tag);
 
-CREATE TABLE IF NOT EXISTS index_meta (
-  id            INTEGER PRIMARY KEY CHECK (id = 1),
-  scan_complete INTEGER NOT NULL DEFAULT 0
+CREATE TABLE IF NOT EXISTS wikilinks (
+  id                       INTEGER PRIMARY KEY,
+  source_file              TEXT    NOT NULL,
+  source_heading_path_json TEXT,
+  source_anchor_kind       TEXT    NOT NULL,
+  source_stable_id         TEXT,
+  link_ordinal             INTEGER NOT NULL,
+  raw_target               TEXT    NOT NULL,
+  lc_raw_target            TEXT    NOT NULL,
+  is_embed                 INTEGER NOT NULL,
+  alias                    TEXT,
+  link_text                TEXT    NOT NULL,
+  CHECK (source_anchor_kind IN ('heading', 'preamble', 'file')),
+  CHECK (is_embed IN (0, 1))
 );
-INSERT OR IGNORE INTO index_meta (id, scan_complete) VALUES (1, 0);
+CREATE INDEX IF NOT EXISTS wikilinks_by_source        ON wikilinks(source_file);
+CREATE INDEX IF NOT EXISTS wikilinks_by_raw_target    ON wikilinks(raw_target);
+CREATE INDEX IF NOT EXISTS wikilinks_by_lc_raw_target ON wikilinks(lc_raw_target);
 
 CREATE TABLE IF NOT EXISTS heading_history (
   file                   TEXT    NOT NULL,
@@ -325,5 +308,12 @@ CREATE TABLE IF NOT EXISTS heading_history (
   last_seen_mtime        INTEGER NOT NULL,
   retired_at_mtime       INTEGER NOT NULL,
   PRIMARY KEY (file, stable_id)
+);
+
+CREATE TABLE IF NOT EXISTS file_metrics (
+  file                     TEXT    PRIMARY KEY,
+  body_tokens_approx       INTEGER NOT NULL DEFAULT 0,
+  descendant_tokens_approx INTEGER NOT NULL DEFAULT 0,
+  content_kinds_json       TEXT    NOT NULL DEFAULT '[]'
 );
 `;

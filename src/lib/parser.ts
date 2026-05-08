@@ -116,7 +116,7 @@ export interface ParsedFile {
 	blockIndex: Record<string, BlockIndexEntry>;
 	headings: HeadingMeta[];
 	blocks: BlockMeta[];
-	preamble: { range: Range; offsetRange: OffsetRange } | null;
+	preamble: { range: Range; offsetRange: OffsetRange; contentKinds: ContentKind[] } | null;
 	/**
 	 * Source offsets of `code`/`inlineCode`/`math`/`inlineMath` AST nodes,
 	 * ascending. Wikilinks and block-IDs inside these ranges are notation,
@@ -189,7 +189,7 @@ export function parseFile(source: string, relpath: string, options: ParseFileOpt
 			blocks: [],
 			preamble: null,
 			excludedRanges: [],
-		};
+		} satisfies ParsedFile;
 	}
 
 	const tree = PROCESSOR.parse(source) as Root;
@@ -211,7 +211,13 @@ export function parseFile(source: string, relpath: string, options: ParseFileOpt
 	const headings = buildHeadingMetas(tree, source, relpath);
 	finalizeHeadingRanges(headings, source);
 	annotateBodyTokens(headings, source, tree);
-	annotateContentKinds(headings, tree);
+
+	const preamble = computePreamble(headings, source, frontmatterEndOffset);
+	// Preamble passed in so kinds for headingless files (and pre-first-heading
+	// nodes) accumulate on `preamble.contentKinds` instead of being silently
+	// dropped — `get_vault_tree`'s file-row `contentKinds` reads through the
+	// preamble bucket via `computeFileMetrics`.
+	annotateContentKinds(headings, tree, preamble);
 
 	const blockableNodes = collectBlockableNodes(tree, source);
 	const excludedRanges = collectExcludedRanges(tree);
@@ -221,8 +227,6 @@ export function parseFile(source: string, relpath: string, options: ParseFileOpt
 
 	const outline = buildOutlineTree(headings);
 	annotateDescendantTokens(outline, headings);
-
-	const preamble = computePreamble(headings, source, frontmatterEndOffset);
 
 	return {
 		relpath,
@@ -499,12 +503,15 @@ function annotateBodyTokens(headings: HeadingMeta[], source: string, _tree: Root
 	}
 }
 
-function annotateContentKinds(headings: HeadingMeta[], tree: Root): void {
-	if (headings.length === 0) return;
+function annotateContentKinds(
+	headings: HeadingMeta[],
+	tree: Root,
+	preamble: { range: Range; offsetRange: OffsetRange; contentKinds: ContentKind[] } | null,
+): void {
 	// Body ranges are non-overlapping slices of the document (each top-level
-	// non-heading node belongs to exactly one heading's IMMEDIATE body), so
-	// one pass over `tree.children` + binary-search per node is O(C × log H)
-	// instead of the previous O(H × C × nested-list).
+	// non-heading node belongs to exactly one heading's IMMEDIATE body OR to
+	// the preamble), so one pass over `tree.children` + binary-search per
+	// node is O(C × log H) instead of the previous O(H × C × nested-list).
 	//
 	// Per node, recurse uniformly via `visit()` — paragraphs hold inline
 	// `image` nodes and blockquotes hold arbitrary block content; both
@@ -512,17 +519,24 @@ function annotateContentKinds(headings: HeadingMeta[], tree: Root): void {
 	// types (heading, paragraph, text, etc.) so visit-the-start-node is
 	// idempotent on a Set.
 	const kindsByStableId = new Map<string, Set<ContentKind>>();
+	const preambleKinds = new Set<ContentKind>();
 	for (const node of tree.children) {
 		const start = node.position?.start.offset ?? -1;
 		if (start < 0) continue;
 		const heading = findHeadingByBodyOffset(start, headings);
-		if (!heading) continue;
-		let kinds = kindsByStableId.get(heading.stable_id);
-		if (!kinds) {
-			kinds = new Set<ContentKind>();
-			kindsByStableId.set(heading.stable_id, kinds);
+		// Headingless file OR pre-first-heading nodes route to the preamble
+		// bucket so their kinds aren't silently dropped.
+		let target: Set<ContentKind>;
+		if (heading) {
+			let existing = kindsByStableId.get(heading.stable_id);
+			if (!existing) {
+				existing = new Set<ContentKind>();
+				kindsByStableId.set(heading.stable_id, existing);
+			}
+			target = existing;
+		} else {
+			target = preambleKinds;
 		}
-		const target = kinds;
 		visit(node, (n) => {
 			const k = nodeContentKind(n);
 			if (k) target.add(k);
@@ -533,6 +547,7 @@ function annotateContentKinds(headings: HeadingMeta[], tree: Root): void {
 		const kinds = kindsByStableId.get(h.stable_id);
 		if (kinds && kinds.size > 0) h.contentKinds = [...kinds];
 	}
+	if (preamble && preambleKinds.size > 0) preamble.contentKinds = [...preambleKinds];
 }
 
 /**
@@ -692,6 +707,7 @@ function buildBlockMetas(
 			blockIndex[m.id] = {
 				range: block.range,
 				heading_path: block.containingHeadingPath,
+				containing_stable_id: block.containingStableId,
 			};
 		}
 	}
@@ -812,7 +828,7 @@ function computePreamble(
 	headings: HeadingMeta[],
 	source: string,
 	frontmatterEndOffset: number,
-): { range: Range; offsetRange: OffsetRange } | null {
+): { range: Range; offsetRange: OffsetRange; contentKinds: ContentKind[] } | null {
 	// Headingless notes: the entire post-frontmatter body IS the preamble
 	// — Brief line 784 says `anchor: {kind: "heading_path", path: []}`
 	// must resolve to "content before first heading," and for a headingless
@@ -828,6 +844,7 @@ function computePreamble(
 	return {
 		range: { start: startLine, end: Math.max(startLine, lastBodyLine) },
 		offsetRange: { start: startOffset, end: endOffset },
+		contentKinds: [],
 	};
 }
 
@@ -878,13 +895,50 @@ function githubSlug(text: string): string {
 /**
  * Canonical heading-text shape for `heading_path` matching: NFC + trim +
  * whitespace-collapse. Used at index time to build `pathText` and at query
- * time to normalize agent input (`getFragment.normalizeHeadingPath`) — both
- * endpoints must run the same pipeline or sloppy whitespace silently drops
- * to HEADING_NOT_FOUND. NFC and trim are idempotent so calling on already-
- * stripped text is safe.
+ * time to normalize agent input — both endpoints must run the same
+ * pipeline or sloppy whitespace silently drops to HEADING_NOT_FOUND. NFC
+ * and trim are idempotent so calling on already-stripped text is safe.
  */
 export function normalizeHeadingText(text: string): string {
 	return text.normalize("NFC").trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Canonicalize an agent-supplied `heading_path` to the array form used
+ * by every `parsed.headings[].headingPath` field. Accepts either an
+ * array or `"A > B"` string form; each component is normalized through
+ * {@link normalizeHeadingText} and empty segments dropped. Shared by
+ * `get_fragment` and `get_links` narrowing.
+ */
+export function normalizeHeadingPath(path: string | string[]): string[] {
+	const components = typeof path === "string" ? path.split(/\s*>\s*/) : path;
+	return components.map(normalizeHeadingText).filter((s) => s.length > 0);
+}
+
+export function headingPathsEqual(a: ReadonlyArray<string>, b: ReadonlyArray<string>): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+/**
+ * Byte offset where a file's body begins after the frontmatter — the
+ * starting point a "whole file" fragment slice or embed expansion uses.
+ *
+ * Fallback chain: preamble offset (when present) → first heading start
+ * (skips a whitespace-only gap between frontmatter and heading, e.g.
+ * `---\n...\n---\n\n# H\n`) → first block start → raw frontmatter end
+ * for the truly empty / frontmatter-only case. Plain `preamble ??
+ * frontmatterEndOffset` would emit a stray leading `\n` on
+ * frontmatter+blank+heading files.
+ */
+export function fileBodyStartOffset(parsed: ParsedFile): number {
+	return (
+		parsed.preamble?.offsetRange.start ??
+		parsed.headings[0]?.offsetRange.start ??
+		parsed.blocks[0]?.offsetRange.start ??
+		parsed.frontmatterEndOffset
+	);
 }
 
 function uniqueSlug(base: string, seen: Set<string>, counters: Map<string, number>): string {
@@ -901,9 +955,9 @@ function uniqueSlug(base: string, seen: Set<string>, counters: Map<string, numbe
 
 function countLines(source: string): number {
 	// CommonMark §2.3 line endings: each `\n`, bare `\r`, or `\r\n` pair
-	// counts once. Round-14 enabled bare-CR support at the frontmatter layer;
-	// outline ranges (preamble.range, last-heading EOF line) and pushRange's
-	// blockquote walk-back rely on the same EOL surface.
+	// counts once. Outline ranges (preamble.range, last-heading EOF line)
+	// and pushRange's blockquote walk-back rely on this EOL surface — the
+	// frontmatter layer also accepts bare CR for the same reason.
 	if (source.length === 0) return 1;
 	let count = 1;
 	for (let i = 0; i < source.length; i++) {

@@ -36,6 +36,36 @@ function makeFilterKeyset(requestHash = "abc", snapshot = 1): CursorEnvelope {
 	};
 }
 
+function makeLinksKeyset(
+	requestHash = "lh",
+	snapshot = 1,
+	phase: "in" | "out" | undefined = undefined,
+): CursorEnvelope {
+	return {
+		v: 1,
+		sort: "links-keyset-v1",
+		request_hash: requestHash,
+		snapshot_mtime: snapshot,
+		after_key: {
+			source_file: "src.md",
+			source_heading_path: ["Section"],
+			link_ordinal: 3,
+			id: 42,
+			...(phase !== undefined ? { phase } : {}),
+		},
+	};
+}
+
+function makeTreeDfs(requestHash = "td", snapshot = 1): CursorEnvelope {
+	return {
+		v: 1,
+		sort: "tree-dfs-v1",
+		request_hash: requestHash,
+		snapshot_mtime: snapshot,
+		after_key: { dfs_rank: 7 },
+	};
+}
+
 describe("cursor — encode/decode round-trip", () => {
 	test("score-desc round-trips exact shape", () => {
 		const env = makeScoreDesc("abc", 100);
@@ -49,6 +79,58 @@ describe("cursor — encode/decode round-trip", () => {
 		const env = makeFilterKeyset("def", 200);
 		const encoded = encodeCursor(env);
 		const decoded = decodeCursor(encoded);
+		expect(decoded).toEqual(env);
+	});
+
+	test("links-keyset-v1 round-trips without phase", () => {
+		const env = makeLinksKeyset("xx", 5);
+		const decoded = decodeCursor(encodeCursor(env));
+		expect(decoded).toEqual(env);
+	});
+
+	test("links-keyset-v1 round-trips with phase=in", () => {
+		const env = makeLinksKeyset("xx", 5, "in");
+		const decoded = decodeCursor(encodeCursor(env));
+		expect(decoded).toEqual(env);
+	});
+
+	test("links-keyset-v1 round-trips with phase=out and null source_heading_path", () => {
+		const env: CursorEnvelope = {
+			v: 1,
+			sort: "links-keyset-v1",
+			request_hash: "rh",
+			snapshot_mtime: 1,
+			after_key: { source_file: "x.md", source_heading_path: null, link_ordinal: 1, id: 9, phase: "out" },
+		};
+		const decoded = decodeCursor(encodeCursor(env));
+		expect(decoded).toEqual(env);
+	});
+
+	test("links-keyset-v1 legacy cursor without id decodes to id: 0", () => {
+		// Legacy cursors (no `id`) decode with `id: 0` so single-section vaults
+		// keep paginating; rowids are positive auto-increments.
+		const legacyEnv: CursorEnvelope = {
+			v: 1,
+			sort: "links-keyset-v1",
+			request_hash: "rh",
+			snapshot_mtime: 1,
+			after_key: { source_file: "x.md", source_heading_path: null, link_ordinal: 1, id: 0 },
+		};
+		const encoded = encodeCursor({
+			v: 1,
+			sort: "links-keyset-v1",
+			request_hash: "rh",
+			snapshot_mtime: 1,
+			// biome-ignore lint/suspicious/noExplicitAny: simulating a legacy cursor shape on the wire
+			after_key: { source_file: "x.md", source_heading_path: null, link_ordinal: 1 } as any,
+		});
+		const decoded = decodeCursor(encoded);
+		expect(decoded).toEqual(legacyEnv);
+	});
+
+	test("tree-dfs-v1 round-trips", () => {
+		const env = makeTreeDfs("rh", 9);
+		const decoded = decodeCursor(encodeCursor(env));
 		expect(decoded).toEqual(env);
 	});
 });

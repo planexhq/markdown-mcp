@@ -16,14 +16,14 @@ import { stat } from "node:fs/promises";
 import {
 	type CursorEnvelope,
 	type CursorSort,
-	decodeCursor,
+	decodeOptionalCursor,
 	encodeCursor,
 	type FilterKeysetKey,
 	parseHeadingPathJson,
 	type ScoreDescKey,
-	validateCursor,
 } from "../lib/cursor.js";
 import {
+	indexWarmingEnvelope,
 	newMeta,
 	successEnvelope,
 	type ToolErrorEnvelope,
@@ -34,7 +34,8 @@ import {
 import { compileFilter } from "../lib/filter.js";
 import { isHiddenPath } from "../lib/hiddenPath.js";
 import type { IndexHandle, SearchRow, SearchScopeClause } from "../lib/index/IndexHandle.js";
-import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "../lib/limits.js";
+import { isIndexWarming } from "../lib/index_status.js";
+import { clampPageSize } from "../lib/limits.js";
 import { QUERY_ALGORITHM_ID, sanitizeQuery } from "../lib/search/sanitize.js";
 import {
 	BM25_SNIPPET_ALGORITHM_ID,
@@ -103,8 +104,12 @@ export async function handleSearch(
 			return successEnvelope({ items: [], retriever: "bm25" } satisfies SearchOutput, successMeta);
 		}
 
-		if (indexStatus.state === "cold" || indexStatus.state === "warming") {
-			return indexWarmingEnvelope(meta, indexStatus.files_indexed);
+		if (isIndexWarming(indexStatus.state)) {
+			return indexWarmingEnvelope(meta, {
+				filesIndexed: indexStatus.files_indexed,
+				message: "Index is warming; vault-wide search is not yet available.",
+				suggestion: "Retry after the warm-up completes; bounded reads (outline/fragment/metadata) work now.",
+			});
 		}
 
 		const queryMode = outcome.kind === "ok";
@@ -115,7 +120,11 @@ export async function handleSearch(
 			queryMatch: outcome.kind === "ok" ? outcome.match : "",
 		});
 		const snapshotMtime = index.getSnapshot();
-		const cursorEnv = decodeOptionalCursor(input.cursor, expectedSort, requestHash, snapshotMtime);
+		const cursorEnv = decodeOptionalCursor(input.cursor, {
+			expectedSort,
+			currentRequestHash: requestHash,
+			currentSnapshotMtime: snapshotMtime,
+		});
 
 		let rows: SearchRow[];
 		let snippetAlgo: string;
@@ -220,25 +229,6 @@ async function classifyScope(rawPath: string | undefined, vaultRoot: VaultRoot):
 	};
 }
 
-function clampPageSize(input: number | undefined): number {
-	if (input === undefined || !Number.isFinite(input)) return DEFAULT_PAGE_SIZE;
-	const n = Math.floor(input);
-	if (n < 1) return DEFAULT_PAGE_SIZE;
-	return Math.min(n, MAX_PAGE_SIZE);
-}
-
-function decodeOptionalCursor(
-	raw: string | undefined,
-	expectedSort: CursorSort,
-	currentRequestHash: string,
-	currentSnapshotMtime: number,
-): CursorEnvelope | undefined {
-	if (raw === undefined || raw.length === 0) return undefined;
-	const env = decodeCursor(raw);
-	validateCursor(env, { expectedSort, currentRequestHash, currentSnapshotMtime });
-	return env;
-}
-
 /**
  * Hash of the request-shaping inputs for `search` cursors. Reusing a
  * cursor across mutated `scope` or `query` produces a different hash
@@ -258,20 +248,6 @@ function decodeOptionalCursor(
 function computeRequestHash(inputs: { filterHash: string; scope: SearchScopeClause; queryMatch: string }): string {
 	const payload = `${inputs.filterHash}\u0000${inputs.scope.kind}\u0000${inputs.scope.value ?? ""}\u0000${inputs.queryMatch}`;
 	return createHash("sha1").update(payload).digest("hex");
-}
-
-function indexWarmingEnvelope(meta: MetaEnvelope, filesIndexed: number): ToolErrorEnvelope {
-	const err = vaultError("INDEX_WARMING", "Index is warming; vault-wide search is not yet available.", {
-		retry_after_ms: 1000,
-		request_id: meta.request_id,
-		progress: {
-			files_indexed: filesIndexed,
-			files_total_estimate: filesIndexed,
-			phase: "scanning",
-		},
-		suggestion: "Retry after the warm-up completes; bounded reads (outline/fragment/metadata) work now.",
-	});
-	return toolErrorEnvelope(err, meta);
 }
 
 /**

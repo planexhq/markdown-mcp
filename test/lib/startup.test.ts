@@ -30,8 +30,8 @@ describe("chooseStartupState", () => {
 	});
 
 	test("preexisted + !scan_complete + !ever_complete + rows → cold + log mentions partial first scan", () => {
-		// Round-14 F1: partial first scan (interrupted before any clean
-		// finish) — rows exist but they only cover a subset of the vault.
+		// Partial first scan (interrupted before any clean finish) —
+		// rows exist but they only cover a subset of the vault.
 		// Going warm would silently truncate vault-wide search.
 		const decision = chooseStartupState({
 			preexisted: true,
@@ -53,6 +53,22 @@ describe("chooseStartupState", () => {
 		});
 		expect(decision.state).toBe("cold");
 		expect(decision.log).toContain("no indexed rows");
+	});
+
+	test("preexisted + !scan_complete + ever_complete + 0 rows → warm (round 25 F5)", () => {
+		// Empty vault that previously scanned cleanly (ever_complete=true)
+		// then was interrupted mid-reconcile. Pre-fix this fell through to
+		// `cold` because `fileCount > 0` was required, wedging vault-wide
+		// tools at INDEX_WARMING during the unnecessary rescan.
+		const decision = chooseStartupState({
+			preexisted: true,
+			scanComplete: false,
+			everComplete: true,
+			fileCount: 0,
+		});
+		expect(decision.state).toBe("warm");
+		expect(decision.log).toContain("0 files indexed");
+		expect(decision.log).toContain("last scan incomplete");
 	});
 
 	test("fresh DB (!preexisted) → cold + no log", () => {
