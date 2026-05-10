@@ -37,7 +37,7 @@ const setups: Setup[] = [];
 async function setup(structure: VaultStructure): Promise<Setup> {
 	const vault = await createTempVault(structure);
 	const opened = openSqlite({ dbPath: ":memory:" });
-	const index = createIndexHandle(opened.db);
+	const index = createIndexHandle(opened.db, { includeHidden: false });
 	// validateVaultRoot realpath's the temp dir — required for indexOne's
 	// `validatePath` containment check to pass on macOS where /var/folders
 	// resolves through a symlink to /private/var/folders.
@@ -101,6 +101,20 @@ describe("scanVault — basic", () => {
 		ctrl.abort();
 		const result = await scanVault({ vaultRoot: s.vaultRoot, index: s.index, signal: ctrl.signal });
 		expect(result.aborted).toBe(true);
+	});
+
+	test("excludes .vault-mcp even under --include-hidden", async () => {
+		// The watcher hard-ignores .vault-mcp via isIndexCachePath; the
+		// scanner's walkVault must do the same so a markdown file colocated
+		// with the cache (e.g. operator drops `.vault-mcp/notes.md`) never
+		// gets indexed under --include-hidden. Otherwise rows drift out of
+		// sync with edits forever.
+		const s = await setup({
+			"a.md": "# A\n\nbody",
+			".vault-mcp": { "internal.md": "# internal\n\nshould not be indexed" },
+		});
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1, includeHidden: true });
+		expect(s.index.listIndexedFiles().sort()).toEqual(["a.md"]);
 	});
 });
 
@@ -662,7 +676,7 @@ describe("confirmPrune — segment-walk re-validation", () => {
 			await symlink(elsewhere, join(s.vault.path, "notes"));
 			// confirmPrune should now recognize the path as unaddressable
 			// and return true (prune).
-			const verdict = await confirmPrune("notes/file.md", s.vaultRoot);
+			const verdict = await confirmPrune("notes/file.md", s.vaultRoot, false);
 			expect(verdict).toBe(true);
 		} finally {
 			await rm(elsewhere, { recursive: true, force: true });
@@ -671,14 +685,14 @@ describe("confirmPrune — segment-walk re-validation", () => {
 
 	test("regular file still on disk → don't prune", async () => {
 		const s = await setup({ "x.md": "# X\n\nbody" });
-		const verdict = await confirmPrune("x.md", s.vaultRoot);
+		const verdict = await confirmPrune("x.md", s.vaultRoot, false);
 		expect(verdict).toBe(false);
 	});
 
 	test("ENOENT leaf → prune", async () => {
 		const s = await setup({ "x.md": "# X\n\nbody" });
 		await rm(join(s.vault.path, "x.md"));
-		const verdict = await confirmPrune("x.md", s.vaultRoot);
+		const verdict = await confirmPrune("x.md", s.vaultRoot, false);
 		expect(verdict).toBe(true);
 	});
 
@@ -692,11 +706,28 @@ describe("confirmPrune — segment-walk re-validation", () => {
 		const subdir = join(s.vault.path, "subdir");
 		try {
 			await chmod(subdir, 0o000);
-			const verdict = await confirmPrune("subdir/file.md", s.vaultRoot);
+			const verdict = await confirmPrune("subdir/file.md", s.vaultRoot, false);
 			expect(verdict).toBe(false);
 		} finally {
 			await chmod(subdir, 0o755);
 		}
+	});
+
+	test("hidden path with includeHidden=false → prune", async () => {
+		// Policy flip on→off: a row indexed during a prior `--include-hidden`
+		// session must be pruned when the same vault restarts in default
+		// mode. Without this gate, walkVault skips the hidden file (so it's
+		// not in the on-disk set) but the row survives confirmPrune (file
+		// physically exists), and search/get_links continue serving it.
+		const s = await setup({ ".secret.md": "# Secret\n\nhidden body" });
+		const verdict = await confirmPrune(".secret.md", s.vaultRoot, false);
+		expect(verdict).toBe(true);
+	});
+
+	test("hidden path with includeHidden=true → don't prune", async () => {
+		const s = await setup({ ".secret.md": "# Secret\n\nhidden body" });
+		const verdict = await confirmPrune(".secret.md", s.vaultRoot, true);
+		expect(verdict).toBe(false);
 	});
 });
 

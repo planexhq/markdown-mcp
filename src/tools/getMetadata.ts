@@ -25,6 +25,7 @@ export async function handleGetMetadata(
 	input: GetMetadataInput,
 	vaultRoot: VaultRoot,
 	index?: IndexHandle,
+	includeHidden = false,
 ): Promise<ToolSuccessEnvelope<GetMetadataResult> | ToolErrorEnvelope> {
 	// Hoisted before try so the catch can pass meta to routeToolError —
 	// preserves `index_status` on error envelopes. No `tokenizer` for
@@ -32,7 +33,7 @@ export async function handleGetMetadata(
 	const meta = newMetaForHandler(index);
 	try {
 		const safePath = await validatePath(input.file, vaultRoot);
-		const { parsed } = await readNote(safePath, { frontmatterOnly: true });
+		const { parsed } = await readNote(safePath, { frontmatterOnly: true }, includeHidden);
 		const result: GetMetadataResult = {
 			metadata: parsed.frontmatter ?? {},
 			has_frontmatter: parsed.hasFrontmatter,

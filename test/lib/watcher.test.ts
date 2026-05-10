@@ -30,7 +30,7 @@ async function setup(): Promise<Fixture> {
 	const v = await createTempVault({ "seed.md": "# Seed\n" });
 	const vaultRoot = await validateVaultRoot(v.path);
 	const opened = openSqlite({ dbPath: ":memory:" });
-	const index = createIndexHandle(opened.db);
+	const index = createIndexHandle(opened.db, { includeHidden: false });
 	index.setStatus("warming");
 	const coordinator = new WriteCoordinator();
 	await scanVault({ vaultRoot, index, coordinator, concurrency: 1 });
@@ -136,7 +136,7 @@ describe("watcher — ready() resolves even when called late", () => {
 		const v = await createTempVault({ "seed.md": "# Seed\n" });
 		const vaultRoot = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const index = createIndexHandle(opened.db);
+		const index = createIndexHandle(opened.db, { includeHidden: false });
 		index.setStatus("warming");
 
 		const watcher = startWatcher({
@@ -176,7 +176,7 @@ describe("watcher — per-file reindex serialization", () => {
 		const v = await createTempVault({ "queue.md": "# initial\n" });
 		const vaultRoot = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const index = createIndexHandle(opened.db);
+		const index = createIndexHandle(opened.db, { includeHidden: false });
 		index.setStatus("warming");
 		const coordinator = new WriteCoordinator();
 		await scanVault({ vaultRoot, index, coordinator, concurrency: 1 });
@@ -245,7 +245,7 @@ describe("watcher — close() does not drain coordinator", () => {
 		const v = await createTempVault({ "hold.md": "# v1\n" });
 		const vaultRoot = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const index = createIndexHandle(opened.db);
+		const index = createIndexHandle(opened.db, { includeHidden: false });
 		index.setStatus("warming");
 		const coordinator = new WriteCoordinator();
 		await scanVault({ vaultRoot, index, coordinator, concurrency: 1 });
@@ -300,7 +300,7 @@ describe("watcher — unlink queues behind in-flight reindex", () => {
 		const v = await createTempVault({ "ghost.md": "# v1\n" });
 		const vaultRoot = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const index = createIndexHandle(opened.db);
+		const index = createIndexHandle(opened.db, { includeHidden: false });
 		index.setStatus("warming");
 		const coordinator = new WriteCoordinator();
 		await scanVault({ vaultRoot, index, coordinator, concurrency: 1 });
@@ -424,7 +424,7 @@ describe("watcher — ignoreInitial: false emits add for pre-existing files", ()
 		const v = await createTempVault({ "preexisting.md": "# Hi\n" });
 		const vaultRoot = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const index = createIndexHandle(opened.db);
+		const index = createIndexHandle(opened.db, { includeHidden: false });
 		index.setStatus("warming");
 		const coordinator = new WriteCoordinator();
 

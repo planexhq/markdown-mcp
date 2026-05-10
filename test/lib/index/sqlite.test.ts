@@ -6,7 +6,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Database as DatabaseType } from "better-sqlite3";
+import Database, { type Database as DatabaseType } from "better-sqlite3";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
@@ -23,6 +23,24 @@ function listMaster(db: DatabaseType, type: "table" | "index"): string[] {
 		name: string;
 	}>;
 	return rows.map((r) => r.name);
+}
+
+/**
+ * Seed a fresh DB with the legacy 3-column `index_meta` shape, used
+ * by upgrade-path tests to exercise `ensureColumn`'s idempotent
+ * ALTER TABLE migrations.
+ */
+function seedLegacy3ColumnIndexMeta(dbPath: string, scanComplete: 0 | 1, everComplete: 0 | 1): void {
+	const seed = new Database(dbPath);
+	seed.exec(`
+		CREATE TABLE index_meta (
+		  id            INTEGER PRIMARY KEY CHECK (id = 1),
+		  scan_complete INTEGER NOT NULL DEFAULT 0,
+		  ever_complete INTEGER NOT NULL DEFAULT 0
+		);
+		INSERT INTO index_meta (id, scan_complete, ever_complete) VALUES (1, ${scanComplete}, ${everComplete});
+	`);
+	seed.close();
 }
 
 const opens: ReturnType<typeof openSqlite>[] = [];
@@ -92,11 +110,106 @@ describe("openSqlite", () => {
 		);
 	});
 
-	test("index_meta has scan_complete + ever_complete columns", () => {
+	test("index_meta has scan_complete + ever_complete + include_hidden + inflight_include_hidden columns", () => {
 		const { db } = open();
 		const cols = (db.prepare("PRAGMA table_info(index_meta)").all() as Array<{ name: string }>).map((c) => c.name);
-		expect(cols.sort()).toEqual(["ever_complete", "id", "scan_complete"]);
+		expect(cols.sort()).toEqual(["ever_complete", "id", "include_hidden", "inflight_include_hidden", "scan_complete"]);
 	});
+
+	test("legacy 3-column index_meta upgrades cleanly via ensureColumn", async () => {
+		// Regression: the seed `INSERT OR IGNORE` once referenced
+		// `include_hidden` inside `SCHEMA_V1_DDL`, which runs BEFORE
+		// `ensureColumn`. SQLite resolves column names at prepare time, so
+		// reopening a legacy 3-col table threw `no column named
+		// include_hidden`. Tempfile (not :memory:) is required — the bug
+		// only manifests across an open/close cycle.
+		const dir = await mkdtemp(join(tmpdir(), "vault-mcp-sqlite-legacy-"));
+		const dbPath = join(dir, "index.sqlite3");
+		try {
+			seedLegacy3ColumnIndexMeta(dbPath, 1, 1);
+
+			const opened = openSqlite({ dbPath });
+			try {
+				expect(opened.preexisted).toBe(true);
+				const cols = (opened.db.prepare("PRAGMA table_info(index_meta)").all() as Array<{ name: string }>).map(
+					(c) => c.name,
+				);
+				expect(cols.sort()).toEqual([
+					"ever_complete",
+					"id",
+					"include_hidden",
+					"inflight_include_hidden",
+					"scan_complete",
+				]);
+				const row = opened.db
+					.prepare(
+						"SELECT scan_complete, ever_complete, include_hidden, inflight_include_hidden FROM index_meta WHERE id = 1",
+					)
+					.get() as {
+					scan_complete: number;
+					ever_complete: number;
+					include_hidden: number | null;
+					inflight_include_hidden: number | null;
+				};
+				expect(row.scan_complete).toBe(1);
+				expect(row.ever_complete).toBe(1);
+				expect(row.include_hidden).toBeNull();
+				expect(row.inflight_include_hidden).toBeNull();
+			} finally {
+				closeSqlite(opened.db);
+			}
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("runMigrationV1 concurrent same-policy peers", () => {
+	test("two parallel migrations on a legacy 3-col DB both succeed without duplicate-column-name", async () => {
+		// Same-policy peers must serialize on the migration's
+		// `ensureColumn` PRAGMA→ALTER window — ALTER reads live schema
+		// (no snapshot isolation), so a deferred transaction races to
+		// "duplicate column name". Iterate to surface timing differences.
+		const dir = await mkdtemp(join(tmpdir(), "vault-mcp-sqlite-concurrent-mig-"));
+		const dbPath = join(dir, "index.sqlite3");
+		try {
+			seedLegacy3ColumnIndexMeta(dbPath, 0, 0);
+
+			for (let i = 0; i < 30; i++) {
+				const a = new Database(dbPath);
+				const b = new Database(dbPath);
+				a.pragma("busy_timeout = 5000");
+				b.pragma("busy_timeout = 5000");
+				try {
+					await Promise.all([
+						Promise.resolve().then(() => runMigrationV1(a)),
+						Promise.resolve().then(() => runMigrationV1(b)),
+					]);
+				} finally {
+					a.close();
+					b.close();
+				}
+
+				const check = new Database(dbPath);
+				try {
+					const cols = (check.prepare("PRAGMA table_info(index_meta)").all() as Array<{ name: string }>).map(
+						(c) => c.name,
+					);
+					expect(cols.sort()).toEqual([
+						"ever_complete",
+						"id",
+						"include_hidden",
+						"inflight_include_hidden",
+						"scan_complete",
+					]);
+				} finally {
+					check.close();
+				}
+			}
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
 });
 
 describe("schema CHECK constraints", () => {

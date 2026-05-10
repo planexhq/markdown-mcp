@@ -7,6 +7,8 @@
  * runs `npm run build` ahead of `npm test` per the workflow.
  */
 
+import { type ChildProcess, spawn } from "node:child_process";
+import { once } from "node:events";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,13 +34,19 @@ export interface TestClient {
  * from a `warming` snapshot. The probe tool is `search` because it
  * surfaces `_meta.index_status` cheaply; the query string is irrelevant.
  */
-export async function waitForWarm(client: Client): Promise<void> {
-	for (let i = 0; i < 100; i++) {
+export async function waitForWarm(client: Client, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	let lastState: string | undefined;
+	while (Date.now() < deadline) {
 		const r = await client.callTool({ name: "search", arguments: { query: "x" } });
 		const meta = r._meta as MetaEnvelope | undefined;
-		if (meta?.index_status?.state === "warm") return;
+		lastState = meta?.index_status?.state;
+		if (lastState === "warm") return;
 		await new Promise((resolve) => setTimeout(resolve, 100));
 	}
+	throw new Error(
+		`waitForWarm: index did not reach 'warm' within ${timeoutMs} ms (last state=${lastState ?? "unknown"})`,
+	);
 }
 
 /**
@@ -52,7 +60,11 @@ export async function waitForWarm(client: Client): Promise<void> {
  * `{ VAULT_EXTENSIONS: "md,mdx" }` so the spawned server reads the
  * widened predicate. PATH/HOME/etc. inherit from `process.env`.
  */
-export async function spawnTestServer(vaultPath: string, extraEnv: Record<string, string> = {}): Promise<TestClient> {
+export async function spawnTestServer(
+	vaultPath: string,
+	extraEnv: Record<string, string> = {},
+	extraArgs: string[] = [],
+): Promise<TestClient> {
 	const env: Record<string, string> = {};
 	for (const [k, v] of Object.entries(process.env)) {
 		if (typeof v === "string") env[k] = v;
@@ -62,7 +74,7 @@ export async function spawnTestServer(vaultPath: string, extraEnv: Record<string
 	}
 	const transport = new StdioClientTransport({
 		command: process.execPath,
-		args: [SERVER_BIN, "--vault", vaultPath],
+		args: [SERVER_BIN, "--vault", vaultPath, ...extraArgs],
 		stderr: "pipe",
 		env,
 	});
@@ -82,4 +94,87 @@ export async function spawnTestServer(vaultPath: string, extraEnv: Record<string
 			await client.close();
 		},
 	};
+}
+
+/**
+ * Spawn a `vault-mcp` server child WITHOUT the MCP handshake. Streams
+ * stderr into a captured buffer; resolves once the "vault-mcp running
+ * on stdio" log line lands (proving `main()` finished startup —
+ * lockfile written, SQLite opened, scanner kicked off). The caller
+ * inspects the captured stderr and decides when to SIGTERM. Used by
+ * tests that need to assert against startup log lines or observe
+ * lockfile state pre/post-shutdown.
+ */
+export interface SpawnedServer {
+	child: ChildProcess;
+	getStderr(): string;
+}
+
+export interface SpawnAndWaitOptions {
+	extraArgs?: string[];
+	extraEnv?: Record<string, string>;
+	/** Substring the spawned process logs to stderr once `waitFor` is reached. */
+	waitFor: string;
+	timeoutMs?: number;
+}
+
+/**
+ * Spawn `vault-mcp` and resolve once stderr contains `waitFor`. Single
+ * stderr listener shared between buffer accumulation and trigger
+ * detection — the `resolved` guard prevents double-resolve when the
+ * trigger lands in a chunk that also contains later content.
+ */
+export async function spawnAndWaitForStderr(vaultPath: string, opts: SpawnAndWaitOptions): Promise<SpawnedServer> {
+	const env: NodeJS.ProcessEnv = { ...process.env, ...opts.extraEnv };
+	const child = spawn(process.execPath, [SERVER_BIN, "--vault", vaultPath, ...(opts.extraArgs ?? [])], {
+		stdio: ["pipe", "pipe", "pipe"],
+		env,
+	});
+	let stderr = "";
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(
+			() => reject(new Error(`timed out waiting for stderr "${opts.waitFor}"`)),
+			opts.timeoutMs ?? 10_000,
+		);
+		let resolved = false;
+		const onData = (chunk: Buffer): void => {
+			stderr += chunk.toString();
+			if (!resolved && stderr.includes(opts.waitFor)) {
+				resolved = true;
+				clearTimeout(timer);
+				resolve();
+			}
+		};
+		child.stderr?.on("data", onData);
+		child.on("exit", () => {
+			clearTimeout(timer);
+			if (!resolved) reject(new Error(`child exited before stderr "${opts.waitFor}" arrived`));
+		});
+	});
+	return {
+		child,
+		getStderr: () => stderr,
+	};
+}
+
+export async function spawnAndWaitForStartup(
+	vaultPath: string,
+	extraArgs: string[] = [],
+	timeoutMs = 10_000,
+): Promise<SpawnedServer> {
+	return spawnAndWaitForStderr(vaultPath, {
+		extraArgs,
+		waitFor: "vault-mcp running on stdio",
+		timeoutMs,
+	});
+}
+
+/**
+ * Await child exit and return the exit code (or null if killed via signal
+ * without a code). Thin wrapper over `events.once` so callers don't need
+ * to spell out the typed-tuple destructuring at every site.
+ */
+export async function waitForExit(child: ChildProcess): Promise<number | null> {
+	const [code] = (await once(child, "exit")) as [number | null];
+	return code;
 }

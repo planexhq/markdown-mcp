@@ -16,12 +16,13 @@
 
 import { lstat, readdir, stat } from "node:fs/promises";
 import { extname, join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { AnchorKind, ContentKind, SafePath } from "../../types.js";
 import { isWhitespaceRange } from "../blockIds.js";
 import { errorMessage, getErrnoCode, isVanishedErrno } from "../error.js";
 import { isUnderFailedSubtree } from "../failedSubtrees.js";
 import { ISO_LIKELY_RE, isCalendarDate, parseIsoDatetimeToCanonical, toCanonicalUtcIso } from "../filter.js";
-import { isHiddenName, isNonNfc } from "../hiddenPath.js";
+import { isHiddenName, isHiddenPath, isIndexCachePath, isNonNfc } from "../hiddenPath.js";
 import { type ParsedFile, ParseError } from "../parser.js";
 import { readNote } from "../readNote.js";
 import { estimateTokens } from "../tokenizer.js";
@@ -65,6 +66,12 @@ export interface ScanArgs {
 	 * "Scanner finalize race" gotcha.
 	 */
 	preFinalize?: () => Promise<void>;
+	/**
+	 * Server-wide hidden-path policy. Default false — dot-prefixed paths
+	 * are excluded from `walkVault`. Set true via `--include-hidden` to
+	 * index hidden notes symmetrically with every other surface.
+	 */
+	includeHidden?: boolean;
 }
 
 export interface ScanResult {
@@ -74,7 +81,7 @@ export interface ScanResult {
 }
 
 export async function scanVault(args: ScanArgs): Promise<ScanResult> {
-	const { vaultRoot, index, signal, concurrency = 4, onProgress } = args;
+	const { vaultRoot, index, signal, concurrency = 4, onProgress, includeHidden = false } = args;
 	// Default-construct so the worker can use the same code path
 	// regardless of whether the caller supplied a shared coordinator.
 	// A scanner-only coordinator is harmless: relpaths are unique per
@@ -96,6 +103,12 @@ export async function scanVault(args: ScanArgs): Promise<ScanResult> {
 	const priorScanComplete = index.getScanComplete();
 	const startingState = index.getStatus().state;
 	index.setScanComplete(false);
+	// Record the policy under which this scan starts. `markScanFinalized`
+	// clears the column atomically with the clean-finish flags; a SIGTERM
+	// between these two writes leaves the marker set, which the next
+	// startup compares against the running `args.includeHidden` to detect
+	// a partial scan under a possibly-different policy.
+	index.setInflightIncludeHidden(includeHidden);
 	index.setStatus(startingState === "warm" ? "reconciling" : "warming");
 	index.setScanInProgress(true);
 	// Reset the failed-subtrees gate for this scan. End-of-scan resets
@@ -119,7 +132,7 @@ export async function scanVault(args: ScanArgs): Promise<ScanResult> {
 		// progress envelope.
 		onProgress?.({ files_indexed: 0, files_total_estimate: 0, phase: "scanning" });
 		const files: string[] = [];
-		for await (const file of walkVault(vaultRoot.absolute, "", failedSubtrees, signal)) {
+		for await (const file of walkVault(vaultRoot.absolute, "", failedSubtrees, includeHidden, signal)) {
 			files.push(file);
 			if (files.length % 100 === 0) {
 				onProgress?.({
@@ -159,7 +172,7 @@ export async function scanVault(args: ScanArgs): Promise<ScanResult> {
 					// back a fresh commit. `skipUnchanged=priorScanComplete`
 					// (captured before the flip — see top of `scanVault`).
 					const outcome = await coordinator.enqueue(relpath, () =>
-						indexOne(vaultRoot, index, relpath, priorScanComplete),
+						indexOne(vaultRoot, index, relpath, priorScanComplete, includeHidden),
 					);
 					if (outcome === "indexed") {
 						indexed++;
@@ -206,7 +219,7 @@ export async function scanVault(args: ScanArgs): Promise<ScanResult> {
 			// Prune files that are in the index but no longer on disk. Done
 			// before `setScanComplete(true)` so a crash mid-prune leaves the
 			// flag false and the next startup re-runs the diff.
-			await pruneVanishedFiles(index, stillOnDisk, failedSubtrees, vaultRoot, coordinator);
+			await pruneVanishedFiles(index, stillOnDisk, failedSubtrees, vaultRoot, coordinator, includeHidden);
 			// Cover unlink events chokidar dropped. `clearPendingRetry` is
 			// gated by `scanInProgress=true` so it only removes entries; the
 			// end-of-scan if-check below is what finalizes.
@@ -272,6 +285,18 @@ export async function scanVault(args: ScanArgs): Promise<ScanResult> {
 
 const PRUNE_STAT_BATCH = 64;
 
+/** Absorbs the BUSY → peer-commit visibility race; mirrors `UNPARSEABLE_RETRY_DELAY_MS` in `serverLock.ts`. */
+const BUSY_RECHECK_DELAY_MS = 25;
+
+/**
+ * better-sqlite3 throws `SqliteError` with `code: "SQLITE_BUSY"` (or
+ * `SQLITE_BUSY_SNAPSHOT` under WAL) when `busy_timeout` exhausts.
+ */
+function isSqliteBusyError(err: unknown): boolean {
+	const code = getErrnoCode(err);
+	return code === "SQLITE_BUSY" || code === "SQLITE_BUSY_SNAPSHOT";
+}
+
 /**
  * `true` iff `lstat(rel)` throws ENOENT/ENOTDIR. Other errno
  * (EACCES, EMFILE, EIO, …) treat as transient and return `false`
@@ -293,6 +318,18 @@ async function lstatVanished(rel: string, vaultRoot: VaultRoot): Promise<boolean
  *   - File's extension no longer matches `VAULT_EXTENSIONS` (policy
  *     shrink: e.g. `md,mdx → md` leaves orphaned `.mdx` rows that the
  *     walk skipped). Cheap string predicate; no syscall.
+ *   - Path lives under the server's cache dir (`.vault-mcp/`).
+ *     `walkVault` skips it unconditionally so any pre-existing row
+ *     under that prefix reaches the prune-candidates list; without
+ *     this gate, search/get_links would keep surfacing cache content
+ *     because the storage layer carries no cache-prefix predicate.
+ *     Independent of `includeHidden`.
+ *   - Path is hidden AND `includeHidden=false` (policy flipped from
+ *     on→off; rows from a prior `--include-hidden` run must not survive
+ *     into a default-mode session — `walkVault` skips them so they
+ *     reach this path via the prune candidates list. Without this gate,
+ *     `IndexHandle.search*` and `wikilinks` continue serving them
+ *     because the storage layer carries no hidden-row predicate).
  *   - Path is not a regular file on disk (`lstat` says directory,
  *     symlink, FIFO, …).
  *   - `lstat` ENOENT/ENOTDIR — file genuinely vanished.
@@ -304,8 +341,10 @@ async function lstatVanished(rel: string, vaultRoot: VaultRoot): Promise<boolean
  * metadata, leaving a row pointing at a path `validatePath` now
  * rejects.
  */
-export async function confirmPrune(rel: string, vaultRoot: VaultRoot): Promise<boolean> {
+export async function confirmPrune(rel: string, vaultRoot: VaultRoot, includeHidden: boolean): Promise<boolean> {
 	if (!isMarkdownPath(rel)) return true;
+	if (isIndexCachePath(rel)) return true;
+	if (!includeHidden && isHiddenPath(rel)) return true;
 	// Segment-walk via validatePath catches parent-dir symlink swaps and
 	// any path the indexer would now refuse (NFC/percent mismatches, depth
 	// cap, hidden-segment policy). A flat lstat(leaf) follows parent
@@ -344,11 +383,14 @@ export async function confirmPrune(rel: string, vaultRoot: VaultRoot): Promise<b
 export async function confirmAndPrune(
 	candidates: ReadonlyArray<string>,
 	vaultRoot: VaultRoot,
+	includeHidden: boolean,
 	onPrune: (rel: string) => void | Promise<void>,
 ): Promise<void> {
 	for (let i = 0; i < candidates.length; i += PRUNE_STAT_BATCH) {
 		const batch = candidates.slice(i, i + PRUNE_STAT_BATCH);
-		const verdicts = await Promise.all(batch.map(async (rel) => ({ rel, prune: await confirmPrune(rel, vaultRoot) })));
+		const verdicts = await Promise.all(
+			batch.map(async (rel) => ({ rel, prune: await confirmPrune(rel, vaultRoot, includeHidden) })),
+		);
 		// Fan out so async `onPrune` callers (merkle, which routes through
 		// the coordinator) don't serialize N independent prune dispatches.
 		// Sync callers see no throughput change — better-sqlite3 serializes
@@ -363,6 +405,7 @@ async function pruneVanishedFiles(
 	failedSubtrees: ReadonlySet<string>,
 	vaultRoot: VaultRoot,
 	coordinator: WriteCoordinator,
+	includeHidden: boolean,
 ): Promise<void> {
 	const onDisk = new Set(onDiskFiles);
 	const retiredAt = Date.now();
@@ -372,7 +415,7 @@ async function pruneVanishedFiles(
 		if (isUnderFailedSubtree(file, failedSubtrees)) continue;
 		candidates.push(file);
 	}
-	await confirmAndPrune(candidates, vaultRoot, async (file) => {
+	await confirmAndPrune(candidates, vaultRoot, includeHidden, async (file) => {
 		// Re-confirm INSIDE the coordinator window: a watcher reindex of
 		// this path queues on the same FIFO key (FIFO-ordered ahead of
 		// this task), so by the time we run, any concurrent recreate has
@@ -380,7 +423,7 @@ async function pruneVanishedFiles(
 		// deleted. Cost: one extra lstat per pruned file. Mirrors merkle's
 		// prune routing in merkle.ts.
 		await coordinator.enqueue(file, async () => {
-			if (await confirmPrune(file, vaultRoot)) {
+			if (await confirmPrune(file, vaultRoot, includeHidden)) {
 				index.removeFile(file, retiredAt);
 			}
 		});
@@ -397,6 +440,7 @@ async function* walkVault(
 	root: string,
 	relParent: string,
 	failedSubtrees: Set<string>,
+	includeHidden: boolean,
 	signal?: AbortSignal,
 ): AsyncGenerator<string> {
 	if (signal?.aborted) return;
@@ -426,11 +470,17 @@ async function* walkVault(
 		if (signal?.aborted) return;
 		const name = entry.name;
 		// Parent is already vetted by recursion; check the new segment only.
-		if (isHiddenName(name)) continue;
+		if (!includeHidden && isHiddenName(name)) continue;
 		const childRel = relParent ? `${relParent}/${name}` : name;
+		// Server's own cache dir is excluded regardless of `--include-hidden`
+		// (mirrors `watcher.ts:shouldIgnore`). Without this, `walkVault` recurses
+		// into `.vault-mcp/` under the flag and would index any markdown there;
+		// the watcher hard-ignores the same prefix so those rows would never
+		// refresh on edit.
+		if (isIndexCachePath(childRel)) continue;
 		if (entry.isSymbolicLink()) continue;
 		if (entry.isDirectory()) {
-			yield* walkVault(root, childRel, failedSubtrees, signal);
+			yield* walkVault(root, childRel, failedSubtrees, includeHidden, signal);
 			continue;
 		}
 		if (!entry.isFile()) continue;
@@ -492,6 +542,7 @@ async function indexOne(
 	index: IndexHandle,
 	relpath: string,
 	skipUnchanged: boolean,
+	includeHidden: boolean,
 ): Promise<IndexOutcome> {
 	// validatePath runs BEFORE stat so the warm-reconcile fast path can't
 	// bypass the segment-walk symlink check. A parent-dir-to-symlink swap
@@ -534,7 +585,7 @@ async function indexOne(
 
 	let parsed: ParsedFile;
 	try {
-		const note = await readNote(safePath);
+		const note = await readNote(safePath, {}, includeHidden);
 		parsed = note.parsed;
 	} catch (err) {
 		// Per-file parse failure: log + skip; aborting the whole scan
@@ -555,8 +606,29 @@ async function indexOne(
 	const frontmatter = buildFrontmatterInput(parsed);
 	const links = buildWikilinkRows(parsed);
 	const metrics = computeFileMetrics(parsed);
-	index.replaceFile({ file: relpath, mtime, size, fragments, frontmatter, links, metrics });
-	return "indexed";
+	try {
+		index.replaceFile({ file: relpath, mtime, size, fragments, frontmatter, links, metrics });
+		return "indexed";
+	} catch (err) {
+		if (!isSqliteBusyError(err)) throw err;
+		// Post-BUSY (mtime, size) match is ambiguous: peer's fresh commit
+		// or pre-existing row with rsync-t-style stale content. Silent
+		// skip — pendingRetry would never drain under same-policy
+		// multi-process operation (merkle drift gates on (mtime, size)
+		// too).
+		if (index.isFileUnchanged({ file: relpath, mtime, size })) {
+			return "indexed";
+		}
+		// Peer's matching commit may land just after our BUSY fires; one
+		// brief recheck absorbs the visibility window. Merkle's pending-
+		// retry backstop catches anything that still slips through.
+		await sleep(BUSY_RECHECK_DELAY_MS);
+		if (index.isFileUnchanged({ file: relpath, mtime, size })) {
+			return "indexed";
+		}
+		logSkipped(relpath, "parse", "SQLITE_BUSY; deferring to merkle reconcile");
+		return "parse_failed";
+	}
 }
 
 /**
@@ -610,7 +682,12 @@ function computeFileMetrics(parsed: ParsedFile): FileMetricsInput {
  * "remove from index" and `parse_failed` / other errors as "leave
  * existing rows alone."
  */
-export async function reindexOne(vaultRoot: VaultRoot, index: IndexHandle, relpath: string): Promise<IndexOutcome> {
+export async function reindexOne(
+	vaultRoot: VaultRoot,
+	index: IndexHandle,
+	relpath: string,
+	includeHidden = false,
+): Promise<IndexOutcome> {
 	// chokidar's `ignored` filter is stats-gated, but stats is undefined
 	// during the initial recursive crawl (`alwaysStat: false`), so
 	// non-markdown files reach here on `add` events. `walkVault` skips
@@ -619,7 +696,7 @@ export async function reindexOne(vaultRoot: VaultRoot, index: IndexHandle, relpa
 	// removeFile + clearPendingRetry; the former is a no-op for
 	// never-indexed paths and correct for renamed-to-non-markdown rows.
 	if (!isMarkdownPath(relpath)) return "vanished";
-	return indexOne(vaultRoot, index, relpath, true);
+	return indexOne(vaultRoot, index, relpath, true, includeHidden);
 }
 
 function buildFragmentRows(parsed: ParsedFile): FragmentRowInput[] {

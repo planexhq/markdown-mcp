@@ -284,7 +284,7 @@ describe("get_vault_tree — resource_link emitted unconditionally for markdown"
 		vault = await createTempVault({ "a.md": "# A\n", "b.md": "# B\n" });
 		vaultRoot = await validateVaultRoot(vault.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		index = createIndexHandle(opened.db);
+		index = createIndexHandle(opened.db, { includeHidden: false });
 		index.setStatus("warm");
 		closeDb = () => closeSqlite(opened.db);
 	});
@@ -336,7 +336,7 @@ describe("get_vault_tree — file metrics", () => {
 		});
 		metricsRoot = await validateVaultRoot(metricsVault.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		metricsIndex = createIndexHandle(opened.db);
+		metricsIndex = createIndexHandle(opened.db, { includeHidden: false });
 		metricsIndex.setStatus("warm");
 		metricsCloseDb = () => closeSqlite(opened.db);
 	});
@@ -428,7 +428,7 @@ describe("get_vault_tree — sync policy gates", () => {
 		});
 		policyRoot = await validateVaultRoot(policyVault.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		policyIndex = createIndexHandle(opened.db);
+		policyIndex = createIndexHandle(opened.db, { includeHidden: false });
 		policyIndex.setStatus("warm");
 		policyCloseDb = () => closeSqlite(opened.db);
 	});
@@ -468,7 +468,7 @@ describe("get_vault_tree — sync policy gates", () => {
 		});
 		const childRoot = await validateVaultRoot(childVault.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const childIndex = createIndexHandle(opened.db);
+		const childIndex = createIndexHandle(opened.db, { includeHidden: false });
 		childIndex.setStatus("warm");
 		try {
 			const r = await handleGetVaultTree({ path: "", depth: 1 }, childRoot, childIndex);
@@ -479,6 +479,43 @@ describe("get_vault_tree — sync policy gates", () => {
 		} finally {
 			closeSqlite(opened.db);
 			await childVault.cleanup();
+		}
+	});
+});
+
+describe("get_vault_tree — cache-dir exclusion (case-insensitive)", () => {
+	// `shouldEmitDirent` filters the server's own cache directory regardless
+	// of `--include-hidden`. The tree dirent filter must use the same
+	// case-folding `isIndexCachePath` predicate as direct-read tools so a
+	// pre-existing `.Vault-MCP/` (aliasing the cache on case-insensitive FS)
+	// doesn't leak via DFS recursion into SQLite/WAL/SHM.
+
+	test("mixed-case `.Vault-MCP` at vault root excluded under --include-hidden", async () => {
+		const v = await createTempVault({
+			"clean.md": "# clean\n",
+		});
+		// Pre-create a mixed-case cache directory. On macOS APFS this aliases
+		// to `.vault-mcp/` (case-insensitive FS); on Linux ext4 it's a
+		// distinct inode, but the default (flag = null) routes the predicate
+		// through the case-fold branch, so the dirent is still excluded —
+		// matching the safer-default behavior of the uninitialized flag.
+		await mkdir(join(v.path, ".Vault-MCP"), { recursive: true });
+		await writeFile(join(v.path, ".Vault-MCP", "fake-secret.md"), "# secret\n", "utf8");
+		const root = await validateVaultRoot(v.path);
+		const opened = openSqlite({ dbPath: ":memory:" });
+		const idx = createIndexHandle(opened.db, { includeHidden: true });
+		idx.setStatus("warm");
+		try {
+			const r = await handleGetVaultTree({ path: "", depth: 5 }, root, idx, true);
+			expect(r.isError).toBeFalsy();
+			const out = r.structuredContent as GetVaultTreeResult;
+			const paths = out.items.map((i) => i.path);
+			expect(paths).toContain("clean.md");
+			// Neither the cache dir nor its contents should appear.
+			expect(paths.some((p) => p.toLowerCase().startsWith(".vault-mcp"))).toBe(false);
+		} finally {
+			closeSqlite(opened.db);
+			await v.cleanup();
 		}
 	});
 });
@@ -508,7 +545,7 @@ describe("get_vault_tree — symlink rejected at readdir descent", () => {
 
 		const root = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const idx = createIndexHandle(opened.db);
+		const idx = createIndexHandle(opened.db, { includeHidden: false });
 		idx.setStatus("warm");
 		try {
 			const r = await handleGetVaultTree({ path: "" }, root, idx);
@@ -541,7 +578,7 @@ describe("get_vault_tree — readdir errno discipline", () => {
 		const lockedAbs = join(v.path, "locked");
 		const root = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const idx = createIndexHandle(opened.db);
+		const idx = createIndexHandle(opened.db, { includeHidden: false });
 		idx.setStatus("warm");
 
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -593,7 +630,7 @@ describe("get_vault_tree — children count filters match walkTreeDfs", () => {
 		});
 		countRoot = await validateVaultRoot(countVault.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		countIndex = createIndexHandle(opened.db);
+		countIndex = createIndexHandle(opened.db, { includeHidden: false });
 		countIndex.setStatus("warm");
 		countCloseDb = () => closeSqlite(opened.db);
 	});

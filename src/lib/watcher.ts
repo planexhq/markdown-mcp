@@ -19,7 +19,7 @@ import { relative } from "node:path";
 import { watch as chokidarWatch, type FSWatcher } from "chokidar";
 
 import { errorMessage } from "./error.js";
-import { isHiddenPath, isNonNfc } from "./hiddenPath.js";
+import { isHiddenPath, isIndexCachePath, isNonNfc } from "./hiddenPath.js";
 import type { IndexHandle } from "./index/IndexHandle.js";
 import type { IndexOutcome } from "./index/scanner.js";
 import { classifyRelpathPolicy, type VaultRoot } from "./validatePath.js";
@@ -198,7 +198,7 @@ function shouldIgnore(
 	// `state` stays at warming forever.
 	if (classifyRelpathPolicy(posixRel) !== null) return true;
 	if (isNonNfc(posixRel)) return true;
-	if (posixRel === ".vault-mcp" || posixRel.startsWith(".vault-mcp/")) return true;
+	if (isIndexCachePath(posixRel)) return true;
 	if (!includeHidden && isHiddenPath(posixRel)) return true;
 	if (stats?.isFile() && !isMarkdownPath(posixRel)) return true;
 	return false;

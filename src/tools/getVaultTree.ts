@@ -33,7 +33,7 @@ import {
 	toolErrorEnvelope,
 	vaultError,
 } from "../lib/error.js";
-import { isHiddenName, isHiddenPath } from "../lib/hiddenPath.js";
+import { isHiddenName, isHiddenPath, isIndexCachePath } from "../lib/hiddenPath.js";
 import type { IndexHandle } from "../lib/index/IndexHandle.js";
 import { isIndexWarming } from "../lib/index_status.js";
 import { clampPageSize, MAX_PATH_DEPTH } from "../lib/limits.js";
@@ -49,12 +49,13 @@ export async function handleGetVaultTree(
 	input: GetVaultTreeInput,
 	vaultRoot: VaultRoot,
 	index?: IndexHandle,
+	includeHidden = false,
 ): Promise<ToolSuccessEnvelope<GetVaultTreeResult> | ToolErrorEnvelope> {
 	const meta = newMetaForHandler(index, { tokenizer: getTokenizerId() });
 	try {
 		// Path validation precedes INDEX_WARMING (mirrors search.ts) so
 		// permanent errors like `path: "../etc"` aren't masked as transient.
-		const startRel = await resolveStartPath(input.path, vaultRoot);
+		const startRel = await resolveStartPath(input.path, vaultRoot, includeHidden);
 		if (startRel === null) {
 			const err = vaultError("PATH_NOT_FOUND", `Tree root path does not exist: ${input.path ?? ""}`, {
 				param: "path",
@@ -81,7 +82,7 @@ export async function handleGetVaultTree(
 		const hasher = createHash("sha1");
 		hasher.update(`${startRel}\u0000${depth}\u0000`);
 		const allNodes: WalkNode[] = [];
-		for await (const node of walkTreeDfs(startAbs, startRel, depth, /* currentDepth */ 0)) {
+		for await (const node of walkTreeDfs(startAbs, startRel, depth, /* currentDepth */ 0, includeHidden)) {
 			allNodes.push(node);
 			hasher.update(`${node.relpath}\u0000${node.type}\u0001`);
 		}
@@ -97,7 +98,7 @@ export async function handleGetVaultTree(
 
 		const pageNodes = allNodes.slice(skipBeforeRank, skipBeforeRank + pageSize);
 		const items = await Promise.all(
-			pageNodes.map((node, i) => materializeItem(node, skipBeforeRank + i + 1, vaultRoot, index)),
+			pageNodes.map((node, i) => materializeItem(node, skipBeforeRank + i + 1, vaultRoot, index, includeHidden)),
 		);
 		const hasMore = allNodes.length > skipBeforeRank + items.length;
 		const nextCursorAfter = hasMore && items.length === pageSize ? skipBeforeRank + items.length : null;
@@ -139,7 +140,11 @@ function buildResourceLinks(items: ReadonlyArray<VaultTreeItem>): ExtraContentBl
 	return blocks;
 }
 
-async function resolveStartPath(input: string | undefined, vaultRoot: VaultRoot): Promise<string | null> {
+async function resolveStartPath(
+	input: string | undefined,
+	vaultRoot: VaultRoot,
+	includeHidden: boolean,
+): Promise<string | null> {
 	if (!input || input === "" || input === "/") return "";
 	let safe: SafePath;
 	try {
@@ -157,7 +162,13 @@ async function resolveStartPath(input: string | undefined, vaultRoot: VaultRoot)
 	// passing `path: ".obsidian"` would walk inside the hidden root and emit
 	// its non-hidden children. Per-entry isHiddenName in walkTreeDfs only
 	// vets descendants. Mirrors search.ts (scope.path) and readNote.ts.
-	if (isHiddenPath(safe.relative)) return null;
+	if (!includeHidden && isHiddenPath(safe.relative)) return null;
+	// Server's own cache dir is rejected as a tree root regardless of
+	// `--include-hidden`. The dirent filter in `shouldEmitDirent` only excludes
+	// `.vault-mcp` when encountered as a child of vault root — without this
+	// resolver-level gate, `path: ".vault-mcp"` under `--include-hidden` would
+	// walk inside the cache and enumerate `index.sqlite3` + WAL/SHM siblings.
+	if (isIndexCachePath(safe.relative)) return null;
 	try {
 		const st = await stat(safe.absolute);
 		if (!st.isDirectory()) return null;
@@ -206,6 +217,7 @@ async function* walkTreeDfs(
 	startRel: string,
 	maxDepth: number,
 	currentDepth: number,
+	includeHidden: boolean,
 ): AsyncGenerator<WalkNode> {
 	if (currentDepth > maxDepth) return;
 	if (!(await isRealDirectory(startAbs))) return;
@@ -231,7 +243,7 @@ async function* walkTreeDfs(
 	const dirs: Dirent[] = [];
 	const files: Dirent[] = [];
 	for (const entry of entries) {
-		if (!shouldEmitDirent(entry)) continue;
+		if (!shouldEmitDirent(entry, startRel, includeHidden)) continue;
 		if (entry.isDirectory()) dirs.push(entry);
 		else files.push(entry);
 	}
@@ -247,7 +259,7 @@ async function* walkTreeDfs(
 		if (!passesPathPolicy(childRel)) continue;
 		yield { relpath: childRel, type: "dir" };
 		if (currentDepth < maxDepth) {
-			yield* walkTreeDfs(join(startAbs, entry.name), childRel, maxDepth, currentDepth + 1);
+			yield* walkTreeDfs(join(startAbs, entry.name), childRel, maxDepth, currentDepth + 1, includeHidden);
 		}
 	}
 	for (const entry of files) {
@@ -259,18 +271,24 @@ async function* walkTreeDfs(
 
 /**
  * Per-entry filter for the tree walk + child counter. Symlinks are
- * skipped (D8 — symlinks are rejected at every surface), hidden names
- * are skipped per the all-or-nothing server policy, and only regular
- * files and directories are considered (sockets/devices/FIFOs surface
- * from readdir but have no addressable representation).
+ * skipped (D8 — symlinks are rejected at every surface), the server's
+ * own top-level cache dir is skipped regardless of `includeHidden` via
+ * `isIndexCachePath` (FS-aware case-folding so a `.Vault-MCP/` aliasing
+ * the cache on macOS APFS / Windows NTFS is also excluded — byte-wise
+ * compare against `INDEX_DIR_NAME` alone would leak the cache through
+ * the tree), hidden names are skipped per the all-or-nothing server
+ * policy, and only regular files and directories are considered
+ * (sockets/devices/FIFOs surface from readdir but have no addressable
+ * representation).
  *
  * Shared between `walkTreeDfs` (DFS emission) and `safeChildrenCount`
  * (the `children` lazy-load hint) so the visible-children count never
  * lies about what DFS would yield.
  */
-function shouldEmitDirent(entry: Dirent): boolean {
+function shouldEmitDirent(entry: Dirent, parentRel: string, includeHidden: boolean): boolean {
 	if (entry.isSymbolicLink()) return false;
-	if (isHiddenName(entry.name)) return false;
+	if (parentRel === "" && isIndexCachePath(entry.name)) return false;
+	if (!includeHidden && isHiddenName(entry.name)) return false;
 	if (!entry.isDirectory() && !entry.isFile()) return false;
 	return true;
 }
@@ -280,6 +298,7 @@ async function materializeItem(
 	dfsRank: number,
 	vaultRoot: VaultRoot,
 	index: IndexHandle | undefined,
+	includeHidden: boolean,
 ): Promise<VaultTreeItem> {
 	const id = `t:${createHash("sha1").update(node.relpath).digest("hex").slice(0, 14)}`;
 	const slashIdx = node.relpath.lastIndexOf("/");
@@ -313,7 +332,10 @@ async function materializeItem(
 	// scales with dir count; serialized fs ops would dominate for
 	// pageSize-bounded responses with many directories.
 	const absPath = join(vaultRoot.absolute, node.relpath);
-	const [children, mtime] = await Promise.all([safeChildrenCount(absPath, node.relpath), safeStatMtime(absPath)]);
+	const [children, mtime] = await Promise.all([
+		safeChildrenCount(absPath, node.relpath, includeHidden),
+		safeStatMtime(absPath),
+	]);
 	item.children = children;
 	item.mtime = mtime;
 	return item;
@@ -348,13 +370,13 @@ async function safeStatMtime(absPath: string): Promise<number> {
 	}
 }
 
-async function safeChildrenCount(absPath: string, relParent: string): Promise<number> {
+async function safeChildrenCount(absPath: string, relParent: string, includeHidden: boolean): Promise<number> {
 	if (!(await isRealDirectory(absPath))) return 0;
 	try {
 		const entries = (await readdir(absPath, { withFileTypes: true, encoding: "utf8" })) as Dirent[];
 		let count = 0;
 		for (const entry of entries) {
-			if (!shouldEmitDirent(entry)) continue;
+			if (!shouldEmitDirent(entry, relParent, includeHidden)) continue;
 			const childRel = relParent ? `${relParent}/${entry.name}` : entry.name;
 			if (!passesPathPolicy(childRel)) continue;
 			count++;

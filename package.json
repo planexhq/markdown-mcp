@@ -1,7 +1,8 @@
 {
   "name": "vault-mcp",
-  "version": "1.0.0-w4",
+  "version": "1.0.0",
   "description": "Read-only MCP server exposing a local markdown vault to AI agents.",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "vault-mcp": "./dist/index.js"
@@ -20,13 +21,18 @@
   },
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "lint": "biome check src test",
     "lint:fix": "biome check --write src test",
     "format": "biome format --write src test",
     "pretest": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "bench": "npm run bench:scan && npm run bench:search && npm run bench:watcher",
+    "bench:scan": "tsx bench/scan.ts",
+    "bench:search": "tsx bench/search.ts",
+    "bench:watcher": "tsx bench/watcher.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -47,6 +53,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.1.5",
+    "tsx": "^4.21.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
   }

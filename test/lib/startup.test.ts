@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { chooseStartupState } from "../../src/lib/startup.js";
+import { chooseStartupState, computePolicyMismatch } from "../../src/lib/startup.js";
 
 describe("chooseStartupState", () => {
 	test("preexisted + scan_complete → warm + log mentions count", () => {
@@ -55,11 +55,10 @@ describe("chooseStartupState", () => {
 		expect(decision.log).toContain("no indexed rows");
 	});
 
-	test("preexisted + !scan_complete + ever_complete + 0 rows → warm (round 25 F5)", () => {
+	test("preexisted + !scan_complete + ever_complete + 0 rows → warm (empty-vault warm-restart)", () => {
 		// Empty vault that previously scanned cleanly (ever_complete=true)
-		// then was interrupted mid-reconcile. Pre-fix this fell through to
-		// `cold` because `fileCount > 0` was required, wedging vault-wide
-		// tools at INDEX_WARMING during the unnecessary rescan.
+		// then was interrupted mid-reconcile must stay warm, not fall
+		// through to cold and wedge vault-wide tools at INDEX_WARMING.
 		const decision = chooseStartupState({
 			preexisted: true,
 			scanComplete: false,
@@ -80,5 +79,117 @@ describe("chooseStartupState", () => {
 		});
 		expect(decision.state).toBe("cold");
 		expect(decision.log).toBeNull();
+	});
+});
+
+describe("computePolicyMismatch", () => {
+	test("fresh DB never mismatches", () => {
+		expect(
+			computePolicyMismatch({
+				preexisted: false,
+				scanComplete: false,
+				includeHiddenPolicy: null,
+				inflightIncludeHidden: null,
+				argIncludeHidden: true,
+			}),
+		).toBe(false);
+	});
+
+	test("last-clean mismatch: persisted differs from args", () => {
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: true,
+			}),
+		).toBe(true);
+	});
+
+	test("NULL persisted coerces to false (legacy / pre-column upgrade)", () => {
+		// Upgrade case: legacy cache opened with --include-hidden=on for
+		// the first time. Persisted is NULL → coerce to false → mismatch.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: null,
+				inflightIncludeHidden: null,
+				argIncludeHidden: true,
+			}),
+		).toBe(true);
+	});
+
+	test("interrupted-mismatch: inflight differs from args during a partial scan", () => {
+		// Revert-during-flip: persisted last-clean matches args, but an
+		// in-flight scan ran under the opposite policy and was interrupted.
+		// The last-clean signal alone misses this.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: false,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: true,
+				argIncludeHidden: false,
+			}),
+		).toBe(true);
+	});
+
+	test("interrupted-mismatch fires symmetric direction (on→off→on revert)", () => {
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: false,
+				includeHiddenPolicy: true,
+				inflightIncludeHidden: false,
+				argIncludeHidden: true,
+			}),
+		).toBe(true);
+	});
+
+	test("no-mismatch when scan_complete=false but inflight matches args", () => {
+		// Same-policy interrupted reconcile: keep warm semantics, no cold
+		// rescan. The fix must not over-fire on routine SIGTERMs.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: false,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: false,
+				argIncludeHidden: false,
+			}),
+		).toBe(false);
+	});
+
+	test("no-mismatch when scan_complete=false and inflight is NULL (legacy DB)", () => {
+		// Legacy DB upgrading: inflight column wasn't tracked, so NULL
+		// is the only signal. Don't force cold on every upgrade — the
+		// last-clean check still catches genuine policy flips.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: false,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+			}),
+		).toBe(false);
+	});
+
+	test("scan_complete=true: inflight is ignored even if mismatched (defensive)", () => {
+		// `markScanFinalized` clears inflight atomically with
+		// `scan_complete=1`, so this state is unreachable in practice. If
+		// it ever occurred (e.g., direct DB tampering), the last-clean
+		// policy is the authoritative signal — trust it.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: true,
+				inflightIncludeHidden: false, // mismatched but ignored
+				argIncludeHidden: true,
+			}),
+		).toBe(false);
 	});
 });

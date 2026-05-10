@@ -24,13 +24,14 @@ export async function handleGetFileOutline(
 	input: GetFileOutlineInput,
 	vaultRoot: VaultRoot,
 	index?: IndexHandle,
+	includeHidden = false,
 ): Promise<ToolSuccessEnvelope<GetFileOutlineResult> | ToolErrorEnvelope> {
 	// Hoisted before try so the catch can pass meta to routeToolError —
 	// preserves `index_status` and `tokenizer` on error envelopes.
 	const meta = newMetaForHandler(index, { tokenizer: getTokenizerId() });
 	try {
 		const safePath = await validatePath(input.file, vaultRoot);
-		const { parsed } = await readNote(safePath);
+		const { parsed } = await readNote(safePath, {}, includeHidden);
 		const result: GetFileOutlineResult = {
 			outline: parsed.outline,
 			blockIndex: parsed.blockIndex,

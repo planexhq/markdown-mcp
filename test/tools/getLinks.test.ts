@@ -517,7 +517,7 @@ describe("get_links — outgoing in document order (D36)", () => {
 		// must emit `Y, X` (document order via rowid) instead of the
 		// pre-D36 JSON-lex `X, Y`.
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const idx = createIndexHandle(opened.db);
+		const idx = createIndexHandle(opened.db, { includeHidden: false });
 		try {
 			idx.replaceFile({
 				file: "src.md",
@@ -944,7 +944,7 @@ describe("get_links — chunked candidate SQL handles >200 candidates", () => {
 		// trees past SQLITE_MAX_EXPR_DEPTH=1000 — chunking + JS merge keep
 		// each query under the cap.
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const idx = createIndexHandle(opened.db);
+		const idx = createIndexHandle(opened.db, { includeHidden: false });
 		try {
 			idx.replaceFile({
 				file: "src.md",
@@ -1010,7 +1010,7 @@ describe("get_links — warming gate", () => {
 
 	test("returns INDEX_WARMING when index state is warming", async () => {
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const idx = createIndexHandle(opened.db);
+		const idx = createIndexHandle(opened.db, { includeHidden: false });
 		try {
 			idx.setStatus("warming");
 			const input: GetLinksInput = { file: "any.md" };
@@ -1025,7 +1025,7 @@ describe("get_links — warming gate", () => {
 
 	test("returns INDEX_WARMING when index state is cold", async () => {
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const idx = createIndexHandle(opened.db);
+		const idx = createIndexHandle(opened.db, { includeHidden: false });
 		try {
 			const result = await handleGetLinks({ file: "any.md" }, gateRoot, idx);
 			expect(result.isError).toBe(true);
@@ -1041,7 +1041,7 @@ describe("get_links — warming gate", () => {
 		// being masked by the transient INDEX_WARMING — agents would
 		// otherwise retry indefinitely against a permanently malformed path.
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const idx = createIndexHandle(opened.db);
+		const idx = createIndexHandle(opened.db, { includeHidden: false });
 		try {
 			// Index is cold; a traversal path must still surface PATH_OUTSIDE_VAULT.
 			const result = await handleGetLinks({ file: "../escape.md" }, gateRoot, idx);
@@ -1057,7 +1057,7 @@ describe("get_links — warming gate", () => {
 		// Counter to the above: a path-shape-valid but FS-missing file likewise
 		// surfaces as PATH_NOT_FOUND, not INDEX_WARMING.
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const idx = createIndexHandle(opened.db);
+		const idx = createIndexHandle(opened.db, { includeHidden: false });
 		try {
 			const result = await handleGetLinks({ file: "ghost.md" }, gateRoot, idx);
 			expect(result.isError).toBe(true);

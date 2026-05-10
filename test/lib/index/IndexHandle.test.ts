@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { parseHeadingPathJson } from "../../../src/lib/cursor.js";
 import { compileFilter } from "../../../src/lib/filter.js";
+import { resetFsCaseInsensitiveForTest, setFsCaseInsensitive } from "../../../src/lib/hiddenPath.js";
 import { createIndexHandle, type FragmentRowInput, type IndexHandle } from "../../../src/lib/index/IndexHandle.js";
 import { closeSqlite, openSqlite } from "../../../src/lib/index/sqlite.js";
 
@@ -14,7 +15,7 @@ let index: IndexHandle;
 
 beforeEach(() => {
 	opened = openSqlite({ dbPath: ":memory:" });
-	index = createIndexHandle(opened.db);
+	index = createIndexHandle(opened.db, { includeHidden: false });
 });
 
 afterEach(() => {
@@ -849,3 +850,244 @@ function historyRowCount(db: import("better-sqlite3").Database, file: string): n
 	const row = db.prepare("SELECT count(*) AS n FROM heading_history WHERE file = ?").get(file) as { n: number };
 	return row.n;
 }
+
+describe("sweepIndexCacheRows — cold-start cache-prefix sweep", () => {
+	function countWhere(db: import("better-sqlite3").Database, table: string, column: string, prefix: string): number {
+		const row = db.prepare(`SELECT count(*) AS n FROM ${table} WHERE ${column} LIKE ?`).get(`${prefix}%`) as {
+			n: number;
+		};
+		return row.n;
+	}
+
+	test("sweeps `.vault-mcp/*` rows from all file-keyed tables", () => {
+		// `replaceFile` has no validatePath gate, so storage writes can
+		// land a cache-prefix row directly.
+		index.replaceFile({
+			file: ".vault-mcp/cache.md",
+			mtime: 500,
+			size: 50,
+			fragments: [
+				headingRow({
+					stable_id: "h:cache",
+					heading_path: ["Cache"],
+					heading_text: "Cache",
+					structural_path: "h1[1]",
+				}),
+			],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: ["secret"] },
+		});
+		expect(countWhere(opened.db, "fragments", "file", ".vault-mcp/")).toBeGreaterThan(0);
+		expect(countWhere(opened.db, "frontmatter", "file", ".vault-mcp/")).toBe(1);
+		expect(countWhere(opened.db, "frontmatter_tags", "file", ".vault-mcp/")).toBe(1);
+		expect(countWhere(opened.db, "file_metrics", "file", ".vault-mcp/")).toBe(1);
+
+		index.sweepIndexCacheRows();
+
+		expect(countWhere(opened.db, "fragments", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter_tags", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "file_metrics", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "wikilinks", "source_file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "heading_history", "file", ".vault-mcp/")).toBe(0);
+	});
+
+	test("preserves non-cache rows", () => {
+		index.replaceFile({
+			file: "notes/regular.md",
+			mtime: 1000,
+			size: 100,
+			fragments: [headingRow({ stable_id: "h:r", heading_path: ["R"], heading_text: "R", structural_path: "h1[1]" })],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: [] },
+		});
+		index.replaceFile({
+			file: ".vault-mcp/cache.md",
+			mtime: 500,
+			size: 50,
+			fragments: [headingRow({ stable_id: "h:c", heading_path: ["C"], heading_text: "C", structural_path: "h1[1]" })],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: [] },
+		});
+
+		index.sweepIndexCacheRows();
+
+		expect(countWhere(opened.db, "frontmatter", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter", "file", "notes/")).toBe(1);
+		expect(countWhere(opened.db, "fragments", "file", "notes/")).toBeGreaterThan(0);
+		expect(countWhere(opened.db, "file_metrics", "file", "notes/")).toBe(1);
+	});
+
+	test("idempotent on clean DB (no rows to sweep)", () => {
+		expect(() => index.sweepIndexCacheRows()).not.toThrow();
+		expect(() => index.sweepIndexCacheRows()).not.toThrow();
+		expect(index.countFiles()).toBe(0);
+	});
+
+	test("sweeps mixed-case cache rows (case-insensitive FS bypass closed)", () => {
+		// Mixed-case `.Vault-MCP/*` rows can land via a legacy walker or a
+		// planted DB. The cold-start sweep must mirror `isIndexCachePath`'s
+		// case-fold (`lower(file) GLOB`) so those rows are cleaned before
+		// the warm-publish window lets search/get_links serve them.
+		index.replaceFile({
+			file: ".Vault-MCP/notes.md",
+			mtime: 500,
+			size: 50,
+			fragments: [headingRow({ stable_id: "h:m", heading_path: ["M"], heading_text: "M", structural_path: "h1[1]" })],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: ["secret"] },
+		});
+		index.replaceFile({
+			file: ".VAULT-MCP/index.sqlite3.md",
+			mtime: 600,
+			size: 60,
+			fragments: [headingRow({ stable_id: "h:u", heading_path: ["U"], heading_text: "U", structural_path: "h1[1]" })],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: [] },
+		});
+
+		index.sweepIndexCacheRows();
+
+		// `countWhere` uses LIKE (case-insensitive in SQLite default), so
+		// it sees both `.vault-mcp/*` and `.Vault-MCP/*` rows; both should
+		// be zero after the sweep.
+		expect(countWhere(opened.db, "fragments", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter_tags", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "file_metrics", "file", ".vault-mcp/")).toBe(0);
+	});
+});
+
+describe("sweepIndexCacheRows — case-sensitive FS routing", () => {
+	beforeEach(() => {
+		setFsCaseInsensitive(false);
+	});
+	afterEach(() => {
+		resetFsCaseInsensitiveForTest();
+	});
+
+	function countExact(db: import("better-sqlite3").Database, table: string, column: string, value: string): number {
+		const row = db.prepare(`SELECT count(*) AS n FROM ${table} WHERE ${column} = ?`).get(value) as { n: number };
+		return row.n;
+	}
+
+	test("preserves `.Vault-MCP/*` user content on case-sensitive FS", () => {
+		index.replaceFile({
+			file: ".Vault-MCP/notes.md",
+			mtime: 500,
+			size: 50,
+			fragments: [headingRow({ stable_id: "h:u", heading_path: ["U"], heading_text: "U", structural_path: "h1[1]" })],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: ["secret"] },
+		});
+		index.replaceFile({
+			file: ".vault-mcp/cache.md",
+			mtime: 600,
+			size: 60,
+			fragments: [headingRow({ stable_id: "h:c", heading_path: ["C"], heading_text: "C", structural_path: "h1[1]" })],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: [] },
+		});
+
+		index.sweepIndexCacheRows();
+
+		expect(countExact(opened.db, "fragments", "file", ".vault-mcp/cache.md")).toBe(0);
+		expect(countExact(opened.db, "frontmatter", "file", ".vault-mcp/cache.md")).toBe(0);
+		expect(countExact(opened.db, "file_metrics", "file", ".vault-mcp/cache.md")).toBe(0);
+		expect(countExact(opened.db, "fragments", "file", ".Vault-MCP/notes.md")).toBeGreaterThan(0);
+		expect(countExact(opened.db, "frontmatter", "file", ".Vault-MCP/notes.md")).toBe(1);
+		expect(countExact(opened.db, "frontmatter_tags", "file", ".Vault-MCP/notes.md")).toBe(1);
+		expect(countExact(opened.db, "file_metrics", "file", ".Vault-MCP/notes.md")).toBe(1);
+	});
+});
+
+describe("sweepIndexCacheRows — snapshot bump on rows-changed", () => {
+	test("bumps snapshot when a cache row is deleted", () => {
+		index.replaceFile({
+			file: ".vault-mcp/cache.md",
+			mtime: 500,
+			size: 50,
+			fragments: [headingRow({ stable_id: "h:c", heading_path: ["C"], heading_text: "C", structural_path: "h1[1]" })],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: [] },
+		});
+		const before = index.getSnapshot();
+		index.sweepIndexCacheRows();
+		expect(index.getSnapshot()).toBeGreaterThan(before);
+	});
+
+	test("no bump on a clean DB (no rows to delete)", () => {
+		const before = index.getSnapshot();
+		index.sweepIndexCacheRows();
+		// Common no-op restart path: bumping unconditionally would
+		// invalidate every in-flight cursor across restart for no
+		// behavioral reason. Changes-gated bump preserves them.
+		expect(index.getSnapshot()).toBe(before);
+	});
+});
+
+describe("removeFile — frontmatter-only orphan", () => {
+	test("removeFile drops a frontmatter-only orphan (no fragments)", () => {
+		// `replaceFile` always emits a fragment row in production, but
+		// legacy/corrupt DBs (or manual SQL surgery) can leave a frontmatter
+		// row with no fragments. The pre-fix gate (`SELECT 1 FROM fragments`)
+		// would early-return, leaving the orphan uncleanable; the canonical
+		// "indexed files" set is `frontmatter`.
+		opened.db
+			.prepare("INSERT INTO frontmatter (file, created, updated, fields_json) VALUES (?, NULL, NULL, '{}')")
+			.run("orphan.md");
+		opened.db.prepare("INSERT OR IGNORE INTO frontmatter_tags (file, tag) VALUES (?, ?)").run("orphan.md", "stale");
+		expect(index.countFiles()).toBe(1);
+
+		index.removeFile("orphan.md", Date.now());
+
+		expect(index.countFiles()).toBe(0);
+		const fmRow = opened.db.prepare("SELECT count(*) AS n FROM frontmatter WHERE file = ?").get("orphan.md") as {
+			n: number;
+		};
+		expect(fmRow.n).toBe(0);
+		const tagRow = opened.db.prepare("SELECT count(*) AS n FROM frontmatter_tags WHERE file = ?").get("orphan.md") as {
+			n: number;
+		};
+		expect(tagRow.n).toBe(0);
+	});
+
+	test("removeFile on a never-indexed path is still a no-op (cursor stability preserved)", () => {
+		// `chokidar`'s stats-undefined initial crawl emits add events for
+		// non-markdown assets that were never indexed. Unconditional snapshot
+		// bump would invalidate every in-flight cursor — preserve early-return.
+		const before = index.getSnapshot();
+		index.removeFile("never-indexed.png", Date.now());
+		expect(index.getSnapshot()).toBe(before);
+	});
+
+	test("removeFile drops a fragments-only orphan (no frontmatter)", () => {
+		// The symmetric corruption case: an indexed file whose frontmatter row
+		// was wiped externally (manual SQL, partial WAL recovery, planted DB)
+		// leaves fragments + tags. `searchQueryMode` / `searchFilterMode` read
+		// fragments LEFT JOIN frontmatter, so the orphan stays searchable until
+		// `removeFile` cleans it — the gate must cover both directions.
+		index.replaceFile({
+			file: "frag-orphan.md",
+			mtime: 1000,
+			size: 100,
+			fragments: [
+				headingRow({
+					stable_id: "h:fo",
+					heading_path: ["Stale"],
+					heading_text: "Stale",
+					structural_path: "h1[1]",
+				}),
+			],
+			frontmatter: { created: null, updated: null, fields_json: "{}", tags: ["orphan"] },
+		});
+		opened.db.prepare("DELETE FROM frontmatter WHERE file = ?").run("frag-orphan.md");
+		const fragsBefore = opened.db
+			.prepare("SELECT count(*) AS n FROM fragments WHERE file = ?")
+			.get("frag-orphan.md") as { n: number };
+		expect(fragsBefore.n).toBeGreaterThan(0);
+
+		index.removeFile("frag-orphan.md", Date.now());
+
+		const fragsAfter = opened.db
+			.prepare("SELECT count(*) AS n FROM fragments WHERE file = ?")
+			.get("frag-orphan.md") as { n: number };
+		expect(fragsAfter.n).toBe(0);
+		const tagRow = opened.db
+			.prepare("SELECT count(*) AS n FROM frontmatter_tags WHERE file = ?")
+			.get("frag-orphan.md") as { n: number };
+		expect(tagRow.n).toBe(0);
+	});
+});

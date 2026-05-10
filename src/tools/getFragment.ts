@@ -67,13 +67,14 @@ export async function handleGetFragment(
 	input: GetFragmentInput,
 	vaultRoot: VaultRoot,
 	index?: IndexHandle,
+	includeHidden = false,
 ): Promise<ToolSuccessEnvelope<FragmentResult> | ToolErrorEnvelope> {
 	// Hoisted before try so the catch can pass meta to routeToolError —
 	// preserves `index_status` and `tokenizer` on error envelopes.
 	const meta = newMetaForHandler(index, { tokenizer: getTokenizerId() });
 	try {
 		const safePath = await validatePath(input.file, vaultRoot);
-		const { parsed } = await readNote(safePath);
+		const { parsed } = await readNote(safePath, {}, includeHidden);
 		// Defer link resolution and embed expansion until the index has a
 		// usable snapshot — pre-warm, basename/heading maps are a strict
 		// subset of the eventual vault, so `[[foo]]` can resolve uniquely
@@ -99,12 +100,21 @@ export async function handleGetFragment(
 			const heading = parsed.headings.find((h) => h.stable_id === normalized);
 			if (heading) {
 				const fragment = buildHeadingFragment(heading, parsed, "fresh", vaultIndex);
-				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 				return successEnvelope(fragment, meta);
 			}
 			const history = index?.getHistoryRow(safePath.relative, normalized) ?? null;
 			if (history !== null) {
-				return resolveStaleStableId(history, parsed, input.stable_id, meta, vaultRoot, vaultIndex, input.expand_embeds);
+				return resolveStaleStableId(
+					history,
+					parsed,
+					input.stable_id,
+					meta,
+					vaultRoot,
+					vaultIndex,
+					input.expand_embeds,
+					includeHidden,
+				);
 			}
 			return headingNotFoundEnvelope(
 				{
@@ -123,7 +133,7 @@ export async function handleGetFragment(
 		switch (input.anchor.kind) {
 			case "file": {
 				const fragment = buildFileFragment(parsed, vaultIndex);
-				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 				return successEnvelope(fragment, meta);
 			}
 
@@ -131,7 +141,7 @@ export async function handleGetFragment(
 				const path = normalizeHeadingPath(input.anchor.path);
 				if (path.length === 0) {
 					const fragment = buildPreambleFragment(parsed, vaultIndex);
-					await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+					await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 					return successEnvelope(fragment, meta);
 				}
 				const matches = parsed.headings.filter((h) => headingPathsEqual(h.headingPath, path));
@@ -170,7 +180,7 @@ export async function handleGetFragment(
 					);
 				}
 				const fragment = buildHeadingFragment(heading, parsed, "fresh", vaultIndex);
-				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 				return successEnvelope(fragment, meta);
 			}
 
@@ -190,7 +200,7 @@ export async function handleGetFragment(
 					);
 				}
 				const fragment = buildBlockFragment(block, parsed, vaultIndex);
-				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex);
+				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 				return successEnvelope(fragment, meta);
 			}
 		}
@@ -223,6 +233,7 @@ async function resolveStaleStableId(
 	vaultRoot: VaultRoot,
 	vaultIndex: VaultFileIndex | undefined,
 	expandEmbedsOpt: ExpandEmbedsOption | undefined,
+	includeHidden: boolean,
 ): Promise<ToolSuccessEnvelope<FragmentResult> | ToolErrorEnvelope> {
 	const recovery = recoverStaleStableId({ history, currentHeadings: parsed.headings });
 	const candidates = recovery.others.map((c) => ({
@@ -235,7 +246,7 @@ async function resolveStaleStableId(
 		const fragment = buildHeadingFragment(recovery.primary.heading, parsed, "stale", vaultIndex);
 		fragment.requested_stable_id = requestedStableId;
 		if (candidates.length > 0) fragment.fuzzy_candidates = candidates;
-		await maybeExpandEmbeds(fragment, expandEmbedsOpt, vaultRoot, vaultIndex);
+		await maybeExpandEmbeds(fragment, expandEmbedsOpt, vaultRoot, vaultIndex, includeHidden);
 		return successEnvelope(fragment, fuzzyMeta);
 	}
 	return headingNotFoundEnvelope(
@@ -393,6 +404,7 @@ async function maybeExpandEmbeds(
 	opt: ExpandEmbedsOption | undefined,
 	vaultRoot: VaultRoot,
 	vaultIndex: VaultFileIndex | undefined,
+	includeHidden: boolean,
 ): Promise<void> {
 	const maxDepth = computeMaxDepth(opt);
 	if (maxDepth <= 0 || !vaultIndex) return;
@@ -403,7 +415,7 @@ async function maybeExpandEmbeds(
 		if (fileCache.has(relpath)) return fileCache.get(relpath) ?? null;
 		try {
 			const safePath = await validatePath(relpath, vaultRoot);
-			const note = await readNote(safePath);
+			const note = await readNote(safePath, {}, includeHidden);
 			fileCache.set(relpath, note.parsed);
 			return note.parsed;
 		} catch {
@@ -421,6 +433,7 @@ async function maybeExpandEmbeds(
 		// content, with the cycle tripping only at the next `b` reference.
 		visited: new Set<string>([makeFragmentCycleKey(fragment)]),
 		maxDepth,
+		includeHidden,
 	};
 
 	for (const embed of fragment.embeds) {

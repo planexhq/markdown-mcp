@@ -88,6 +88,7 @@ export async function handleGetLinks(
 	input: GetLinksInput,
 	vaultRoot: VaultRoot,
 	index: IndexHandle,
+	includeHidden = false,
 ): Promise<ToolSuccessEnvelope<GetLinksResult> | ToolErrorEnvelope> {
 	const meta = newMetaForHandler(index);
 	try {
@@ -101,7 +102,7 @@ export async function handleGetLinks(
 		// path — the `needsAst` skip below would otherwise let asset paths,
 		// directories, or hidden files reach the SQL layer with an empty-
 		// success result (and a hidden-existence side channel).
-		await assertNotePathPolicy(safePath);
+		await assertNotePathPolicy(safePath, includeHidden);
 		const direction: LinkDirection = input.direction ?? "both";
 		const isNarrowed = input.heading_path !== undefined || input.stable_id !== undefined;
 		// Outgoing/incoming rows come from SQL wikilinks; AST is read only
@@ -110,7 +111,7 @@ export async function handleGetLinks(
 		const needsAst = isNarrowed;
 		let parsed: ParsedFile | null = null;
 		if (needsAst) {
-			const result = await readNote(safePath);
+			const result = await readNote(safePath, {}, includeHidden);
 			parsed = result.parsed;
 		}
 

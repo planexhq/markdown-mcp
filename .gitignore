@@ -8,3 +8,7 @@ coverage/
 .vscode/
 .idea/
 *.tsbuildinfo
+
+# Developer-local tooling state (per-developer, not shared)
+.claude/
+.serena/

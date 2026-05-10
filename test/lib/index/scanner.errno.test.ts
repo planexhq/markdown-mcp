@@ -56,7 +56,7 @@ const setups: Setup[] = [];
 async function setup(structure: VaultStructure): Promise<Setup> {
 	const vault = await createTempVault(structure);
 	const opened = openSqlite({ dbPath: ":memory:" });
-	const index = createIndexHandle(opened.db);
+	const index = createIndexHandle(opened.db, { includeHidden: false });
 	// realpath the temp dir so indexOne's validatePath containment check
 	// passes on macOS (/var/folders → /private/var/folders symlink).
 	const vaultRoot: VaultRoot = await validateVaultRoot(vault.path);
@@ -649,5 +649,195 @@ describe("scanVault — N3 watcher-race prune defense", () => {
 
 		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
 		expect(s.index.listIndexedFiles().sort()).toEqual(["a.md", "race.md"]);
+	});
+});
+
+/**
+ * Spy on `index.replaceFile` so a single targeted relpath throws a
+ * synthetic SqliteError-shaped error with the given code/message; all
+ * other relpaths fall through to the real method. Returns the spy so the
+ * caller can `mockRestore()` in `finally`.
+ */
+function mockReplaceFileThrowFor(
+	index: IndexHandle,
+	file: string,
+	code: string,
+	message: string,
+): ReturnType<typeof vi.spyOn> {
+	const original = index.replaceFile.bind(index);
+	const err: Error & { code?: string } = new Error(message);
+	err.code = code;
+	return vi.spyOn(index, "replaceFile").mockImplementation((args) => {
+		if (args.file === file) throw err;
+		return original(args);
+	});
+}
+
+describe("scanVault — SQLITE_BUSY tolerance", () => {
+	test("SQLITE_BUSY for un-indexed file → pendingRetry, scan_complete stays false", async () => {
+		// SQLite WAL's write lock is database-wide, so a BUSY on our
+		// replaceFile may be contention on an unrelated file. When our row
+		// is missing, silently skipping would advertise vault-wide search
+		// as warm with a hole; routing to pendingRetry blocks finalize
+		// until merkle's newFiles set-diff reindexes the missing row.
+		const s = await setup({ "a.md": "# A\n\nbody", "b.md": "# B\n\nbody" });
+		const replaceFileSpy = mockReplaceFileThrowFor(s.index, "b.md", "SQLITE_BUSY", "database is locked");
+
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const result = await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+			expect(s.index.listIndexedFiles()).toEqual(["a.md"]);
+			expect(result.filesIndexed).toBe(1);
+			expect(result.filesSkipped).toBe(1);
+
+			expect(s.index.hasPendingRetries()).toBe(true);
+			expect(s.index.getScanComplete()).toBe(false);
+
+			const stderr = errSpy.mock.calls.flat().join("\n");
+			expect(stderr).toMatch(/SQLITE_BUSY.*deferring to merkle reconcile/);
+		} finally {
+			errSpy.mockRestore();
+			replaceFileSpy.mockRestore();
+		}
+	});
+
+	test("SQLITE_BUSY where peer committed matching row → silent skip, scan_complete=true", async () => {
+		// When the indexed row's (mtime, size) matches on-disk after our
+		// BUSY, a peer wrote our file during the wait. PendingRetry-ing
+		// here would wedge finalize forever because merkle's drift detector
+		// can't trigger reindex on a matching row.
+		const s = await setup({ "a.md": "# A\n\nbody", "b.md": "# B\n\nbody" });
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles().sort()).toEqual(["a.md", "b.md"]);
+		expect(s.index.getScanComplete()).toBe(true);
+
+		// b.md: scanner's pre-write isFileUnchanged returns false (force
+		// the write); indexOne's post-BUSY re-check returns true (silent
+		// skip). The `bMdCalls` assertion below pins this ordering so a
+		// future refactor that drops the re-check fails loudly.
+		const realIsFileUnchanged = s.index.isFileUnchanged.bind(s.index);
+		let bMdCalls = 0;
+		const isFileUnchangedSpy = vi.spyOn(s.index, "isFileUnchanged").mockImplementation((args) => {
+			if (args.file !== "b.md") return realIsFileUnchanged(args);
+			bMdCalls++;
+			return bMdCalls > 1;
+		});
+		const replaceFileSpy = mockReplaceFileThrowFor(s.index, "b.md", "SQLITE_BUSY", "database is locked");
+
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+			expect(s.index.listIndexedFiles().sort()).toEqual(["a.md", "b.md"]);
+			expect(s.index.hasPendingRetries()).toBe(false);
+			expect(s.index.getScanComplete()).toBe(true);
+			expect(bMdCalls).toBe(2);
+		} finally {
+			errSpy.mockRestore();
+			replaceFileSpy.mockRestore();
+			isFileUnchangedSpy.mockRestore();
+		}
+	});
+
+	test("SQLITE_BUSY_SNAPSHOT routes the same way as SQLITE_BUSY", async () => {
+		// WAL surfaces lock contention as SQLITE_BUSY_SNAPSHOT too; both
+		// codes must hit the BUSY catch.
+		const s = await setup({ "a.md": "# A\n", "b.md": "# B\n" });
+		const replaceFileSpy = mockReplaceFileThrowFor(s.index, "b.md", "SQLITE_BUSY_SNAPSHOT", "snapshot busy");
+
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+			expect(s.index.hasPendingRetries()).toBe(true);
+			expect(s.index.getScanComplete()).toBe(false);
+		} finally {
+			errSpy.mockRestore();
+			replaceFileSpy.mockRestore();
+		}
+	});
+
+	test("non-BUSY SqliteError still pendingRetries (regression guard)", async () => {
+		// Only SQLITE_BUSY{,_SNAPSHOT} routes through the indexOne BUSY
+		// catch; other codes (SQLITE_CORRUPT, SQLITE_FULL, …) must reach
+		// the worker catch's addPendingRetry path.
+		const s = await setup({ "a.md": "# A\n", "b.md": "# B\n" });
+		const replaceFileSpy = mockReplaceFileThrowFor(s.index, "b.md", "SQLITE_FULL", "disk full");
+
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+			expect(s.index.hasPendingRetries()).toBe(true);
+			expect(s.index.getScanComplete()).toBe(false);
+		} finally {
+			errSpy.mockRestore();
+			replaceFileSpy.mockRestore();
+		}
+	});
+});
+
+describe("scanVault — BUSY silent-skip unconditional on (mtime, size) match", () => {
+	test("forced rescan + prior row + matching (mtime,size) + BUSY → silent skip (rsync-t residual accepted)", async () => {
+		// Routing this scenario to pendingRetry would defend against the
+		// rsync-t case, but merkle drift can't repair it (gates on
+		// (mtime, size) too), so the scan would wedge until process
+		// restart — vault-wide tools stuck at INDEX_WARMING.
+		// Unconditional silent-skip accepts the rsync-t residual and
+		// defers to `last_body_simhash` (D32 Note).
+		const s = await setup({ "a.md": "# A\n\nbody", "b.md": "# B\n\nbody" });
+		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+		expect(s.index.listIndexedFiles().sort()).toEqual(["a.md", "b.md"]);
+		expect(s.index.getScanComplete()).toBe(true);
+
+		// Force the next scan to skipUnchanged=false (pre-W4 migration /
+		// policy-flip rescan path).
+		s.index.setScanComplete(false);
+
+		// Mock isFileUnchanged for b.md to return true unconditionally —
+		// emulates the post-BUSY case where disk's (mtime, size) match
+		// the indexed row (peer-committed-for-us OR rsync-t residual; we
+		// can't distinguish without content-hash detection).
+		const realIsFileUnchanged = s.index.isFileUnchanged.bind(s.index);
+		const isFileUnchangedSpy = vi.spyOn(s.index, "isFileUnchanged").mockImplementation((args) => {
+			if (args.file !== "b.md") return realIsFileUnchanged(args);
+			return true;
+		});
+		const replaceFileSpy = mockReplaceFileThrowFor(s.index, "b.md", "SQLITE_BUSY", "database is locked");
+
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+			// b.md silent-skipped → no pendingRetry, scan_complete fires.
+			expect(s.index.hasPendingRetries()).toBe(false);
+			expect(s.index.getScanComplete()).toBe(true);
+		} finally {
+			errSpy.mockRestore();
+			replaceFileSpy.mockRestore();
+			isFileUnchangedSpy.mockRestore();
+		}
+	});
+
+	test("cold start + no prior row + BUSY + peer-committed matching → silent skip preserved", async () => {
+		// Post-BUSY (mtime, size) match on a cold-start file means a
+		// peer committed the row → silent skip safe.
+		const s = await setup({ "a.md": "# A\n\nbody", "b.md": "# B\n\nbody" });
+		expect(s.index.getScanComplete()).toBe(false);
+		const realIsFileUnchanged = s.index.isFileUnchanged.bind(s.index);
+		const isFileUnchangedSpy = vi.spyOn(s.index, "isFileUnchanged").mockImplementation((args) => {
+			if (args.file !== "b.md") return realIsFileUnchanged(args);
+			return true;
+		});
+		const replaceFileSpy = mockReplaceFileThrowFor(s.index, "b.md", "SQLITE_BUSY", "database is locked");
+
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
+			// b.md treated as "indexed" via silent skip — no pendingRetry,
+			// scan_complete advances to true.
+			expect(s.index.hasPendingRetries()).toBe(false);
+			expect(s.index.getScanComplete()).toBe(true);
+		} finally {
+			errSpy.mockRestore();
+			replaceFileSpy.mockRestore();
+			isFileUnchangedSpy.mockRestore();
+		}
 	});
 });

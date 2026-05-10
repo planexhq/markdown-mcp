@@ -40,7 +40,7 @@ afterEach(async () => {
 async function makeVault(files: Record<string, string>): Promise<Setup> {
 	const vault = await createTempVault(files);
 	const opened = openSqlite({ dbPath: ":memory:" });
-	const index = createIndexHandle(opened.db);
+	const index = createIndexHandle(opened.db, { includeHidden: false });
 	const vaultRoot: VaultRoot = await validateVaultRoot(vault.path);
 	await scanVault({ vaultRoot, index, concurrency: 1 });
 	const s: Setup = {

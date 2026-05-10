@@ -176,9 +176,30 @@ export function closeSqlite(db: DatabaseType): void {
  * the channel stays available.
  */
 export function runMigrationV1(db: DatabaseType): void {
+	// `.immediate()` serializes concurrent same-policy peers on the WAL
+	// write-lock at BEGIN. `ensureColumn`'s PRAGMA→JS-check→ALTER window
+	// is not snapshot-isolated (ALTER reads live schema), so deferred
+	// concurrent migrations race to "duplicate column name". The loser
+	// waits on busy_timeout=5000 and observes the post-migration schema.
 	db.transaction(() => {
 		db.exec(SCHEMA_V1_DDL);
-	})();
+		// `CREATE TABLE IF NOT EXISTS` won't add columns to a pre-existing
+		// table, so additive columns on `index_meta` need an explicit ALTER
+		// for DBs created before the column existed.
+		ensureColumn(db, "index_meta", "include_hidden", "INTEGER");
+		// Records the policy of the currently-running scan; cleared by
+		// `markScanFinalized`. A SIGTERM mid-scan leaves this set; startup
+		// compares it against `args.includeHidden` when `scan_complete=0`
+		// so a partial scan under one policy followed by a revert-restart
+		// surfaces as a mismatch and forces cold rescan.
+		ensureColumn(db, "index_meta", "inflight_include_hidden", "INTEGER");
+	}).immediate();
+}
+
+function ensureColumn(db: DatabaseType, table: string, column: string, type: string): void {
+	const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+	if (cols.some((c) => c.name === column)) return;
+	db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
 }
 
 /**
@@ -211,9 +232,10 @@ CREATE TABLE IF NOT EXISTS snapshot (
 INSERT OR IGNORE INTO snapshot (id, value) VALUES (1, 0);
 
 CREATE TABLE IF NOT EXISTS index_meta (
-  id            INTEGER PRIMARY KEY CHECK (id = 1),
-  scan_complete INTEGER NOT NULL DEFAULT 0,
-  ever_complete INTEGER NOT NULL DEFAULT 0
+  id             INTEGER PRIMARY KEY CHECK (id = 1),
+  scan_complete  INTEGER NOT NULL DEFAULT 0,
+  ever_complete  INTEGER NOT NULL DEFAULT 0,
+  include_hidden INTEGER
 );
 INSERT OR IGNORE INTO index_meta (id, scan_complete, ever_complete) VALUES (1, 0, 0);
 

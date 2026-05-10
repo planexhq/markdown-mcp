@@ -32,7 +32,7 @@ import {
 	vaultError,
 } from "../lib/error.js";
 import { compileFilter } from "../lib/filter.js";
-import { isHiddenPath } from "../lib/hiddenPath.js";
+import { isHiddenPath, isIndexCachePath } from "../lib/hiddenPath.js";
 import type { IndexHandle, SearchRow, SearchScopeClause } from "../lib/index/IndexHandle.js";
 import { isIndexWarming } from "../lib/index_status.js";
 import { clampPageSize } from "../lib/limits.js";
@@ -55,6 +55,7 @@ export async function handleSearch(
 	input: SearchInput,
 	vaultRoot: VaultRoot,
 	index: IndexHandle,
+	includeHidden = false,
 ): Promise<ToolSuccessEnvelope<SearchOutput> | ToolErrorEnvelope> {
 	// Hoisted so the catch block can pass it to routeToolError — keeps
 	// `index_status` (warm/reconciling) and `query_algorithm` on error
@@ -72,7 +73,7 @@ export async function handleSearch(
 		// latter wastes the agent's retry budget on requests that will
 		// never succeed. The empty-and-empty D23 fast path also moves
 		// above the gate; it never reads the index.
-		const scope = await classifyScope(input.scope?.path, vaultRoot);
+		const scope = await classifyScope(input.scope?.path, vaultRoot, includeHidden);
 		if (!scope.ok) return toolErrorEnvelope(scope.err, meta);
 
 		const outcome = sanitizeQuery(input.query ?? "");
@@ -175,7 +176,11 @@ interface ScopeErr {
 	err: ReturnType<typeof vaultError>;
 }
 
-async function classifyScope(rawPath: string | undefined, vaultRoot: VaultRoot): Promise<ScopeOk | ScopeErr> {
+async function classifyScope(
+	rawPath: string | undefined,
+	vaultRoot: VaultRoot,
+	includeHidden: boolean,
+): Promise<ScopeOk | ScopeErr> {
 	// Only `undefined` (omitted) selects vault-wide; `""` falls through to
 	// validatePath (which rejects with EMPTY_PATH) so scope.path follows the
 	// same path-validation rules as every other tool's `file` parameter.
@@ -198,10 +203,20 @@ async function classifyScope(rawPath: string | undefined, vaultRoot: VaultRoot):
 	// Gate runs BEFORE `stat` — a hidden path's stat would succeed (the file
 	// exists on disk), so a post-stat check would mis-classify the rejection
 	// as "not a regular file or directory" instead of the precise reason.
-	if (isHiddenPath(safe.relative)) {
+	if (!includeHidden && isHiddenPath(safe.relative)) {
 		return {
 			ok: false,
 			err: vaultError("PATH_NOT_FOUND", `Scope path is hidden (excluded by default): ${rawPath}`, {
+				param: "scope.path",
+			}),
+		};
+	}
+	// Server's own cache dir is rejected regardless of `--include-hidden`.
+	// Mirrors readNote, getVaultTree.resolveStartPath, and watcher.shouldIgnore.
+	if (isIndexCachePath(safe.relative)) {
+		return {
+			ok: false,
+			err: vaultError("PATH_NOT_FOUND", `Scope path is inside the server cache directory: ${rawPath}`, {
 				param: "scope.path",
 			}),
 		};

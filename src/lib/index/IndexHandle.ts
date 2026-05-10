@@ -1,8 +1,7 @@
 /**
  * Domain façade over the SQLite + FTS5 index. All prepared statements
  * are centralized here; other modules never construct raw statements.
- * Lifecycle state (cold/warming/warm/reconciling) and `filesIndexed`
- * live in memory and are kept in sync by `replaceFile` / `removeFile`;
+ * Lifecycle state (cold/warming/warm/reconciling) lives in memory;
  * persisted state is the schema rows + the single-row `snapshot` counter.
  */
 
@@ -12,6 +11,7 @@ import type { AnchorKind, ContentKind, IndexState, IndexStatus, SearchScopeKind 
 import { type FilterKeysetKey, type LinksKeysetKey, parseHeadingPathJson, type ScoreDescKey } from "../cursor.js";
 import { type CompiledFilter, escapeLike, globEscape } from "../filter.js";
 import type { HeadingHistoryRow } from "../fuzzy.js";
+import { INDEX_DIR_NAME, isFsCaseInsensitiveResolved } from "../hiddenPath.js";
 import { transition } from "../index_status.js";
 import { basenameNoExt, type VaultFileIndex } from "../wikilinks.js";
 
@@ -165,8 +165,18 @@ export interface FileStats {
 	contentKinds: ReadonlyArray<ContentKind>;
 }
 
-export function createIndexHandle(db: DatabaseType): IndexHandle {
-	return new IndexHandle(db);
+/**
+ * `includeHidden` is captured here so {@link IndexHandle.markScanFinalized}
+ * persists it atomically with `scan_complete=true` — that invariant is
+ * what lets a startup mismatch check distinguish "last clean snapshot's
+ * policy" from "currently-running process flag."
+ */
+export interface CreateIndexHandleOptions {
+	includeHidden: boolean;
+}
+
+export function createIndexHandle(db: DatabaseType, options: CreateIndexHandleOptions): IndexHandle {
+	return new IndexHandle(db, options.includeHidden);
 }
 
 interface FileCacheSnapshot {
@@ -175,14 +185,12 @@ interface FileCacheSnapshot {
 	pathLc: Map<string, string>;
 }
 
+const INDEX_CACHE_GLOB = `${globEscape(INDEX_DIR_NAME)}/*`;
+
 export class IndexHandle implements VaultFileIndex {
 	private readonly db: DatabaseType;
 
-	// In-memory lifecycle state. `files_indexed` is cached at startup
-	// and updated incrementally on `replaceFile` / `removeFile` so the
-	// `getStatus` hot path doesn't run a `COUNT(DISTINCT file)` per call.
 	private state: IndexState = "cold";
-	private filesIndexed: number;
 
 	private readonly stmtBumpSnapshot: Statement;
 	private readonly stmtGetSnapshot: Statement;
@@ -203,24 +211,34 @@ export class IndexHandle implements VaultFileIndex {
 	private readonly stmtGetHistoryRow: Statement;
 	private readonly stmtGetScanComplete: Statement;
 	private readonly stmtSetScanComplete: Statement;
+	private readonly stmtGetIncludeHidden: Statement;
+	private readonly stmtGetInflightIncludeHidden: Statement;
+	private readonly stmtSetInflightIncludeHidden: Statement;
 	private readonly stmtGetEverComplete: Statement;
-	private readonly stmtMarkEverComplete: Statement;
+	private readonly stmtFinalize: Statement;
 	private readonly stmtListIndexedFiles: Statement;
 	private readonly stmtDeleteWikilinksForFile: Statement;
 	private readonly stmtInsertWikilink: Statement;
 	private readonly stmtCountWikilinksForFile: Statement;
 	private readonly stmtUpsertFileMetrics: Statement;
 	private readonly stmtDeleteFileMetrics: Statement;
+	private readonly stmtsSweepCacheLower: ReadonlyArray<Statement>;
+	private readonly stmtsSweepCacheByteWise: ReadonlyArray<Statement>;
 
 	// Single-pass snapshot cache for wikilink resolution. Invalidated on
 	// `bumpSnapshot`; basename + case-insensitive path lookup share one
 	// iteration over `listIndexedFiles()`.
 	private fileCache: FileCacheSnapshot | null = null;
 
-	// One-way latch for `ever_complete`. Never resets within a process
-	// lifetime, so caching the `true` state skips no-op WAL writes on
-	// every reconcile clean-finish.
-	private everCompleteOnce = false;
+	// `ever_complete` is one-way set by {@link markScanFinalized} — once
+	// true, never reset, so cache staleness is impossible.
+	// Other persisted flags (`scan_complete`, `inflight_include_hidden`,
+	// `include_hidden`) do NOT cache: under same-policy multi-process
+	// operation a peer's mid-startup finalize between this handle's
+	// construction and a setter call would let the cache go stale
+	// relative to disk. Setters write disk directly; getters issue a
+	// fresh SELECT each call.
+	private everCompletePersisted: boolean;
 
 	// Per-file failures the watcher can still recover. Both scanner and
 	// the watcher's `reindexCallback` add via {@link addPendingRetry};
@@ -250,12 +268,31 @@ export class IndexHandle implements VaultFileIndex {
 	// so a post-abort watcher recovery can't finalize on a partial index.
 	private scanIncomplete = false;
 
-	constructor(db: DatabaseType) {
+	// See {@link CreateIndexHandleOptions}.
+	private readonly includeHidden: boolean;
+
+	constructor(db: DatabaseType, includeHidden: boolean) {
 		this.db = db;
+		this.includeHidden = includeHidden;
 		this.stmtBumpSnapshot = db.prepare("UPDATE snapshot SET value = MAX(value + 1, :now) WHERE id = 1 RETURNING value");
 		this.stmtGetSnapshot = db.prepare("SELECT value FROM snapshot WHERE id = 1");
-		this.stmtCountFiles = db.prepare("SELECT COUNT(DISTINCT file) AS n FROM fragments");
-		this.stmtFileExists = db.prepare("SELECT 1 FROM fragments WHERE file = :file LIMIT 1");
+		// `frontmatter` has one row per file (line 367 — canonical "indexed
+		// files" set), keyed by `file TEXT PRIMARY KEY`, so COUNT(*) is an
+		// O(log N) b-tree boundary lookup. COUNT(DISTINCT file) on
+		// `fragments` would walk every heading/preamble/file row to dedupe.
+		this.stmtCountFiles = db.prepare("SELECT COUNT(*) AS n FROM frontmatter");
+		// Cover both orphan directions. `replaceFile` upserts both tables
+		// in one txn, but legacy/corrupt/manually-edited DBs can leave a
+		// row in either table without the other. Querying only `frontmatter`
+		// defeats `removeFile` for fragments-only orphans (they stay
+		// searchable via the `fragments f LEFT JOIN frontmatter fm` in
+		// `searchQueryMode` / `searchFilterMode`); querying only `fragments`
+		// defeats it for frontmatter-only orphans (they keep inflating
+		// `countFiles`).
+		this.stmtFileExists = db.prepare(
+			"SELECT 1 WHERE EXISTS (SELECT 1 FROM frontmatter WHERE file = :file) " +
+				"OR EXISTS (SELECT 1 FROM fragments WHERE file = :file)",
+		);
 		this.stmtGetFileMeta = db.prepare("SELECT mtime, size FROM fragments WHERE file = :file LIMIT 1");
 		// `mtime` and `size` are identical across every row of a file (the
 		// per-file txn writes the same scalars), so MAX collapses to that
@@ -324,8 +361,22 @@ export class IndexHandle implements VaultFileIndex {
 		this.stmtGetHistoryRow = db.prepare("SELECT * FROM heading_history WHERE file = :file AND stable_id = :stable_id");
 		this.stmtGetScanComplete = db.prepare("SELECT scan_complete FROM index_meta WHERE id = 1");
 		this.stmtSetScanComplete = db.prepare("UPDATE index_meta SET scan_complete = :value WHERE id = 1");
+		this.stmtGetIncludeHidden = db.prepare("SELECT include_hidden FROM index_meta WHERE id = 1");
+		this.stmtGetInflightIncludeHidden = db.prepare("SELECT inflight_include_hidden FROM index_meta WHERE id = 1");
+		this.stmtSetInflightIncludeHidden = db.prepare(
+			"UPDATE index_meta SET inflight_include_hidden = :value WHERE id = 1",
+		);
+		// Only `ever_complete` is cached (one-way set; staleness impossible).
+		// The other persisted flags use their per-flag getters which read
+		// disk directly — see {@link everCompletePersisted}.
 		this.stmtGetEverComplete = db.prepare("SELECT ever_complete FROM index_meta WHERE id = 1");
-		this.stmtMarkEverComplete = db.prepare("UPDATE index_meta SET ever_complete = 1 WHERE id = 1");
+		// Single statement so the finalize columns commit atomically.
+		// `inflight_include_hidden = NULL` clears the in-flight marker in
+		// the same UPDATE — a SIGTERM mid-finalize cannot leave the clear
+		// half-done.
+		this.stmtFinalize = db.prepare(
+			"UPDATE index_meta SET scan_complete = 1, ever_complete = 1, include_hidden = :include_hidden, inflight_include_hidden = NULL WHERE id = 1",
+		);
 		// `frontmatter` is the canonical "indexed files" set: every
 		// `replaceFile` upserts a row, even for files with zero fragments.
 		this.stmtListIndexedFiles = db.prepare("SELECT file FROM frontmatter");
@@ -347,8 +398,23 @@ export class IndexHandle implements VaultFileIndex {
 			   content_kinds_json = excluded.content_kinds_json`,
 		);
 		this.stmtDeleteFileMetrics = db.prepare("DELETE FROM file_metrics WHERE file = :file");
-		const row = this.stmtCountFiles.get() as { n: number };
-		this.filesIndexed = row.n;
+		// `lower()` loses index-eligibility on `file` but the sweep runs
+		// once per startup against a small cache-prefix row set (zero
+		// on a clean DB).
+		const sweepTargets = [
+			["fragments", "file"],
+			["frontmatter", "file"],
+			["frontmatter_tags", "file"],
+			["wikilinks", "source_file"],
+			["file_metrics", "file"],
+			["heading_history", "file"],
+		] as const;
+		this.stmtsSweepCacheLower = sweepTargets.map(([t, c]) =>
+			db.prepare(`DELETE FROM ${t} WHERE lower(${c}) GLOB :prefix`),
+		);
+		this.stmtsSweepCacheByteWise = sweepTargets.map(([t, c]) => db.prepare(`DELETE FROM ${t} WHERE ${c} GLOB :prefix`));
+		const everCompleteRow = this.stmtGetEverComplete.get() as { ever_complete: number } | undefined;
+		this.everCompletePersisted = everCompleteRow !== undefined && everCompleteRow.ever_complete === 1;
 	}
 
 	/**
@@ -367,38 +433,75 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	/**
-	 * "Has any scan ever finished cleanly?" One-way: never resets after first
-	 * `markEverComplete`. Distinct from `scan_complete` (per-scan flag): a
-	 * partial first scan has `scan_complete=false AND ever_complete=false`,
-	 * while an interrupted reconcile of a previously-complete index has
-	 * `scan_complete=false AND ever_complete=true`. Startup state machine
-	 * only treats the latter as "warm" — see `chooseStartupState`.
+	 * "Has any scan ever finished cleanly?" Written only by
+	 * {@link markScanFinalized} — never resets once set. Distinct from
+	 * `scan_complete` (per-scan flag): a partial first scan has
+	 * `scan_complete=false AND ever_complete=false`, while an
+	 * interrupted reconcile of a previously-complete index has
+	 * `scan_complete=false AND ever_complete=true`. Startup state
+	 * machine only treats the latter as "warm" — see
+	 * `chooseStartupState`.
 	 */
 	getEverComplete(): boolean {
-		const row = this.stmtGetEverComplete.get() as { ever_complete: number } | undefined;
-		return row !== undefined && row.ever_complete === 1;
-	}
-
-	markEverComplete(): void {
-		if (this.everCompleteOnce) return;
-		this.stmtMarkEverComplete.run();
-		this.everCompleteOnce = true;
+		return this.everCompletePersisted;
 	}
 
 	/**
-	 * Single point of "scan reached full success." Flips `scan_complete`,
-	 * one-way-latches `ever_complete`, and flips state to `warm`. Called
-	 * by both the scanner end-of-scan clean branch and the watcher's
-	 * pending-retry drain — keeping the steps in one place ensures
-	 * consistent finalization across recovery paths.
+	 * Persisted `--include-hidden` policy from the last cleanly-finalized
+	 * snapshot. `null` signals a fresh DB or pre-column upgrade; the next
+	 * {@link markScanFinalized} writes the running policy. Compared
+	 * against the current flag at startup to detect policy flips that
+	 * invalidate the snapshot's row population.
+	 */
+	getIncludeHiddenPolicy(): boolean | null {
+		const row = this.stmtGetIncludeHidden.get() as { include_hidden: number | null } | undefined;
+		if (row === undefined || row.include_hidden === null) return null;
+		return row.include_hidden === 1;
+	}
+
+	/**
+	 * Tri-state read of the IN-FLIGHT scan policy. NULL = no scan in
+	 * progress or last scan finalized cleanly; true/false = a scan is/was
+	 * interrupted under that policy. Startup uses this to detect a
+	 * partial scan whose policy may differ from the current
+	 * `args.includeHidden` — `getIncludeHiddenPolicy` only captures the
+	 * LAST CLEAN policy, so a revert-restart after a SIGTERM mid-flip
+	 * would otherwise see no mismatch and serve a contaminated snapshot
+	 * until reconcile drained.
+	 */
+	getInflightIncludeHidden(): boolean | null {
+		const row = this.stmtGetInflightIncludeHidden.get() as { inflight_include_hidden: number | null } | undefined;
+		if (row === undefined || row.inflight_include_hidden === null) return null;
+		return row.inflight_include_hidden === 1;
+	}
+
+	/**
+	 * Records the policy under which the current scan is starting.
+	 * Cleared in {@link markScanFinalized}'s single UPDATE on clean finish.
+	 */
+	setInflightIncludeHidden(value: boolean): void {
+		this.stmtSetInflightIncludeHidden.run({ value: value ? 1 : 0 });
+	}
+
+	/**
+	 * Single point of "scan reached full success." Atomically commits
+	 * `scan_complete=1`, `ever_complete=1`,
+	 * `include_hidden=<current policy>`, and `inflight_include_hidden=NULL`
+	 * via one UPDATE so the persisted `include_hidden` always identifies
+	 * the last cleanly-finalized snapshot's policy AND the in-flight
+	 * marker is cleared atomically.
+	 *
+	 * Every call writes; no cache-skip. Under same-policy multi-process
+	 * operation a peer's cached `scan_complete=true` can be stale
+	 * relative to disk if another peer writes `scan_complete=0` during
+	 * its scan; a cache-skip would leave disk stuck at 0. The skip would
+	 * save ~1 SQL write per peer lifetime — unmeasurable; dropping it is
+	 * free.
 	 */
 	markScanFinalized(): void {
-		this.setScanComplete(true);
-		this.markEverComplete();
+		this.stmtFinalize.run({ include_hidden: this.includeHidden ? 1 : 0 });
+		this.everCompletePersisted = true;
 		this.setStatus("warm");
-		// Self-clear so a clean merkle reconcile after an aborted scan
-		// correctly re-arms — the next aborted scan flips this back via
-		// `setScanIncomplete(true)`.
 		this.scanIncomplete = false;
 	}
 
@@ -449,7 +552,7 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	getStatus(): IndexStatus {
-		return { state: this.state, files_indexed: this.filesIndexed };
+		return { state: this.state, files_indexed: this.countFiles() };
 	}
 
 	/**
@@ -462,7 +565,7 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	countFiles(): number {
-		return this.filesIndexed;
+		return (this.stmtCountFiles.get() as { n: number }).n;
 	}
 
 	/**
@@ -474,8 +577,29 @@ export class IndexHandle implements VaultFileIndex {
 		return (this.stmtListIndexedFiles.all() as Array<{ file: string }>).map((r) => r.file);
 	}
 
-	private fileHasRows(file: string): boolean {
+	fileHasRows(file: string): boolean {
 		return this.stmtFileExists.get({ file }) !== undefined;
+	}
+
+	/**
+	 * Storage-layer cache-prefix predicate: search / get_links SQL has
+	 * none, so a pre-existing or planted DB with `.vault-mcp/*` rows
+	 * would leak through the warm-publish window.
+	 */
+	sweepIndexCacheRows(): void {
+		const args = { prefix: INDEX_CACHE_GLOB };
+		const stmts = isFsCaseInsensitiveResolved() ? this.stmtsSweepCacheLower : this.stmtsSweepCacheByteWise;
+		this.db
+			.transaction(() => {
+				let totalChanges = 0;
+				for (const stmt of stmts) totalChanges += stmt.run(args).changes;
+				// Snapshot persists in SQLite; without a bump on real deletes,
+				// a pre-restart cursor would pass the equality check on a
+				// different row set. Zero-changes skips the bump to preserve
+				// cursors across no-op restarts (common path).
+				if (totalChanges > 0) this.bumpSnapshot();
+			})
+			.immediate();
 	}
 
 	/**
@@ -529,7 +653,6 @@ export class IndexHandle implements VaultFileIndex {
 				newStableIds.add(f.stable_id);
 			}
 		}
-		const hadRowsBefore = this.fileHasRows(file);
 
 		const txn = this.db.transaction(() => {
 			const oldHeadings = this.stmtSelectOldHeadings.all({ file }) as Array<{
@@ -621,10 +744,6 @@ export class IndexHandle implements VaultFileIndex {
 			this.bumpSnapshot();
 		});
 		txn();
-		const hasRowsAfter = fragments.length > 0;
-		if (hadRowsBefore !== hasRowsAfter) {
-			this.filesIndexed += hasRowsAfter ? 1 : -1;
-		}
 	}
 
 	/**
@@ -671,7 +790,6 @@ export class IndexHandle implements VaultFileIndex {
 			this.bumpSnapshot();
 		});
 		txn();
-		this.filesIndexed--;
 	}
 
 	getHistoryRow(file: string, stable_id: string): HeadingHistoryRow | null {

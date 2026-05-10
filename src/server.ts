@@ -46,15 +46,28 @@ import type { ErrorCode as VaultErrorCode } from "./types.js";
 
 /**
  * Server name + version reported in the MCP `initialize` handshake.
- * Bumped to a real `1.0.0` at the W5 release cut.
  */
 const SERVER_INFO = {
 	name: "vault-mcp",
-	version: "1.0.0-w4",
+	version: "1.0.0",
 } as const;
 
 const INSTRUCTIONS =
 	"Read-only access to a local markdown vault. Use get_vault_tree to discover files, get_file_outline + get_fragment for navigation.";
+
+/**
+ * Server-wide policy carried alongside the vault root and index handle.
+ *
+ * `includeHidden` is set by the `--include-hidden` CLI flag. It flows from
+ * here into every surface (tree, search, fragment, outline, metadata,
+ * links, embeds, note:// resource) so dotfile visibility is genuinely
+ * all-or-nothing per CLAUDE.md's "Hidden files: all-or-nothing per-server"
+ * gotcha. The watcher and scanner receive the same flag separately at
+ * startup; both sides must agree or surfaces drift apart.
+ */
+export interface ServerConfig {
+	includeHidden?: boolean;
+}
 
 /**
  * Build a configured `McpServer` for the given vault root. Caller is
@@ -64,7 +77,8 @@ const INSTRUCTIONS =
  * recovery in `get_fragment`. Outline / metadata use it only for the
  * live `_meta.index_status`.
  */
-export function createServer(vaultRoot: VaultRoot, index?: IndexHandle): McpServer {
+export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: ServerConfig = {}): McpServer {
+	const includeHidden = config.includeHidden ?? false;
 	// `tools` and `resources` capabilities are auto-registered by the SDK
 	// when registerTool / registerResource fire; no need to pre-declare.
 	// `subscribe: true` was advertised previously but no subscribe handler
@@ -104,14 +118,19 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle): McpServ
 		};
 	});
 
-	registerTools(server, vaultRoot, index);
-	registerNoteResource(server, vaultRoot);
+	registerTools(server, vaultRoot, index, includeHidden);
+	registerNoteResource(server, vaultRoot, includeHidden);
 	return server;
 }
 
 // ─── Tool registration ─────────────────────────────────────────────────────
 
-function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHandle): void {
+function registerTools(
+	server: McpServer,
+	vaultRoot: VaultRoot,
+	index: IndexHandle | undefined,
+	includeHidden: boolean,
+): void {
 	server.registerTool(
 		"get_vault_tree",
 		{
@@ -119,7 +138,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHan
 			description: TOOL_DESCRIPTIONS.get_vault_tree,
 			inputSchema: GetVaultTreeSchema,
 		},
-		async (input) => handleGetVaultTree(input, vaultRoot, index),
+		async (input) => handleGetVaultTree(input, vaultRoot, index, includeHidden),
 	);
 
 	server.registerTool(
@@ -129,7 +148,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHan
 			description: TOOL_DESCRIPTIONS.get_file_outline,
 			inputSchema: GetFileOutlineSchema,
 		},
-		async (input) => handleGetFileOutline(input, vaultRoot, index),
+		async (input) => handleGetFileOutline(input, vaultRoot, index, includeHidden),
 	);
 
 	server.registerTool(
@@ -139,7 +158,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHan
 			description: TOOL_DESCRIPTIONS.get_fragment,
 			inputSchema: GetFragmentSchema,
 		},
-		async (input) => handleGetFragment(input, vaultRoot, index),
+		async (input) => handleGetFragment(input, vaultRoot, index, includeHidden),
 	);
 
 	server.registerTool(
@@ -153,7 +172,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHan
 			if (index === undefined) {
 				return internalErrorEnvelope("search requires the index handle (server misconfigured).");
 			}
-			return handleSearch(input, vaultRoot, index);
+			return handleSearch(input, vaultRoot, index, includeHidden);
 		},
 	);
 
@@ -164,7 +183,7 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHan
 			description: TOOL_DESCRIPTIONS.get_metadata,
 			inputSchema: GetMetadataSchema,
 		},
-		async (input) => handleGetMetadata(input, vaultRoot, index),
+		async (input) => handleGetMetadata(input, vaultRoot, index, includeHidden),
 	);
 
 	server.registerTool(
@@ -178,14 +197,14 @@ function registerTools(server: McpServer, vaultRoot: VaultRoot, index?: IndexHan
 			if (index === undefined) {
 				return internalErrorEnvelope("get_links requires the index handle (server misconfigured).");
 			}
-			return handleGetLinks(input, vaultRoot, index);
+			return handleGetLinks(input, vaultRoot, index, includeHidden);
 		},
 	);
 }
 
 // ─── Resource registration ─────────────────────────────────────────────────
 
-function registerNoteResource(server: McpServer, vaultRoot: VaultRoot): void {
+function registerNoteResource(server: McpServer, vaultRoot: VaultRoot, includeHidden: boolean): void {
 	server.registerResource(
 		"note",
 		// `{+path}` is RFC 6570 reserved-character expansion: the SDK's
@@ -241,7 +260,7 @@ function registerNoteResource(server: McpServer, vaultRoot: VaultRoot): void {
 				// file including frontmatter, the brief's contract for
 				// `note://`. Skipping the parser also lets a parse-only
 				// failure like AST cap not block a readable file.
-				const source = await readSource(safePath);
+				const source = await readSource(safePath, includeHidden);
 				return {
 					contents: [{ uri: uri.toString(), mimeType: "text/markdown", text: source }],
 				};

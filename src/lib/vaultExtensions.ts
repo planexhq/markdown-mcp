@@ -16,7 +16,7 @@
 
 import { extname } from "node:path";
 
-const DEFAULT_EXTENSIONS: ReadonlySet<string> = new Set(["md"]);
+export const DEFAULT_EXTENSIONS: ReadonlySet<string> = new Set(["md"]);
 
 let cachedRawEnv: string | undefined;
 let cachedExtensions: ReadonlySet<string> = DEFAULT_EXTENSIONS;

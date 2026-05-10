@@ -32,7 +32,7 @@ import { lstat } from "node:fs/promises";
 
 import type { PathRejectionReason, SafePath } from "../types.js";
 import { errorMessage, isVanishedErrno, vaultError } from "./error.js";
-import { isHiddenPath } from "./hiddenPath.js";
+import { isHiddenPath, isIndexCachePath } from "./hiddenPath.js";
 import { MAX_FILE_BYTES } from "./limits.js";
 import { type ParsedFile, ParseError, type ParseFileOptions, parseFile } from "./parser.js";
 import { openNoFollow, PathValidationError } from "./validatePath.js";
@@ -63,13 +63,21 @@ export class FileTooLargeError extends Error {
 	}
 }
 
-function assertNotePathString(safePath: SafePath): void {
+function assertNotePathString(safePath: SafePath, includeHidden: boolean): void {
 	if (!isMarkdownPath(safePath.relative)) {
 		throw pathNotFound(`Path is not a markdown note: ${safePath.relative}`);
 	}
-	if (isHiddenPath(safePath.relative)) {
+	// Server's own cache dir is rejected regardless of `--include-hidden`.
+	// Mirrors `watcher.ts:shouldIgnore` + `getVaultTree.resolveStartPath` +
+	// `search.classifyScope`. Without this, an agent under `--include-hidden`
+	// could read markdown placed inside `.vault-mcp/` via get_fragment etc.
+	if (isIndexCachePath(safePath.relative)) {
+		throw pathNotFound(`Path is inside the server cache directory: ${safePath.relative}`);
+	}
+	if (!includeHidden && isHiddenPath(safePath.relative)) {
 		// Brief line 928: hidden files are policy-excluded from every direct-read
-		// surface by default. `--include-hidden` will gate this at the call site (W5).
+		// surface by default. `--include-hidden` (CLI in W5) flips this off so
+		// dotfiles become addressable through every surface symmetrically.
 		throw pathNotFound(`Path is hidden (excluded by default): ${safePath.relative}`);
 	}
 }
@@ -80,8 +88,8 @@ function assertNotePathString(safePath: SafePath): void {
  * that subsequently open the file get a stricter post-open `fstat` from
  * `readSource`.
  */
-export async function assertNotePathPolicy(safePath: SafePath): Promise<void> {
-	assertNotePathString(safePath);
+export async function assertNotePathPolicy(safePath: SafePath, includeHidden = false): Promise<void> {
+	assertNotePathString(safePath, includeHidden);
 	let stat: Awaited<ReturnType<typeof lstat>>;
 	try {
 		stat = await lstat(safePath.absolute);
@@ -107,8 +115,8 @@ export async function assertNotePathPolicy(safePath: SafePath): Promise<void> {
  * during the validation window still can't bypass it; `O_NONBLOCK` on
  * the open keeps the FIFO from hanging the server.
  */
-export async function readSource(safePath: SafePath): Promise<string> {
-	assertNotePathString(safePath);
+export async function readSource(safePath: SafePath, includeHidden = false): Promise<string> {
+	assertNotePathString(safePath, includeHidden);
 	let fh: FileHandle | undefined;
 	try {
 		try {
@@ -173,8 +181,12 @@ export async function readSource(safePath: SafePath): Promise<string> {
  * run `validatePath`. `safePath.relative` is used as the input to the
  * D27 stable_id hash.
  */
-export async function readNote(safePath: SafePath, options: ParseFileOptions = {}): Promise<NoteData> {
-	const source = await readSource(safePath);
+export async function readNote(
+	safePath: SafePath,
+	options: ParseFileOptions = {},
+	includeHidden = false,
+): Promise<NoteData> {
+	const source = await readSource(safePath, includeHidden);
 	const parsed = parseFile(source, safePath.relative, options);
 	return { source, parsed };
 }

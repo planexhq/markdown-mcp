@@ -22,7 +22,7 @@ import { posix } from "node:path";
 import type { ExpansionError, FragmentResult } from "../types.js";
 import { stripBlockIdMarker } from "./blockIds.js";
 import { getErrnoCode } from "./error.js";
-import { isHiddenPath } from "./hiddenPath.js";
+import { isHiddenPath, isIndexCachePath } from "./hiddenPath.js";
 import { fileBodyStartOffset, type HeadingMeta, headingPathsEqual, type ParsedFile } from "./parser.js";
 import { PathValidationError, type VaultRoot, validatePath } from "./validatePath.js";
 import { isAssetPath, isMarkdownPath } from "./vaultExtensions.js";
@@ -46,6 +46,9 @@ export interface EmbedExpansionContext {
 	 * one fragment so embeds within the parent are also cycle-protected. */
 	visited: Set<string>;
 	maxDepth: number;
+	/** Server-wide hidden-path policy. Default false — hidden assets are not
+	 * probed for the `non_markdown_target` discriminator. */
+	includeHidden: boolean;
 }
 
 interface ExpansionResult {
@@ -78,7 +81,7 @@ export async function expandEmbed(
 		// The markdown index doesn't track non-markdown assets, so probe the
 		// filesystem before declaring `![[image.png]]` missing — separates
 		// "asset doesn't exist" from "asset exists but is non-markdown."
-		if (await assetExistsOnDisk(resolved.rawTarget, ctx.vaultRoot, sourceFile)) {
+		if (await assetExistsOnDisk(resolved.rawTarget, ctx.vaultRoot, sourceFile, ctx.includeHidden)) {
 			return { expanded: false, expansion_error: "non_markdown_target" };
 		}
 		const candidates = resolved.candidates ?? [];
@@ -273,7 +276,12 @@ async function recursivelyExpandSlice(
  * symlinked image stores resolve; `validatePath`'s segment-walk lstat has
  * already rejected any symlinked PARENT in the path.
  */
-async function assetExistsOnDisk(rawTarget: string, vaultRoot: VaultRoot, sourceFile: string): Promise<boolean> {
+async function assetExistsOnDisk(
+	rawTarget: string,
+	vaultRoot: VaultRoot,
+	sourceFile: string,
+	includeHidden: boolean,
+): Promise<boolean> {
 	const { filePart } = parseTarget(rawTarget);
 	if (filePart.length === 0) return false;
 	if (!isAssetPath(filePart)) return false;
@@ -305,13 +313,17 @@ async function assetExistsOnDisk(rawTarget: string, vaultRoot: VaultRoot, source
 	for (const candidate of candidates) {
 		try {
 			const safe = await validatePath(candidate, vaultRoot);
+			// Server cache directory is unconditionally unreachable across
+			// every surface (mirrors scanner / merkle walks, getVaultTree,
+			// readNote, search scope). Independent of `includeHidden`.
+			if (isIndexCachePath(safe.relative)) continue;
 			// Hidden-path policy is server-wide ("all-or-nothing per server").
 			// Without this gate the probe would distinguish hidden-asset
 			// existence from missing via the `non_markdown_target` vs
 			// `unresolved_file` discriminator. validatePath itself doesn't
 			// enforce hidden — that lives in readSource for markdown reads;
 			// mirror it here.
-			if (isHiddenPath(safe.relative)) continue;
+			if (!includeHidden && isHiddenPath(safe.relative)) continue;
 			const st = await stat(safe.absolute);
 			if (st.isFile()) return true;
 		} catch (err) {

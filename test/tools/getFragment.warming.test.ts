@@ -31,7 +31,7 @@ async function setup(): Promise<Setup> {
 		"target.md": "# Target\n\nbody\n",
 	});
 	const opened = openSqlite({ dbPath: ":memory:" });
-	const index = createIndexHandle(opened.db);
+	const index = createIndexHandle(opened.db, { includeHidden: false });
 	const vaultRoot = await validateVaultRoot(vault.path);
 	const s: Setup = { vault, opened, index, vaultRoot };
 	setups.push(s);

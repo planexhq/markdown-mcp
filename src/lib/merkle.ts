@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 import { errorMessage, getErrnoCode, isVanishedErrno } from "./error.js";
 import { isUnderFailedSubtree } from "./failedSubtrees.js";
-import { isHiddenName } from "./hiddenPath.js";
+import { isHiddenName, isIndexCachePath } from "./hiddenPath.js";
 import type { IndexHandle } from "./index/IndexHandle.js";
 import { confirmAndPrune, confirmPrune, type IndexOutcome } from "./index/scanner.js";
 import { passesPathPolicy, type VaultRoot } from "./validatePath.js";
@@ -194,8 +194,25 @@ async function reconcile(
 		await batchedReindex(newFiles, coordinator, reindexFile, "new", failedFiles);
 		const drifted = await driftedPromise;
 		await batchedReindex(drifted, coordinator, reindexFile, "drift", failedFiles);
+		// Backstop the scanner BUSY race: pending entries whose row drift
+		// detection now sees as in-sync are unreachable via the new/drifted/
+		// removal partitions. Reindex once; re-BUSY stays pending and the
+		// next tick retries.
+		if (index.hasPendingRetries()) {
+			const pending = index.pendingRetriesSnapshot();
+			const newSet = new Set(newFiles);
+			const driftedSet = new Set(drifted);
+			const removalSet = new Set(removalCandidates);
+			const pendingBackstop: string[] = [];
+			for (const rel of pending) {
+				if (!onDisk.has(rel)) continue;
+				if (newSet.has(rel) || driftedSet.has(rel) || removalSet.has(rel)) continue;
+				pendingBackstop.push(rel);
+			}
+			await batchedReindex(pendingBackstop, coordinator, reindexFile, "pending", failedFiles);
+		}
 	})();
-	const prunePass = pruneVanished(removalCandidates, vaultRoot, coordinator, index);
+	const prunePass = pruneVanished(removalCandidates, vaultRoot, coordinator, index, includeHidden);
 	await Promise.all([parsePasses, prunePass]);
 	return { failedSubtrees, failedFiles };
 }
@@ -215,7 +232,7 @@ async function batchedReindex(
 	files: ReadonlyArray<string>,
 	coordinator: WriteCoordinator,
 	reindexFile: (relpath: string) => Promise<IndexOutcome>,
-	label: "new" | "drift",
+	label: "new" | "drift" | "pending",
 	failedFiles: Set<string>,
 ): Promise<void> {
 	for (let i = 0; i < files.length; i += REINDEX_BATCH) {
@@ -240,18 +257,19 @@ async function pruneVanished(
 	vaultRoot: VaultRoot,
 	coordinator: WriteCoordinator,
 	index: IndexHandle,
+	includeHidden: boolean,
 ): Promise<void> {
 	const retiredAt = Date.now();
 	// Stat-confirm before pruning: `onDisk` was captured before `indexed`,
 	// so a file added by the watcher between the two captures would
 	// otherwise be removed despite still existing on disk.
-	await confirmAndPrune(removalCandidates, vaultRoot, async (rel) => {
+	await confirmAndPrune(removalCandidates, vaultRoot, includeHidden, async (rel) => {
 		await coordinator.enqueue(rel, async () => {
 			// Re-confirm inside the coordinator window: the batched verdict is
 			// up to N×lstat stale, and a watcher reindex of the same path
 			// queues on this same coordinator key (FIFO-ordered ahead of this
 			// task). Without the re-check, a recreated row is silently deleted.
-			const stillStaleVerdict = await confirmPrune(rel, vaultRoot);
+			const stillStaleVerdict = await confirmPrune(rel, vaultRoot, includeHidden);
 			if (!stillStaleVerdict) return;
 			try {
 				index.removeFile(rel, retiredAt);
@@ -346,6 +364,9 @@ async function* walkVaultMarkdown(
 		const name = entry.name;
 		if (!includeHidden && isHiddenName(name)) continue;
 		const childRel = relParent ? `${relParent}/${name}` : name;
+		// Server's own cache dir is excluded regardless of `--include-hidden`
+		// (mirrors `scanner.ts:walkVault` and `watcher.ts:shouldIgnore`).
+		if (isIndexCachePath(childRel)) continue;
 		if (entry.isSymbolicLink()) continue;
 		if (entry.isDirectory()) {
 			yield* walkVaultMarkdown(root, childRel, includeHidden, failedSubtrees);

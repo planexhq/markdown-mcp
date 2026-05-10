@@ -1,6 +1,61 @@
 import type { IndexState } from "../types.js";
 
 /**
+ * Stderr log fragment emitted when {@link chooseStartupState} forces a
+ * cold rescan because of a policy mismatch. Exported so tests assert
+ * against the same string the production code emits — if the copy ever
+ * changes, both move together.
+ */
+export const POLICY_MISMATCH_LOG_FRAGMENT = "--include-hidden policy changed since last run";
+
+/**
+ * Inputs to {@link computePolicyMismatch}. Two distinct signals collapse
+ * into one boolean: either indicates the persisted index population
+ * doesn't match the running `--include-hidden` flag.
+ */
+export interface PolicyMismatchInputs {
+	preexisted: boolean;
+	scanComplete: boolean;
+	/** Persisted policy of the LAST CLEANLY-FINALIZED snapshot. `null` for
+	 * fresh DBs or pre-column upgrades. */
+	includeHiddenPolicy: boolean | null;
+	/** Policy of an IN-FLIGHT (interrupted) scan. `null` when no scan is
+	 * in progress / last scan finalized cleanly. */
+	inflightIncludeHidden: boolean | null;
+	argIncludeHidden: boolean;
+}
+
+/**
+ * `true` when either signal indicates the persisted index doesn't match
+ * the running `--include-hidden` flag and a cold rescan is required:
+ *
+ * 1. **Last-clean mismatch**: the persisted last-clean policy differs
+ *    from `args.includeHidden`. Catches the simple toggle case. NULL
+ *    `includeHiddenPolicy` coerces to `false` (the legacy default) so
+ *    upgrades from a pre-column cache opened with the flag flip are
+ *    caught.
+ * 2. **Interrupted-scan mismatch**: a scan was interrupted
+ *    (`scan_complete=false`) under a policy that differs from
+ *    `args.includeHidden`. The persisted last-clean policy can match
+ *    `args.includeHidden` (revert-during-flip case) and still leave the
+ *    DB contaminated by an unfinalized scan; without this signal,
+ *    `chooseStartupState` would return warm via the
+ *    `(preexisted && everComplete)` branch and serve the contaminated
+ *    snapshot until reconcile drained.
+ *
+ * `preexisted=false` short-circuits to false; a fresh DB forces cold via
+ * the rest of `chooseStartupState`.
+ */
+export function computePolicyMismatch(inputs: PolicyMismatchInputs): boolean {
+	if (!inputs.preexisted) return false;
+	const persisted = inputs.includeHiddenPolicy ?? false;
+	if (persisted !== inputs.argIncludeHidden) return true;
+	if (inputs.scanComplete) return false;
+	if (inputs.inflightIncludeHidden === null) return false;
+	return inputs.inflightIncludeHidden !== inputs.argIncludeHidden;
+}
+
+/**
  * Startup state decision. Warm requires `(scan_complete OR ever_complete)`
  * AND `fileCount > 0`. The two persisted flags answer different questions:
  * `scan_complete` = "did the most recent scan finish cleanly?";
@@ -15,6 +70,16 @@ export interface StartupStateInputs {
 	scanComplete: boolean;
 	everComplete: boolean;
 	fileCount: number;
+	/**
+	 * `true` when the persisted `--include-hidden` policy differs from this
+	 * run's policy. The prior snapshot was internally consistent for its
+	 * own policy but contains the wrong row population for this run
+	 * (extra hidden rows when off→on→off, missing hidden rows when off→on),
+	 * so vault-wide tools must return INDEX_WARMING until reconcile
+	 * realigns the index. Forces cold regardless of `scan_complete` /
+	 * `ever_complete`.
+	 */
+	policyMismatch?: boolean;
 }
 
 export interface StartupStateDecision {
@@ -23,6 +88,12 @@ export interface StartupStateDecision {
 }
 
 export function chooseStartupState(inputs: StartupStateInputs): StartupStateDecision {
+	if (inputs.preexisted && inputs.policyMismatch === true) {
+		return {
+			state: "cold",
+			log: `vault-mcp index: ${POLICY_MISMATCH_LOG_FRAGMENT}; rebuilding (${inputs.fileCount} prior rows).`,
+		};
+	}
 	if (inputs.preexisted && inputs.scanComplete) {
 		return {
 			state: "warm",

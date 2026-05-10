@@ -119,7 +119,7 @@ describe("Initialize handshake", () => {
 	test("server reports name + version", () => {
 		const info = connection.client.getServerVersion();
 		expect(info?.name).toBe("vault-mcp");
-		expect(info?.version).toBe("1.0.0-w4");
+		expect(info?.version).toBe("1.0.0");
 	});
 
 	test("server advertises tools + resources capabilities", () => {

@@ -31,7 +31,7 @@ describe("reindexOne — vanished file outcome", () => {
 		vault = await createTempVault({});
 		vaultRoot = await validateVaultRoot(vault.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		index = createIndexHandle(opened.db);
+		index = createIndexHandle(opened.db, { includeHidden: false });
 		closeDb = () => closeSqlite(opened.db);
 	});
 

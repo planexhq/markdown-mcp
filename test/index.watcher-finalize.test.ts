@@ -34,7 +34,7 @@ const setups: Setup[] = [];
 async function setup(structure: VaultStructure): Promise<Setup> {
 	const vault = await createTempVault(structure);
 	const opened = openSqlite({ dbPath: ":memory:" });
-	const index = createIndexHandle(opened.db);
+	const index = createIndexHandle(opened.db, { includeHidden: false });
 	const vaultRoot = await validateVaultRoot(vault.path);
 	const s: Setup = { vault, opened, index, vaultRoot };
 	setups.push(s);

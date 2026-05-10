@@ -32,15 +32,25 @@ async function setup(): Promise<Fixture> {
 	});
 	const vaultRoot = await validateVaultRoot(v.path);
 	const opened = openSqlite({ dbPath: ":memory:" });
-	const index = createIndexHandle(opened.db);
+	const index = createIndexHandle(opened.db, { includeHidden: false });
 	index.setStatus("warming");
 	const coordinator = new WriteCoordinator();
 	await scanVault({ vaultRoot, index, coordinator, concurrency: 1 });
+	// Mirror `makeReindexCallback` from `src/index.ts`: clear pendingRetry
+	// on successful reindex / vanish. Without this wrapping, the merkle
+	// backstop pass would reindex pending entries but the bare outcome
+	// wouldn't drain the set, masking the backstop's behavior.
 	const tick = startMerkleTick({
 		vaultRoot,
 		index,
 		coordinator,
-		reindexFile: (rel) => reindexOne(vaultRoot, index, rel),
+		reindexFile: async (rel) => {
+			const outcome = await reindexOne(vaultRoot, index, rel);
+			if (outcome === "indexed" || outcome === "vanished") {
+				index.clearPendingRetry(rel);
+			}
+			return outcome;
+		},
 		intervalMs: 60_000, // Long; tests call runOnce explicitly.
 	});
 	return {
@@ -214,6 +224,21 @@ describe("merkle — pendingRetries lifecycle", () => {
 		expect(fixture.index.getFileMtime(file)).toBeNull();
 		expect(fixture.index.hasPendingRetries()).toBe(false);
 	});
+
+	test("pendingRetries on an in-sync indexed file are drained by the backstop pass", async () => {
+		// Scanner's BUSY catch can race a peer's matching commit and leave
+		// the file in pendingRetries; merkle's drift detector sees it as
+		// in-sync (no drift) and would never reindex without this backstop.
+		const file = "alpha.md";
+		// File is indexed and on-disk (M, S) matches — no drift would fire.
+		expect(fixture.index.getFileMtime(file)).not.toBeNull();
+		fixture.index.addPendingRetry(file);
+		expect(fixture.index.hasPendingRetries()).toBe(true);
+
+		await fixture.tick.runOnce();
+
+		expect(fixture.index.hasPendingRetries()).toBe(false);
+	});
 });
 
 describe("merkle — state transitions", () => {
@@ -242,7 +267,7 @@ describe("merkle — warming → warm finalization", () => {
 		const v = await createTempVault(structure);
 		const vaultRoot = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const index = createIndexHandle(opened.db);
+		const index = createIndexHandle(opened.db, { includeHidden: false });
 		index.setStatus("warming");
 		const coordinator = new WriteCoordinator();
 		const tick = startMerkleTick({

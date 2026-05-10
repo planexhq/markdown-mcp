@@ -32,6 +32,14 @@ function runServer(scriptPath: string): { code: number | null; stderr: string } 
 	return { code: result.status, stderr: result.stderr };
 }
 
+function runServerWithArgs(scriptPath: string, args: string[]): { code: number | null; stderr: string } {
+	const result = spawnSync(process.execPath, [scriptPath, ...args], {
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+	return { code: result.status, stderr: result.stderr };
+}
+
 describe("CLI entry detection", () => {
 	test("direct invocation of dist/index.js exits 2 with usage error when --vault is missing", () => {
 		const { code, stderr } = runServer(SERVER_BIN);
@@ -50,5 +58,41 @@ describe("CLI entry detection", () => {
 		const { code, stderr } = runServer(symlinkPath);
 		expect(code).toBe(2);
 		expect(stderr).toContain("error: --vault <path> is required.");
+	});
+});
+
+describe("CLI flag parsing", () => {
+	// `--help` exits 0 after printing USAGE; piggy-back on it to verify the
+	// new flags appear in the help text without spinning up a real server.
+	test("--help shows --polling and --include-hidden", () => {
+		const result = spawnSync(process.execPath, [SERVER_BIN, "--help"], {
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		expect(result.status).toBe(0);
+		expect(result.stderr).toContain("--polling");
+		expect(result.stderr).toContain("--include-hidden");
+	});
+
+	test("--polling without --vault still requires --vault", () => {
+		const { code, stderr } = runServerWithArgs(SERVER_BIN, ["--polling"]);
+		expect(code).toBe(2);
+		expect(stderr).toContain("error: --vault <path> is required.");
+	});
+
+	test("--include-hidden without --vault still requires --vault", () => {
+		const { code, stderr } = runServerWithArgs(SERVER_BIN, ["--include-hidden"]);
+		expect(code).toBe(2);
+		expect(stderr).toContain("error: --vault <path> is required.");
+	});
+
+	test("unknown flag is rejected by parseArgs strict mode", () => {
+		// `parseArgs({ strict: true })` throws on unknown options; the bootstrap's
+		// `main().catch(...)` writes `fatal: ...` to stderr and exits 1. This
+		// confirms the schema is closed — a typo like `--include_hidden` (snake)
+		// won't silently no-op.
+		const { code, stderr } = runServerWithArgs(SERVER_BIN, ["--vault", "/tmp/v", "--include_hidden"]);
+		expect(code).toBe(1);
+		expect(stderr).toContain("fatal:");
 	});
 });

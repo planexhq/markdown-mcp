@@ -43,7 +43,7 @@ const setups: Setup[] = [];
 async function setup(initial: string, file = "swap.md"): Promise<Setup> {
 	const vault = await createTempVault({ [file]: initial });
 	const opened = openSqlite({ dbPath: ":memory:" });
-	const index = createIndexHandle(opened.db);
+	const index = createIndexHandle(opened.db, { includeHidden: false });
 	// Use the production startup helper so the test exercises the same
 	// realpath-canonicalization the server does — without it, macOS
 	// `/var/folders/...` symlinks make `path.relative` report containment
@@ -207,7 +207,7 @@ describe("handleGetFragment — embed expansion preserves missing-heading state"
 			"target.md": "# Other\n\nSecret content that must not leak.\n",
 		});
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const index = createIndexHandle(opened.db);
+		const index = createIndexHandle(opened.db, { includeHidden: false });
 		const vaultRoot: VaultRoot = await validateVaultRoot(vault.path);
 		setups.push({
 			vault,
@@ -242,7 +242,7 @@ describe("handleGetFragment — embed expansion preserves missing-heading state"
 			"target.md": "# Other\n\nWhole-file body.\n",
 		});
 		const opened = openSqlite({ dbPath: ":memory:" });
-		const index = createIndexHandle(opened.db);
+		const index = createIndexHandle(opened.db, { includeHidden: false });
 		const vaultRoot: VaultRoot = await validateVaultRoot(vault.path);
 		setups.push({
 			vault,
