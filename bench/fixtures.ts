@@ -178,7 +178,7 @@ export async function generateVault(spec: VaultGenSpec): Promise<GeneratedVault>
 		seed = 0xc0ffee,
 	} = spec;
 	const rng = makeRng(seed);
-	const root = await mkdtemp(join(tmpdir(), `vault-mcp-bench-${files}-`));
+	const root = await mkdtemp(join(tmpdir(), `markdown-mcp-bench-${files}-`));
 	const dirs = Array.from({ length: directories }, (_, i) => `dir-${i}`);
 	await Promise.all(dirs.map((d) => mkdir(join(root, d), { recursive: true })));
 	const planned: Array<{ path: string; body: string }> = [];
@@ -238,7 +238,7 @@ export interface BenchHarness {
 
 /**
  * Boilerplate shared by every bench script: validate the vault root,
- * ensure the `.vault-mcp/` dir exists, return a factory that opens a
+ * ensure the `.markdown-mcp/` dir exists, return a factory that opens a
  * fresh SQLite + IndexHandle + WriteCoordinator. The factory is a thunk
  * so benches that need cold/warm pairs (scan.ts) can reopen mid-script;
  * each opened handle owns its own `close()` so callers don't round-trip

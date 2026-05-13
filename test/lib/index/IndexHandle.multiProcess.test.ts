@@ -19,7 +19,7 @@ let handleA: IndexHandle;
 let handleB: IndexHandle;
 
 beforeEach(async () => {
-	dir = await mkdtemp(join(tmpdir(), "vault-mcp-indexhandle-multiproc-"));
+	dir = await mkdtemp(join(tmpdir(), "markdown-mcp-indexhandle-multiproc-"));
 	const dbPath = join(dir, "index.sqlite3");
 	openedA = openSqlite({ dbPath });
 	openedB = openSqlite({ dbPath });

@@ -10,7 +10,7 @@
  * to surface.
  *
  * Each test reuses ONE vault directory (so the SQLite DB at
- * `<vault>/.vault-mcp/index.sqlite3` is shared across the two server
+ * `<vault>/.markdown-mcp/index.sqlite3` is shared across the two server
  * lifecycles) — that's the whole point: verify the second server, with
  * a different policy, cleans up the first server's index.
  */
@@ -28,7 +28,7 @@ import { createTempVault, type VaultStructure } from "./helpers/vault.js";
  * full index. Returns `null` for "never written" so we can distinguish
  * legacy/fresh from explicitly-false. */
 function readPersistedIncludeHidden(vaultPath: string): number | null {
-	const dbPath = join(vaultPath, ".vault-mcp", "index.sqlite3");
+	const dbPath = join(vaultPath, ".markdown-mcp", "index.sqlite3");
 	const db = new Database(dbPath, { readonly: true });
 	try {
 		const row = db.prepare("SELECT include_hidden FROM index_meta WHERE id = 1").get() as
@@ -43,7 +43,7 @@ function readPersistedIncludeHidden(vaultPath: string): number | null {
 }
 
 function setPersistedIncludeHidden(vaultPath: string, value: number | null): void {
-	const dbPath = join(vaultPath, ".vault-mcp", "index.sqlite3");
+	const dbPath = join(vaultPath, ".markdown-mcp", "index.sqlite3");
 	const db = new Database(dbPath);
 	try {
 		db.prepare("UPDATE index_meta SET include_hidden = ? WHERE id = 1").run(value);
@@ -127,7 +127,7 @@ describe("hidden-row cache invalidation on policy flip", () => {
 		// matching what `setScanComplete(false)` would do at the mismatch
 		// branch. `markScanFinalized` never ran, so `include_hidden` stays
 		// at 1 (the previous clean snapshot's policy).
-		const db = new Database(join(vault.path, ".vault-mcp", "index.sqlite3"));
+		const db = new Database(join(vault.path, ".markdown-mcp", "index.sqlite3"));
 		try {
 			db.prepare("UPDATE index_meta SET scan_complete = 0 WHERE id = 1").run();
 		} finally {

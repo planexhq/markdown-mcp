@@ -21,7 +21,7 @@
  * Both `body` and `code` are accepted because the FTS5 schema indexes
  * them as separate columns (D18 weights body=2.0, code=0.5). A query
  * that hits only the `code` column on a code-heavy section (e.g.
- * `npm install vault-mcp`) would otherwise produce an empty / heading-
+ * `npm install markdown-mcp`) would otherwise produce an empty / heading-
  * only snippet because `extractFtsTexts` strips code from `body`. Body
  * is preferred when it carries any matches (mirrors the BM25 weight
  * preference); fall through to `code` only when body is term-empty.

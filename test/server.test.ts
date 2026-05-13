@@ -118,7 +118,7 @@ describe("Initialize handshake — D22 minimum protocol version", () => {
 describe("Initialize handshake", () => {
 	test("server reports name + version", () => {
 		const info = connection.client.getServerVersion();
-		expect(info?.name).toBe("vault-mcp");
+		expect(info?.name).toBe("markdown-mcp");
 		expect(info?.version).toBe("1.0.0");
 	});
 

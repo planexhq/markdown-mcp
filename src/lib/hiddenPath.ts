@@ -47,7 +47,7 @@ export function isNonNfc(s: string): boolean {
  * exclusions from this constant so a future rename only touches one
  * place.
  */
-export const INDEX_DIR_NAME = ".vault-mcp";
+export const INDEX_DIR_NAME = ".markdown-mcp";
 
 // Hoisted so chokidar's per-event `shouldIgnore` callback doesn't
 // re-allocate a template literal on every fs event.
@@ -85,17 +85,17 @@ export function isFsCaseInsensitiveResolved(): boolean {
 /**
  * `true` for the server's own cache dir or anything beneath it. Used
  * by the watcher (don't reindex our own writes) and the tree (don't
- * leak server internals — and because `.vault-mcp` sorts before any
+ * leak server internals — and because `.markdown-mcp` sorts before any
  * letter-named content, it would consume the first page on small
  * `pageSize` requests). Independent of `--include-hidden`: the cache
  * is a server artifact, never user content.
  *
  * Routing branches on FS case-sensitivity. Case-insensitive FS (macOS
  * APFS, Windows NTFS): `validatePath` preserves user-supplied casing
- * and `.Vault-MCP/...` aliases to the server's lowercase cache; fold
+ * and `.Markdown-MCP/...` aliases to the server's lowercase cache; fold
  * to lowercase before comparing or the variant slips past the gate
  * and the SQLite cache leaks. Case-sensitive FS (Linux ext4 / btrfs
- * default): `.Vault-MCP/` is a distinct inode and may be legitimate
+ * default): `.Markdown-MCP/` is a distinct inode and may be legitimate
  * user content; byte-wise compare preserves access. Unset flag falls
  * back to the case-insensitive branch (safer default — see fsDetect).
  *

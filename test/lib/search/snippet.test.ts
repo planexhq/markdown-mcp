@@ -125,7 +125,7 @@ describe("filter-preview-v1", () => {
 	});
 
 	test("empty body, code non-empty → preview from code", () => {
-		const out = buildFilterPreview({ body: "", code: "npm install vault-mcp" });
+		const out = buildFilterPreview({ body: "", code: "npm install markdown-mcp" });
 		expect(out).toContain("npm install");
 	});
 

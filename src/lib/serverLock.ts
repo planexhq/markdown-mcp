@@ -92,7 +92,7 @@ export class ServerLockError extends Error {
 export class ServerLockConflictError extends ServerLockError {
 	constructor(conflictPid: number, conflictPolicy: boolean, requestedPolicy: boolean) {
 		super(
-			`Another vault-mcp server (PID ${conflictPid}) is running on this vault with ` +
+			`Another markdown-mcp server (PID ${conflictPid}) is running on this vault with ` +
 				`--include-hidden=${conflictPolicy}. This process requested --include-hidden=${requestedPolicy}. ` +
 				`Stop the other server or match its flag.`,
 			"ServerLockConflictError",
@@ -103,7 +103,7 @@ export class ServerLockConflictError extends ServerLockError {
 export class ServerLockFileNotRegularError extends ServerLockError {
 	constructor(path: string, kind: string) {
 		super(
-			`server lockfile ${path} is not a regular file (${kind}); refuse to overwrite.`,
+			`Server lockfile ${path} is not a regular file (${kind}); refusing to overwrite.`,
 			"ServerLockFileNotRegularError",
 		);
 	}
@@ -121,7 +121,7 @@ export class ServerLockFileNotRegularError extends ServerLockError {
 export class ServerLockUnknownPeerError extends ServerLockError {
 	constructor(pid: number, path: string) {
 		super(
-			`Another vault-mcp server (PID ${pid}) is running on this vault but its lockfile at ${path} ` +
+			`Another markdown-mcp server (PID ${pid}) is running on this vault but its lockfile at ${path} ` +
 				`is unparseable. Stop the other server, or remove the lockfile if you're certain the process has exited.`,
 			"ServerLockUnknownPeerError",
 		);
@@ -130,7 +130,7 @@ export class ServerLockUnknownPeerError extends ServerLockError {
 
 /**
  * Foreign host owns our PID-named slot. PIDs are per-host on POSIX, so on
- * a shared mount a foreign-host vault-mcp can hold `server-<ourPID>.lock`
+ * a shared mount a foreign-host markdown-mcp can hold `server-<ourPID>.lock`
  * while still alive on its host. Unlinking would orphan its lock and let
  * both hosts write the WAL — refuse to start instead. Symmetric with
  * `inspectForeignSlot`'s hostname-precedes-PID-liveness rule.
@@ -138,10 +138,9 @@ export class ServerLockUnknownPeerError extends ServerLockError {
 export class ServerLockHostCollisionError extends ServerLockError {
 	constructor(path: string, foreignHostname: string) {
 		super(
-			`server lockfile ${path} is owned by a foreign host ` +
-				`(hostname=${foreignHostname}) holding the same numeric PID as this process. ` +
-				`Cross-host mounts are not supported. Stop the other server, or remove the ` +
-				`lockfile if you're certain the holder has exited.`,
+			`Another markdown-mcp server (PID ${process.pid} on host ${foreignHostname}) ` +
+				`holds the lockfile at ${path}. Cross-host mounts are not supported. ` +
+				`Stop the other server, or remove the lockfile if you're certain the holder has exited.`,
 			"ServerLockHostCollisionError",
 		);
 	}
@@ -156,9 +155,9 @@ export class ServerLockHostCollisionError extends ServerLockError {
 export class ServerLockOwnSlotUnparseableError extends ServerLockError {
 	constructor(path: string) {
 		super(
-			`server lockfile ${path} (our PID ${process.pid}) is unparseable. On shared mounts, ` +
-				`this may be a foreign-host vault-mcp mid-startup. Refusing to overwrite. ` +
-				`Remove the lockfile manually if you're certain no other server holds it.`,
+			`Another markdown-mcp server may be holding the lockfile at ${path} (our PID ${process.pid}); ` +
+				`its content is unparseable, so we can't verify whether it's a foreign-host peer mid-startup. ` +
+				`Refusing to overwrite. Remove the lockfile manually if you're certain no other server holds it.`,
 			"ServerLockOwnSlotUnparseableError",
 		);
 	}
@@ -172,7 +171,7 @@ export class ServerLockOwnSlotUnparseableError extends ServerLockError {
 export class ServerLockExtensionConflictError extends ServerLockError {
 	constructor(conflictPid: number, conflictExts: ReadonlyArray<string>, requestedExts: ReadonlyArray<string>) {
 		super(
-			`Another vault-mcp server (PID ${conflictPid}) is running on this vault with ` +
+			`Another markdown-mcp server (PID ${conflictPid}) is running on this vault with ` +
 				`VAULT_EXTENSIONS=${conflictExts.join(",")}. This process has VAULT_EXTENSIONS=${requestedExts.join(",")}. ` +
 				`Stop the other server or match the env.`,
 			"ServerLockExtensionConflictError",
@@ -269,7 +268,7 @@ function foreignHostnameOf(record: LockFileRecord): string | null {
  *
  * `pid === process.pid` is reachable only via a foreign filename slot
  * `server-<ourpid>.lock` left by a same-PID predecessor (PID reuse from
- * a previous vault-mcp process). Treat as stale: we own this PID for
+ * a previous markdown-mcp process). Treat as stale: we own this PID for
  * the lifetime of this process, so anyone else's claim against it is
  * already settled.
  */
@@ -299,7 +298,7 @@ function weArrivedFirst(ourMtimeMs: number, otherMtimeMs: number, otherPid: numb
 
 function logTiebreakerWin(otherPath: string, otherPid: number, conflictAttr: string): void {
 	console.error(
-		`vault-mcp serverLock: conflicting peer at ${otherPath} (PID ${otherPid}, ${conflictAttr}) ` +
+		`markdown-mcp serverLock: conflicting peer at ${otherPath} (PID ${otherPid}, ${conflictAttr}) ` +
 			`arrived after us; continuing. Peer will observe our older mtime and exit.`,
 	);
 }
@@ -474,7 +473,7 @@ async function cleanupLegacyEntry(
 		// `unlink` doesn't follow symlinks, but we still refuse to remove
 		// non-regular legacy entries — they could be user-managed pointers
 		// the operator deliberately placed.
-		console.error(`vault-mcp serverLock: leaving non-regular legacy entry at ${legacyPath} (${kindOf(probe.stats)})`);
+		console.error(`markdown-mcp serverLock: leaving non-regular legacy entry at ${legacyPath} (${kindOf(probe.stats)})`);
 		return;
 	}
 
@@ -493,7 +492,7 @@ async function cleanupLegacyEntry(
 
 	if (!isProcessAlive(record.pid)) {
 		console.error(
-			`vault-mcp serverLock: legacy lockfile at ${legacyPath} (PID ${record.pid}) ${ESRCH_PRESERVE_SUFFIX}`,
+			`markdown-mcp serverLock: legacy lockfile at ${legacyPath} (PID ${record.pid}) ${ESRCH_PRESERVE_SUFFIX}`,
 		);
 		return;
 	}
@@ -510,7 +509,7 @@ async function cleanupLegacyEntry(
 	// Same-policy live legacy owner: leave the file alone, its
 	// shutdown handler will unlink it.
 	console.error(
-		`vault-mcp serverLock: legacy lock at ${legacyPath} (PID ${record.pid}) running with matching policy; coexisting.`,
+		`markdown-mcp serverLock: legacy lock at ${legacyPath} (PID ${record.pid}) running with matching policy; coexisting.`,
 	);
 }
 
@@ -527,7 +526,7 @@ async function inspectForeignSlot(
 		// Foreign non-regular entries we don't touch; the own-PID slot is
 		// the only one we hard-refuse on. A hostile vault planting weird
 		// names at random PID slots doesn't compromise our own slot.
-		console.error(`vault-mcp serverLock: ignoring non-regular foreign entry at ${otherPath} (${kindOf(probe.stats)})`);
+		console.error(`markdown-mcp serverLock: ignoring non-regular foreign entry at ${otherPath} (${kindOf(probe.stats)})`);
 		return;
 	}
 	const otherMtimeMs = probe.stats.mtimeMs;
@@ -544,7 +543,7 @@ async function inspectForeignSlot(
 		// — both warrant refusal.
 		if (!isProcessAlive(otherPid)) {
 			console.error(
-				`vault-mcp serverLock: unparseable foreign slot at ${otherPath} (PID ${otherPid}) ${ESRCH_PRESERVE_SUFFIX}`,
+				`markdown-mcp serverLock: unparseable foreign slot at ${otherPath} (PID ${otherPid}) ${ESRCH_PRESERVE_SUFFIX}`,
 			);
 			return;
 		}
@@ -559,7 +558,7 @@ async function inspectForeignSlot(
 	const foreignHostname = foreignHostnameOf(otherRecord);
 	if (foreignHostname !== null) {
 		console.error(
-			`vault-mcp serverLock: foreign-host lockfile at ${otherPath} (hostname=${foreignHostname}); ` +
+			`markdown-mcp serverLock: foreign-host lockfile at ${otherPath} (hostname=${foreignHostname}); ` +
 				`cross-host mounts are not supported, leaving in place.`,
 		);
 		return;
@@ -611,14 +610,14 @@ async function readAndParseWithRetry(
 	const first = await readAndParse(path);
 	if (first !== "unparseable") return first;
 	console.error(
-		`vault-mcp serverLock: unparseable ${contextLog} at ${path}; retrying after ${UNPARSEABLE_RETRY_DELAY_MS} ms.`,
+		`markdown-mcp serverLock: unparseable ${contextLog} at ${path}; retrying after ${UNPARSEABLE_RETRY_DELAY_MS} ms.`,
 	);
 	await sleep(UNPARSEABLE_RETRY_DELAY_MS);
 	const reprobe = await statEntry(path);
 	if (reprobe.kind === "absent") return "absent";
 	if (reprobe.kind === "non-regular") {
 		console.error(
-			`vault-mcp serverLock: ${contextLog} at ${path} became ${kindOf(reprobe.stats)} during retry; skipping.`,
+			`markdown-mcp serverLock: ${contextLog} at ${path} became ${kindOf(reprobe.stats)} during retry; skipping.`,
 		);
 		return "absent";
 	}
@@ -662,7 +661,7 @@ async function readAndParse(otherPath: string): Promise<LockFileRecord | "absent
 		const code = getErrnoCode(err);
 		if (code === "ENOENT" || code === "ENOTDIR") return "absent";
 		if (code === "ELOOP" || code === "ENXIO") {
-			console.error(`vault-mcp serverLock: foreign slot at ${otherPath} non-regular at open (${code}); skipping.`);
+			console.error(`markdown-mcp serverLock: foreign slot at ${otherPath} non-regular at open (${code}); skipping.`);
 			return "absent";
 		}
 		throw err;
@@ -670,7 +669,7 @@ async function readAndParse(otherPath: string): Promise<LockFileRecord | "absent
 	try {
 		const st = await handle.stat();
 		if (!st.isFile()) {
-			console.error(`vault-mcp serverLock: foreign slot at ${otherPath} not a regular file post-open; skipping.`);
+			console.error(`markdown-mcp serverLock: foreign slot at ${otherPath} not a regular file post-open; skipping.`);
 			return "absent";
 		}
 		const buf = Buffer.alloc(MAX_LOCKFILE_BYTES + 1);

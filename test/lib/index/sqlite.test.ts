@@ -123,7 +123,7 @@ describe("openSqlite", () => {
 		// reopening a legacy 3-col table threw `no column named
 		// include_hidden`. Tempfile (not :memory:) is required — the bug
 		// only manifests across an open/close cycle.
-		const dir = await mkdtemp(join(tmpdir(), "vault-mcp-sqlite-legacy-"));
+		const dir = await mkdtemp(join(tmpdir(), "markdown-mcp-sqlite-legacy-"));
 		const dbPath = join(dir, "index.sqlite3");
 		try {
 			seedLegacy3ColumnIndexMeta(dbPath, 1, 1);
@@ -170,7 +170,7 @@ describe("runMigrationV1 concurrent same-policy peers", () => {
 		// `ensureColumn` PRAGMA→ALTER window — ALTER reads live schema
 		// (no snapshot isolation), so a deferred transaction races to
 		// "duplicate column name". Iterate to surface timing differences.
-		const dir = await mkdtemp(join(tmpdir(), "vault-mcp-sqlite-concurrent-mig-"));
+		const dir = await mkdtemp(join(tmpdir(), "markdown-mcp-sqlite-concurrent-mig-"));
 		const dbPath = join(dir, "index.sqlite3");
 		try {
 			seedLegacy3ColumnIndexMeta(dbPath, 0, 0);
@@ -394,7 +394,7 @@ describe("wipeIndexCache + openSqliteWithRecovery — corruption recovery", () =
 	let tempDir: string;
 
 	async function setup(): Promise<string> {
-		tempDir = await mkdtemp(join(tmpdir(), "vault-mcp-sqlite-test-"));
+		tempDir = await mkdtemp(join(tmpdir(), "markdown-mcp-sqlite-test-"));
 		return join(tempDir, "index.sqlite3");
 	}
 

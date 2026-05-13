@@ -199,7 +199,7 @@ export async function scanVault(args: ScanArgs): Promise<ScanResult> {
 					// be indexed this pass. Route the same as `parse_failed` so
 					// the prune pass doesn't drop valid rows.
 					stillOnDisk.push(relpath);
-					console.error(`vault-mcp scanner: failed to index ${relpath}: ${errorMessage(err)}`);
+					console.error(`markdown-mcp scanner: failed to index ${relpath}: ${errorMessage(err)}`);
 				}
 				if (indexed % 50 === 0) {
 					onProgress?.({
@@ -318,7 +318,7 @@ async function lstatVanished(rel: string, vaultRoot: VaultRoot): Promise<boolean
  *   - File's extension no longer matches `VAULT_EXTENSIONS` (policy
  *     shrink: e.g. `md,mdx → md` leaves orphaned `.mdx` rows that the
  *     walk skipped). Cheap string predicate; no syscall.
- *   - Path lives under the server's cache dir (`.vault-mcp/`).
+ *   - Path lives under the server's cache dir (`.markdown-mcp/`).
  *     `walkVault` skips it unconditionally so any pre-existing row
  *     under that prefix reaches the prune-candidates list; without
  *     this gate, search/get_links would keep surfacing cache content
@@ -460,7 +460,7 @@ async function* walkVault(
 		// its rows alone and `scan_complete` stays false.
 		const code = getErrnoCode(err);
 		console.error(
-			`vault-mcp scanner: skipping subtree ${relParent || "(vault root)"} (readdir error: ${code ?? "unknown"})`,
+			`markdown-mcp scanner: skipping subtree ${relParent || "(vault root)"} (readdir error: ${code ?? "unknown"})`,
 		);
 		failedSubtrees.add(relParent);
 		return;
@@ -474,7 +474,7 @@ async function* walkVault(
 		const childRel = relParent ? `${relParent}/${name}` : name;
 		// Server's own cache dir is excluded regardless of `--include-hidden`
 		// (mirrors `watcher.ts:shouldIgnore`). Without this, `walkVault` recurses
-		// into `.vault-mcp/` under the flag and would index any markdown there;
+		// into `.markdown-mcp/` under the flag and would index any markdown there;
 		// the watcher hard-ignores the same prefix so those rows would never
 		// refresh on edit.
 		if (isIndexCachePath(childRel)) continue;
@@ -493,11 +493,11 @@ async function* walkVault(
 		// `validatePath` only.
 		const policyRejection = classifyRelpathPolicy(childRel);
 		if (policyRejection !== null) {
-			console.error(`vault-mcp scanner: skipping ${childRel} (path policy: ${policyRejection})`);
+			console.error(`markdown-mcp scanner: skipping ${childRel} (path policy: ${policyRejection})`);
 			continue;
 		}
 		if (isNonNfc(childRel)) {
-			console.error(`vault-mcp scanner: skipping ${childRel} (non-NFC name; rename to NFC for tool addressability)`);
+			console.error(`markdown-mcp scanner: skipping ${childRel} (non-NFC name; rename to NFC for tool addressability)`);
 			continue;
 		}
 		yield childRel;
@@ -519,7 +519,7 @@ export type IndexOutcome = "indexed" | "parse_failed" | "vanished";
 type SkipStage = "stat" | "validate" | "parse";
 
 function logSkipped(relpath: string, stage: SkipStage, detail: string): void {
-	console.error(`vault-mcp scanner: skipping ${relpath} (${stage}: ${detail})`);
+	console.error(`markdown-mcp scanner: skipping ${relpath} (${stage}: ${detail})`);
 }
 
 /**

@@ -1,5 +1,5 @@
 /**
- * Type contract for vault-mcp.
+ * Type contract for markdown-mcp.
  *
  * Source of truth: `docs/Design_Brief_v2.md` (lines cited per interface).
  * Cross-reference: `docs/DECISIONS.md` for ADR rationale.
@@ -131,7 +131,7 @@ export interface MetaEnvelope {
 // ─── Path validation (Brief lines 686–763) ─────────────────────────────────
 
 /**
- * Output of `validatePath(input, vaultRoot)`. All read paths in vault-mcp
+ * Output of `validatePath(input, vaultRoot)`. All read paths in markdown-mcp
  * flow through this interface (D8, D16 — single entry point).
  */
 export interface SafePath {

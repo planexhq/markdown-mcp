@@ -125,7 +125,7 @@ export async function openSqliteWithRecovery(options: OpenSqliteOptions): Promis
 		return openSqlite(options);
 	} catch (err) {
 		if (!isCorruptionError(err)) throw err;
-		console.error(`vault-mcp index: corrupt cache detected (${err.code}); wiping and rebuilding.`);
+		console.error(`markdown-mcp index: corrupt cache detected (${err.code}); wiping and rebuilding.`);
 		await wipeIndexCache(options.dbPath);
 		return openSqlite(options);
 	}

@@ -91,13 +91,13 @@ export function chooseStartupState(inputs: StartupStateInputs): StartupStateDeci
 	if (inputs.preexisted && inputs.policyMismatch === true) {
 		return {
 			state: "cold",
-			log: `vault-mcp index: ${POLICY_MISMATCH_LOG_FRAGMENT}; rebuilding (${inputs.fileCount} prior rows).`,
+			log: `markdown-mcp index: ${POLICY_MISMATCH_LOG_FRAGMENT}; rebuilding (${inputs.fileCount} prior rows).`,
 		};
 	}
 	if (inputs.preexisted && inputs.scanComplete) {
 		return {
 			state: "warm",
-			log: `vault-mcp index: warm (preexisted; ${inputs.fileCount} files indexed); reconciling on startup.`,
+			log: `markdown-mcp index: warm (preexisted; ${inputs.fileCount} files indexed); reconciling on startup.`,
 		};
 	}
 	// SIGTERM mid-reconcile or failed-subtree warm restart: prior clean scan
@@ -113,7 +113,7 @@ export function chooseStartupState(inputs: StartupStateInputs): StartupStateDeci
 	if (inputs.preexisted && inputs.everComplete) {
 		return {
 			state: "warm",
-			log: `vault-mcp index: warm (preexisted; ${inputs.fileCount} files indexed; last scan incomplete); reconciling on startup.`,
+			log: `markdown-mcp index: warm (preexisted; ${inputs.fileCount} files indexed; last scan incomplete); reconciling on startup.`,
 		};
 	}
 	// Partial first scan: rows exist but no clean scan has ever completed.
@@ -123,11 +123,11 @@ export function chooseStartupState(inputs: StartupStateInputs): StartupStateDeci
 	if (inputs.preexisted && inputs.fileCount > 0) {
 		return {
 			state: "cold",
-			log: `vault-mcp index: preexisted DB with ${inputs.fileCount} partial rows from an interrupted first scan; rebuilding.`,
+			log: `markdown-mcp index: preexisted DB with ${inputs.fileCount} partial rows from an interrupted first scan; rebuilding.`,
 		};
 	}
 	if (inputs.preexisted) {
-		return { state: "cold", log: "vault-mcp index: preexisted DB found but no indexed rows; starting cold scan." };
+		return { state: "cold", log: "markdown-mcp index: preexisted DB found but no indexed rows; starting cold scan." };
 	}
 	return { state: "cold", log: null };
 }

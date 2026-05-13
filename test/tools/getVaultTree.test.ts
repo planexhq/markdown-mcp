@@ -487,20 +487,20 @@ describe("get_vault_tree — cache-dir exclusion (case-insensitive)", () => {
 	// `shouldEmitDirent` filters the server's own cache directory regardless
 	// of `--include-hidden`. The tree dirent filter must use the same
 	// case-folding `isIndexCachePath` predicate as direct-read tools so a
-	// pre-existing `.Vault-MCP/` (aliasing the cache on case-insensitive FS)
+	// pre-existing `.Markdown-MCP/` (aliasing the cache on case-insensitive FS)
 	// doesn't leak via DFS recursion into SQLite/WAL/SHM.
 
-	test("mixed-case `.Vault-MCP` at vault root excluded under --include-hidden", async () => {
+	test("mixed-case `.Markdown-MCP` at vault root excluded under --include-hidden", async () => {
 		const v = await createTempVault({
 			"clean.md": "# clean\n",
 		});
 		// Pre-create a mixed-case cache directory. On macOS APFS this aliases
-		// to `.vault-mcp/` (case-insensitive FS); on Linux ext4 it's a
+		// to `.markdown-mcp/` (case-insensitive FS); on Linux ext4 it's a
 		// distinct inode, but the default (flag = null) routes the predicate
 		// through the case-fold branch, so the dirent is still excluded —
 		// matching the safer-default behavior of the uninitialized flag.
-		await mkdir(join(v.path, ".Vault-MCP"), { recursive: true });
-		await writeFile(join(v.path, ".Vault-MCP", "fake-secret.md"), "# secret\n", "utf8");
+		await mkdir(join(v.path, ".Markdown-MCP"), { recursive: true });
+		await writeFile(join(v.path, ".Markdown-MCP", "fake-secret.md"), "# secret\n", "utf8");
 		const root = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
 		const idx = createIndexHandle(opened.db, { includeHidden: true });
@@ -512,7 +512,7 @@ describe("get_vault_tree — cache-dir exclusion (case-insensitive)", () => {
 			const paths = out.items.map((i) => i.path);
 			expect(paths).toContain("clean.md");
 			// Neither the cache dir nor its contents should appear.
-			expect(paths.some((p) => p.toLowerCase().startsWith(".vault-mcp"))).toBe(false);
+			expect(paths.some((p) => p.toLowerCase().startsWith(".markdown-mcp"))).toBe(false);
 		} finally {
 			closeSqlite(opened.db);
 			await v.cleanup();
@@ -534,7 +534,7 @@ describe("get_vault_tree — symlink rejected at readdir descent", () => {
 		});
 		// External directory the symlink will point at; populate it with a
 		// distinctive file to verify it does NOT leak through the tree.
-		const external = join(tmpdir(), `vault-mcp-symlink-target-${Date.now()}`);
+		const external = join(tmpdir(), `markdown-mcp-symlink-target-${Date.now()}`);
 		await mkdir(external, { recursive: true });
 		await writeFile(join(external, "leaked.md"), "# leaked\n", "utf8");
 		// Replace `realchild` with a symlink to `external`. lstat sees a

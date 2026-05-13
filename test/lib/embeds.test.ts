@@ -183,16 +183,16 @@ describe("embeds — hidden asset policy", () => {
 });
 
 describe("embeds — index-cache directory exclusion", () => {
-	// `.vault-mcp` is unreachable through every surface, independent of
+	// `.markdown-mcp` is unreachable through every surface, independent of
 	// `includeHidden`. Without the gate in `assetExistsOnDisk`, an embed
-	// like `![[.vault-mcp/index.sqlite3]]` would surface as
+	// like `![[.markdown-mcp/index.sqlite3]]` would surface as
 	// `non_markdown_target` and confirm the cache file's existence.
 	let cacheVault: { path: string; cleanup: () => Promise<void> };
 	let cacheRoot: VaultRoot;
 
 	beforeAll(async () => {
 		cacheVault = await createTempVault({
-			".vault-mcp": { "foo.png": "fake-png" },
+			".markdown-mcp": { "foo.png": "fake-png" },
 			"image.png": "fake-png",
 		});
 		cacheRoot = await validateVaultRoot(cacheVault.path);
@@ -202,11 +202,11 @@ describe("embeds — index-cache directory exclusion", () => {
 		await cacheVault.cleanup();
 	});
 
-	test("![[.vault-mcp/foo.png]] with includeHidden=true → unresolved_file (NOT non_markdown_target)", async () => {
+	test("![[.markdown-mcp/foo.png]] with includeHidden=true → unresolved_file (NOT non_markdown_target)", async () => {
 		// `includeHidden: true` defeats the hidden-path gate; the cache
 		// gate must fire on top of it.
 		const ctx = makeContext({ files: { "src.md": "" }, vaultRoot: cacheRoot, includeHidden: true });
-		const resolved = resolveWikilink(".vault-mcp/foo.png", "src.md", ctx.vaultIndex);
+		const resolved = resolveWikilink(".markdown-mcp/foo.png", "src.md", ctx.vaultIndex);
 		expect(resolved.resolved).toBe(false);
 		const result = await expandEmbed(resolved, "src.md", ctx, 1);
 		expect(result.expansion_error).toBe("unresolved_file");

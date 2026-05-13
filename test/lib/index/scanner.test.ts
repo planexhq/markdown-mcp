@@ -103,15 +103,15 @@ describe("scanVault — basic", () => {
 		expect(result.aborted).toBe(true);
 	});
 
-	test("excludes .vault-mcp even under --include-hidden", async () => {
-		// The watcher hard-ignores .vault-mcp via isIndexCachePath; the
+	test("excludes .markdown-mcp even under --include-hidden", async () => {
+		// The watcher hard-ignores .markdown-mcp via isIndexCachePath; the
 		// scanner's walkVault must do the same so a markdown file colocated
-		// with the cache (e.g. operator drops `.vault-mcp/notes.md`) never
+		// with the cache (e.g. operator drops `.markdown-mcp/notes.md`) never
 		// gets indexed under --include-hidden. Otherwise rows drift out of
 		// sync with edits forever.
 		const s = await setup({
 			"a.md": "# A\n\nbody",
-			".vault-mcp": { "internal.md": "# internal\n\nshould not be indexed" },
+			".markdown-mcp": { "internal.md": "# internal\n\nshould not be indexed" },
 		});
 		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1, includeHidden: true });
 		expect(s.index.listIndexedFiles().sort()).toEqual(["a.md"]);
@@ -668,7 +668,7 @@ describe("confirmPrune — segment-walk re-validation", () => {
 		// Create an external dir (outside the vault) with a same-named file
 		// so a flat lstat through the symlinked parent would still see a
 		// regular file at notes/file.md.
-		const elsewhere = await mkdtemp(join(tmpdir(), "vault-mcp-confirmprune-"));
+		const elsewhere = await mkdtemp(join(tmpdir(), "markdown-mcp-confirmprune-"));
 		try {
 			await writeFile(join(elsewhere, "file.md"), "# fake\n\n", "utf8");
 			// Replace notes/ with a symlink to the external dir.

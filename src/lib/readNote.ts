@@ -70,7 +70,7 @@ function assertNotePathString(safePath: SafePath, includeHidden: boolean): void 
 	// Server's own cache dir is rejected regardless of `--include-hidden`.
 	// Mirrors `watcher.ts:shouldIgnore` + `getVaultTree.resolveStartPath` +
 	// `search.classifyScope`. Without this, an agent under `--include-hidden`
-	// could read markdown placed inside `.vault-mcp/` via get_fragment etc.
+	// could read markdown placed inside `.markdown-mcp/` via get_fragment etc.
 	if (isIndexCachePath(safePath.relative)) {
 		throw pathNotFound(`Path is inside the server cache directory: ${safePath.relative}`);
 	}

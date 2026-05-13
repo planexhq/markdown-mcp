@@ -44,28 +44,28 @@ describe("isHiddenPath", () => {
 
 describe("isIndexCachePath", () => {
 	test("lowercase top-level cache dir → true", () => {
-		expect(isIndexCachePath(".vault-mcp")).toBe(true);
+		expect(isIndexCachePath(".markdown-mcp")).toBe(true);
 	});
 
 	test("lowercase cache file → true", () => {
-		expect(isIndexCachePath(".vault-mcp/index.sqlite3")).toBe(true);
-		expect(isIndexCachePath(".vault-mcp/index.sqlite3-wal")).toBe(true);
-		expect(isIndexCachePath(".vault-mcp/index.sqlite3-shm")).toBe(true);
+		expect(isIndexCachePath(".markdown-mcp/index.sqlite3")).toBe(true);
+		expect(isIndexCachePath(".markdown-mcp/index.sqlite3-wal")).toBe(true);
+		expect(isIndexCachePath(".markdown-mcp/index.sqlite3-shm")).toBe(true);
 	});
 
 	test("mixed-case top-level cache dir → true (case-insensitive FS bypass closed)", () => {
 		// validatePath preserves user-supplied casing in its returned relpath,
-		// and `.Vault-MCP` resolves to the same inode as `.vault-mcp` on
+		// and `.Markdown-MCP` resolves to the same inode as `.markdown-mcp` on
 		// macOS APFS / Windows NTFS. The predicate must match all casings to
 		// prevent direct-read tools from leaking SQLite/WAL/SHM contents.
-		expect(isIndexCachePath(".Vault-MCP")).toBe(true);
-		expect(isIndexCachePath(".VAULT-MCP")).toBe(true);
-		expect(isIndexCachePath(".vAuLt-McP")).toBe(true);
+		expect(isIndexCachePath(".Markdown-MCP")).toBe(true);
+		expect(isIndexCachePath(".MARKDOWN-MCP")).toBe(true);
+		expect(isIndexCachePath(".mArKdOwN-McP")).toBe(true);
 	});
 
 	test("mixed-case cache file → true", () => {
-		expect(isIndexCachePath(".Vault-MCP/index.sqlite3")).toBe(true);
-		expect(isIndexCachePath(".VAULT-MCP/index.sqlite3-wal")).toBe(true);
+		expect(isIndexCachePath(".Markdown-MCP/index.sqlite3")).toBe(true);
+		expect(isIndexCachePath(".MARKDOWN-MCP/index.sqlite3-wal")).toBe(true);
 	});
 
 	test("non-cache top-level paths → false", () => {
@@ -77,16 +77,16 @@ describe("isIndexCachePath", () => {
 
 	test("cache-named segment NOT at top level → false", () => {
 		// Only the top-level cache dir matters; a user could legitimately have
-		// a deeper `.vault-mcp` subdirectory.
-		expect(isIndexCachePath("notes/.vault-mcp/foo.md")).toBe(false);
-		expect(isIndexCachePath("a/.Vault-MCP/b")).toBe(false);
+		// a deeper `.markdown-mcp` subdirectory.
+		expect(isIndexCachePath("notes/.markdown-mcp/foo.md")).toBe(false);
+		expect(isIndexCachePath("a/.Markdown-MCP/b")).toBe(false);
 	});
 
 	test("near-miss prefix without slash boundary → false", () => {
 		// Predicate is `=== NAME` OR `startsWith(NAME + "/")` — confirms the
-		// slash boundary so `.vault-mcp-archive` doesn't false-positive.
-		expect(isIndexCachePath(".vault-mcp-archive")).toBe(false);
-		expect(isIndexCachePath(".vault-mcp-backup/notes.md")).toBe(false);
+		// slash boundary so `.markdown-mcp-archive` doesn't false-positive.
+		expect(isIndexCachePath(".markdown-mcp-archive")).toBe(false);
+		expect(isIndexCachePath(".markdown-mcp-backup/notes.md")).toBe(false);
 	});
 });
 
@@ -102,19 +102,19 @@ describe("isIndexCachePath case-sensitive FS routing", () => {
 	});
 
 	test("lowercase cache paths still match on case-sensitive FS", () => {
-		expect(isIndexCachePath(".vault-mcp")).toBe(true);
-		expect(isIndexCachePath(".vault-mcp/index.sqlite3")).toBe(true);
-		expect(isIndexCachePath(".vault-mcp/index.sqlite3-wal")).toBe(true);
+		expect(isIndexCachePath(".markdown-mcp")).toBe(true);
+		expect(isIndexCachePath(".markdown-mcp/index.sqlite3")).toBe(true);
+		expect(isIndexCachePath(".markdown-mcp/index.sqlite3-wal")).toBe(true);
 	});
 
 	test("mixed-case treated as distinct user directory on case-sensitive FS", () => {
-		// Linux ext4 / btrfs default: `.Vault-MCP/` is a distinct inode from
-		// `.vault-mcp/`, so a user with a deliberate case-variant directory
+		// Linux ext4 / btrfs default: `.Markdown-MCP/` is a distinct inode from
+		// `.markdown-mcp/`, so a user with a deliberate case-variant directory
 		// retains direct-read access.
-		expect(isIndexCachePath(".Vault-MCP")).toBe(false);
-		expect(isIndexCachePath(".VAULT-MCP/notes.md")).toBe(false);
-		expect(isIndexCachePath(".vAuLt-McP")).toBe(false);
-		expect(isIndexCachePath(".Vault-MCP/index.sqlite3")).toBe(false);
+		expect(isIndexCachePath(".Markdown-MCP")).toBe(false);
+		expect(isIndexCachePath(".MARKDOWN-MCP/notes.md")).toBe(false);
+		expect(isIndexCachePath(".mArKdOwN-McP")).toBe(false);
+		expect(isIndexCachePath(".Markdown-MCP/index.sqlite3")).toBe(false);
 	});
 
 	test("non-cache paths still rejected", () => {

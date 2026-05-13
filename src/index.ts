@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * vault-mcp CLI entrypoint. Stdio-only per D22.
+ * markdown-mcp CLI entrypoint. Stdio-only per D22.
  *
  * NEVER write to stdout — that's the JSON-RPC transport channel. All
  * diagnostic logging goes to stderr (biome's `noConsole` rule permits
@@ -78,12 +78,12 @@ function parseCli(argv: string[]): CliArgs {
 	};
 }
 
-const USAGE = `vault-mcp ${process.env.npm_package_version ?? "1.0.0"}
+const USAGE = `markdown-mcp ${process.env.npm_package_version ?? "1.0.0"}
 
-A read-only MCP server exposing a local markdown vault to AI agents.
+A read-only MCP server giving AI agents structured access to a local markdown vault.
 
 Usage:
-  vault-mcp --vault <path> [--polling] [--include-hidden]
+  markdown-mcp --vault <path> [--polling] [--include-hidden]
 
 Options:
   --vault <path>     Absolute or relative path to the vault directory (required).
@@ -110,11 +110,11 @@ const DRAIN_RETRY_PASSES = 3;
  * unset is the same as absent.
  */
 export const TEST_ENV = {
-	STARTUP_DELAY_MS: "VAULT_MCP_TEST_STARTUP_DELAY_MS",
-	STARTUP_FAIL_AFTER_LOCK: "VAULT_MCP_TEST_STARTUP_FAIL_AFTER_LOCK",
+	STARTUP_DELAY_MS: "MARKDOWN_MCP_TEST_STARTUP_DELAY_MS",
+	STARTUP_FAIL_AFTER_LOCK: "MARKDOWN_MCP_TEST_STARTUP_FAIL_AFTER_LOCK",
 	FAIL_AFTER_LOCK_MESSAGE: "test-injection: post-lock startup",
 	/** Pause inside `acquireServerLock`'s `onSlotCreated` callback so a signal can land between own-slot creation and reconcile return. */
-	RECONCILE_DELAY_MS: "VAULT_MCP_TEST_RECONCILE_DELAY_MS",
+	RECONCILE_DELAY_MS: "MARKDOWN_MCP_TEST_RECONCILE_DELAY_MS",
 } as const;
 
 function printValidationError(err: PathValidationError): void {
@@ -197,14 +197,14 @@ export function makeReindexCallback(
 				index.removeFile(rel, Date.now());
 			}
 		} catch (err) {
-			console.error(`vault-mcp reindex: ${rel}: ${errorMessage(err)}`);
+			console.error(`markdown-mcp reindex: ${rel}: ${errorMessage(err)}`);
 			// Surface unknown errors as parse_failed so merkle's reconcile
 			// aggregates them and keeps the warming gate engaged.
 			outcome = "parse_failed";
 		}
 		if (outcome === "indexed" || outcome === "vanished") {
 			if (index.clearPendingRetry(rel)) {
-				console.error(`vault-mcp: scan finalized after watcher recovery (via: ${rel})`);
+				console.error(`markdown-mcp: scan finalized after watcher recovery (via: ${rel})`);
 			}
 		} else if (outcome === "parse_failed") {
 			// Gate on `scan_complete` not state: warm-restart's reconcile
@@ -227,7 +227,7 @@ async function main(): Promise<void> {
 
 	// Probe FS case-sensitivity before any code path consults
 	// `isIndexCachePath` so the predicate uses byte-wise compare on
-	// case-sensitive FS (preserving access to a legitimate `.Vault-MCP/`
+	// case-sensitive FS (preserving access to a legitimate `.Markdown-MCP/`
 	// user directory) and case-fold on case-insensitive FS (where the
 	// variant aliases to the cache and must be rejected).
 	setFsCaseInsensitive(await detectCaseInsensitiveFs(vaultRoot.absolute));
@@ -289,13 +289,13 @@ async function main(): Promise<void> {
 			timer = undefined;
 
 			if (stopResult === "timeout") {
-				console.error("vault-mcp: tearDown drain timeout (5 s) while stopping producers; proceeding with close.");
+				console.error("markdown-mcp: tearDown drain timeout (5 s) while stopping producers; proceeding with close.");
 			} else {
 				const labels = ["merkle stop", "watcher close", "scan"] as const;
 				for (let i = 0; i < stopResult.length; i++) {
 					const r = stopResult[i];
 					if (r && r.status === "rejected") {
-						console.error(`vault-mcp ${labels[i]}: ${errorMessage(r.reason)}`);
+						console.error(`markdown-mcp ${labels[i]}: ${errorMessage(r.reason)}`);
 					}
 				}
 				if (coordinator !== null) {
@@ -308,12 +308,12 @@ async function main(): Promise<void> {
 					if (timer) clearTimeout(timer);
 					timer = undefined;
 					if (drainResult === "timeout") {
-						console.error("vault-mcp: tearDown drain timeout while draining coordinator; proceeding with close.");
+						console.error("markdown-mcp: tearDown drain timeout while draining coordinator; proceeding with close.");
 					}
 				}
 			}
 		} catch (err) {
-			console.error(`vault-mcp: drain error: ${errorMessage(err)}`);
+			console.error(`markdown-mcp: drain error: ${errorMessage(err)}`);
 		} finally {
 			if (timer) clearTimeout(timer);
 		}
@@ -346,7 +346,7 @@ async function main(): Promise<void> {
 				lockHandle = h;
 				const delay = Number.parseInt(process.env[TEST_ENV.RECONCILE_DELAY_MS] ?? "0", 10);
 				if (delay > 0) {
-					console.error(`vault-mcp: ${TEST_ENV.RECONCILE_DELAY_MS}=${delay}; pausing.`);
+					console.error(`markdown-mcp: ${TEST_ENV.RECONCILE_DELAY_MS}=${delay}; pausing.`);
 					await sleep(delay);
 				}
 			},
@@ -359,7 +359,7 @@ async function main(): Promise<void> {
 		// during the protected window and verify the lockfile is cleaned up.
 		const startupDelayMs = Number.parseInt(process.env[TEST_ENV.STARTUP_DELAY_MS] ?? "0", 10);
 		if (startupDelayMs > 0) {
-			console.error(`vault-mcp: ${TEST_ENV.STARTUP_DELAY_MS}=${startupDelayMs}; pausing.`);
+			console.error(`markdown-mcp: ${TEST_ENV.STARTUP_DELAY_MS}=${startupDelayMs}; pausing.`);
 			await sleep(startupDelayMs);
 		}
 
@@ -383,7 +383,7 @@ async function main(): Promise<void> {
 		// guard" gotcha.
 		if (detectPreW4Schema(opened.db)) {
 			console.error(
-				"vault-mcp index: pre-W4 schema detected (fragments populated; file_metrics empty); forcing full rescan.",
+				"markdown-mcp index: pre-W4 schema detected (fragments populated; file_metrics empty); forcing full rescan.",
 			);
 			index.setScanComplete(false);
 		}
@@ -440,7 +440,7 @@ async function main(): Promise<void> {
 				includeHidden: args.includeHidden,
 			});
 		} catch (err) {
-			console.error(`vault-mcp watcher: failed to start: ${errorMessage(err)}`);
+			console.error(`markdown-mcp watcher: failed to start: ${errorMessage(err)}`);
 		}
 
 		// See CLAUDE.md "Scanner finalize race" gotcha. `coordinator.drain`
@@ -451,7 +451,7 @@ async function main(): Promise<void> {
 				try {
 					await watcher.ready();
 				} catch (err) {
-					console.error(`vault-mcp scanner preFinalize: watcher.ready failed: ${errorMessage(err)}`);
+					console.error(`markdown-mcp scanner preFinalize: watcher.ready failed: ${errorMessage(err)}`);
 				}
 			}
 			for (let i = 0; i < DRAIN_RETRY_PASSES; i++) {
@@ -471,26 +471,26 @@ async function main(): Promise<void> {
 			includeHidden: args.includeHidden,
 			onProgress: (p) => {
 				if (p.files_indexed % 100 === 0 && p.files_indexed > 0) {
-					console.error(`vault-mcp scanner: ${p.files_indexed}/${p.files_total_estimate} (${p.phase})`);
+					console.error(`markdown-mcp scanner: ${p.files_indexed}/${p.files_total_estimate} (${p.phase})`);
 				}
 			},
 		})
 			.then((result) => {
 				const elapsed = Date.now() - startedAt;
 				console.error(
-					`vault-mcp scanner: done in ${elapsed} ms (indexed=${result.filesIndexed} skipped=${result.filesSkipped} aborted=${result.aborted})`,
+					`markdown-mcp scanner: done in ${elapsed} ms (indexed=${result.filesIndexed} skipped=${result.filesSkipped} aborted=${result.aborted})`,
 				);
 				return result;
 			})
 			.catch((err: unknown) => {
-				console.error(`vault-mcp scanner: failed: ${errorMessage(err)}`);
+				console.error(`markdown-mcp scanner: failed: ${errorMessage(err)}`);
 				return { filesIndexed: 0, filesSkipped: 0, aborted: false } satisfies ScanResult;
 			});
 
 		server = createServer(vaultRoot, index, { includeHidden: args.includeHidden });
 		const transport = new StdioServerTransport();
 		await server.connect(transport);
-		console.error(`vault-mcp running on stdio (vault: ${vaultRoot.absolute}, db: ${dbPath})`);
+		console.error(`markdown-mcp running on stdio (vault: ${vaultRoot.absolute}, db: ${dbPath})`);
 
 		// Merkle defers until scan drains: a periodic walk during initial
 		// enumeration would compete with scanner's own walk for I/O and
@@ -507,17 +507,17 @@ async function main(): Promise<void> {
 						includeHidden: args.includeHidden,
 					});
 				} catch (err) {
-					console.error(`vault-mcp merkle: failed to start: ${errorMessage(err)}`);
+					console.error(`markdown-mcp merkle: failed to start: ${errorMessage(err)}`);
 				}
 			})
 			.catch((err: unknown) => {
-				console.error(`vault-mcp startup: deferred chain failed: ${errorMessage(err)}`);
+				console.error(`markdown-mcp startup: deferred chain failed: ${errorMessage(err)}`);
 			});
 	} catch (err) {
 		// `tearDownAndExit` calls `process.exit(1)` so we never return;
 		// the trailing throw is unreachable (kept for type-narrowing).
-		console.error(`vault-mcp: startup failure: ${errorMessage(err)}`);
-		await tearDownAndExit("vault-mcp: startup failure; tearing down.", 1);
+		console.error(`markdown-mcp: startup failure: ${errorMessage(err)}`);
+		await tearDownAndExit("markdown-mcp: startup failure; tearing down.", 1);
 		throw err;
 	}
 }

@@ -1,7 +1,7 @@
 /**
- * `confirmPrune` must drop pre-existing `.vault-mcp/*` rows even under
+ * `confirmPrune` must drop pre-existing `.markdown-mcp/*` rows even under
  * `--include-hidden`. `walkVault` skips the cache dir unconditionally,
- * so any row the index already holds for a path under `.vault-mcp/`
+ * so any row the index already holds for a path under `.markdown-mcp/`
  * reaches the prune-candidates list (in DB, but walk skipped). Without
  * the cache-prefix gate in `confirmPrune`, markdown + non-hidden-gate +
  * `lstat`-says-regular-file preserves the row, and search/get_links
@@ -33,20 +33,20 @@ afterEach(async () => {
 });
 
 async function plantCacheDirNote(vaultPath: string): Promise<void> {
-	const cacheDir = join(vaultPath, ".vault-mcp");
+	const cacheDir = join(vaultPath, ".markdown-mcp");
 	await mkdir(cacheDir, { recursive: true });
 	await writeFile(join(cacheDir, "notes.md"), "# Cache leak\n\nshouldnotleaktoken sentinel.\n");
 }
 
 function plantCacheDirRow(vaultPath: string): void {
-	const dbPath = join(vaultPath, ".vault-mcp", "index.sqlite3");
+	const dbPath = join(vaultPath, ".markdown-mcp", "index.sqlite3");
 	const db = new Database(dbPath);
 	try {
 		// Sentinel token routes through both `body` and `headings` FTS
 		// columns so a `bm25-fragment-v1` query confirms the row's
 		// existence (and after the prune fires, its absence).
 		db.prepare(`INSERT INTO frontmatter (file, created, updated, fields_json) VALUES (:file, NULL, NULL, '{}')`).run({
-			file: ".vault-mcp/notes.md",
+			file: ".markdown-mcp/notes.md",
 		});
 		db.prepare(
 			`INSERT INTO fragments
@@ -54,7 +54,7 @@ function plantCacheDirRow(vaultPath: string): void {
 			    range_start, range_end, body, code, headings, mtime, size)
 			 VALUES (:file, 'heading', :sid, :hp, :ht, :sp, 0, 200, :body, '', :ht, :mtime, :size)`,
 		).run({
-			file: ".vault-mcp/notes.md",
+			file: ".markdown-mcp/notes.md",
 			sid: "h:abc123def45678",
 			hp: '["Cache leak"]',
 			ht: "Cache leak",
@@ -68,8 +68,8 @@ function plantCacheDirRow(vaultPath: string): void {
 	}
 }
 
-describe("confirmPrune .vault-mcp gate", () => {
-	test("pre-existing .vault-mcp row is pruned under --include-hidden", async () => {
+describe("confirmPrune .markdown-mcp gate", () => {
+	test("pre-existing .markdown-mcp row is pruned under --include-hidden", async () => {
 		// First lifecycle: let the server create the index + schema so we
 		// can plant rows against the real shape (the FTS5 triggers + checks
 		// require the trigger DDL to be in place).
@@ -86,19 +86,19 @@ describe("confirmPrune .vault-mcp gate", () => {
 		// Sanity: the planted row is present in the DB before the second
 		// lifecycle runs the prune — same FTS-trigger path the scanner uses.
 		{
-			const db = new Database(join(vault.path, ".vault-mcp", "index.sqlite3"), { readonly: true });
+			const db = new Database(join(vault.path, ".markdown-mcp", "index.sqlite3"), { readonly: true });
 			try {
-				const row = db.prepare(`SELECT file FROM fragments WHERE file = '.vault-mcp/notes.md' LIMIT 1`).get() as
+				const row = db.prepare(`SELECT file FROM fragments WHERE file = '.markdown-mcp/notes.md' LIMIT 1`).get() as
 					| { file: string }
 					| undefined;
-				expect(row?.file).toBe(".vault-mcp/notes.md");
+				expect(row?.file).toBe(".markdown-mcp/notes.md");
 			} finally {
 				db.close();
 			}
 		}
 
 		// Second lifecycle: --include-hidden. Scanner walks vault but skips
-		// `.vault-mcp/` so prune candidates include the planted row.
+		// `.markdown-mcp/` so prune candidates include the planted row.
 		// `confirmPrune`'s cache-prefix gate returns true regardless of
 		// the hidden gate, and the row goes.
 		const probe = await spawnTestServer(vault.path, {}, ["--include-hidden"]);
@@ -110,7 +110,7 @@ describe("confirmPrune .vault-mcp gate", () => {
 				arguments: { query: "shouldnotleaktoken" },
 			});
 			const files = (search.structuredContent as SearchOutput).items.map((i) => i.file);
-			expect(files).not.toContain(".vault-mcp/notes.md");
+			expect(files).not.toContain(".markdown-mcp/notes.md");
 		} finally {
 			await probe.close();
 		}
@@ -118,9 +118,9 @@ describe("confirmPrune .vault-mcp gate", () => {
 		// Confirm the underlying row is gone, not just filtered at the
 		// query layer (which carries no cache-path predicate).
 		{
-			const db = new Database(join(vault.path, ".vault-mcp", "index.sqlite3"), { readonly: true });
+			const db = new Database(join(vault.path, ".markdown-mcp", "index.sqlite3"), { readonly: true });
 			try {
-				const row = db.prepare(`SELECT file FROM fragments WHERE file = '.vault-mcp/notes.md' LIMIT 1`).get() as
+				const row = db.prepare(`SELECT file FROM fragments WHERE file = '.markdown-mcp/notes.md' LIMIT 1`).get() as
 					| { file: string }
 					| undefined;
 				expect(row).toBeUndefined();

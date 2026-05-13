@@ -1,11 +1,11 @@
 {
-  "name": "vault-mcp",
+  "name": "markdown-mcp",
   "version": "1.0.0",
-  "description": "Read-only MCP server exposing a local markdown vault to AI agents.",
+  "description": "MCP server giving AI agents structured, addressable access to a local markdown vault (Obsidian, Foam, plain folder).",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "vault-mcp": "./dist/index.js"
+    "markdown-mcp": "./dist/index.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,6 +15,26 @@
     "!dist/**/*.map",
     "README.md",
     "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/planexhq/markdown-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/planexhq/markdown-mcp/issues"
+  },
+  "homepage": "https://github.com/planexhq/markdown-mcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "markdown",
+    "obsidian",
+    "foam",
+    "vault",
+    "notes",
+    "ai",
+    "claude",
+    "rag"
   ],
   "engines": {
     "node": ">=22.0.0"

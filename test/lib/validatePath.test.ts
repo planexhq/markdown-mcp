@@ -332,32 +332,32 @@ describe("validatePath — edge cases", () => {
 	});
 });
 
-describe("ensureIndexDirIsRealDir — startup symlink guard for .vault-mcp", () => {
+describe("ensureIndexDirIsRealDir — startup symlink guard for .markdown-mcp", () => {
 	test("ENOENT (fresh vault) returns without throwing", async () => {
 		const isolated = await createTempVault({});
 		try {
-			await ensureIndexDirIsRealDir(`${isolated.path}/.vault-mcp`);
+			await ensureIndexDirIsRealDir(`${isolated.path}/.markdown-mcp`);
 		} finally {
 			await isolated.cleanup();
 		}
 	});
 
 	test("real directory passes through", async () => {
-		const isolated = await createTempVault({ ".vault-mcp": { "keep.txt": "x" } });
+		const isolated = await createTempVault({ ".markdown-mcp": { "keep.txt": "x" } });
 		try {
-			await ensureIndexDirIsRealDir(`${isolated.path}/.vault-mcp`);
+			await ensureIndexDirIsRealDir(`${isolated.path}/.markdown-mcp`);
 		} finally {
 			await isolated.cleanup();
 		}
 	});
 
-	test("symlinked .vault-mcp rejected with VAULT_ROOT_SYMLINK", async () => {
+	test("symlinked .markdown-mcp rejected with VAULT_ROOT_SYMLINK", async () => {
 		const isolated = await createTempVault({});
 		const exfil = await createTempVault({});
 		try {
-			await createSymlink(exfil.path, `${isolated.path}/.vault-mcp`);
+			await createSymlink(exfil.path, `${isolated.path}/.markdown-mcp`);
 			await expectPathRejection(
-				() => ensureIndexDirIsRealDir(`${isolated.path}/.vault-mcp`),
+				() => ensureIndexDirIsRealDir(`${isolated.path}/.markdown-mcp`),
 				"PATH_OUTSIDE_VAULT",
 				"VAULT_ROOT_SYMLINK",
 			);
@@ -366,11 +366,11 @@ describe("ensureIndexDirIsRealDir — startup symlink guard for .vault-mcp", () 
 		}
 	});
 
-	test("regular file at .vault-mcp rejected with VAULT_ROOT_NOT_DIRECTORY", async () => {
-		const isolated = await createTempVault({ ".vault-mcp": "not a dir" });
+	test("regular file at .markdown-mcp rejected with VAULT_ROOT_NOT_DIRECTORY", async () => {
+		const isolated = await createTempVault({ ".markdown-mcp": "not a dir" });
 		try {
 			await expectPathRejection(
-				() => ensureIndexDirIsRealDir(`${isolated.path}/.vault-mcp`),
+				() => ensureIndexDirIsRealDir(`${isolated.path}/.markdown-mcp`),
 				"PATH_OUTSIDE_VAULT",
 				"VAULT_ROOT_NOT_DIRECTORY",
 			);
@@ -381,10 +381,10 @@ describe("ensureIndexDirIsRealDir — startup symlink guard for .vault-mcp", () 
 });
 
 describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () => {
-	const dbRel = ".vault-mcp/index.sqlite3";
+	const dbRel = ".markdown-mcp/index.sqlite3";
 
 	test("ENOENT on all three paths (cold start) returns without throwing", async () => {
-		const isolated = await createTempVault({ ".vault-mcp": {} });
+		const isolated = await createTempVault({ ".markdown-mcp": {} });
 		try {
 			await assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`);
 		} finally {
@@ -393,7 +393,7 @@ describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () =
 	});
 
 	test("regular SQLite file (no sidecars) passes through", async () => {
-		const isolated = await createTempVault({ ".vault-mcp": { "index.sqlite3": "fake" } });
+		const isolated = await createTempVault({ ".markdown-mcp": { "index.sqlite3": "fake" } });
 		try {
 			await assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`);
 		} finally {
@@ -402,7 +402,7 @@ describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () =
 	});
 
 	test("symlinked index.sqlite3 rejected with INDEX_FILE_SYMLINK", async () => {
-		const isolated = await createTempVault({ ".vault-mcp": {} });
+		const isolated = await createTempVault({ ".markdown-mcp": {} });
 		const exfil = await createTempVault({ "evil.sqlite3": "exfil" });
 		try {
 			await createSymlink(`${exfil.path}/evil.sqlite3`, `${isolated.path}/${dbRel}`);
@@ -417,7 +417,7 @@ describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () =
 	});
 
 	test("symlinked -wal sidecar rejected with INDEX_FILE_SYMLINK", async () => {
-		const isolated = await createTempVault({ ".vault-mcp": { "index.sqlite3": "fake" } });
+		const isolated = await createTempVault({ ".markdown-mcp": { "index.sqlite3": "fake" } });
 		const exfil = await createTempVault({ "evil.wal": "exfil" });
 		try {
 			await createSymlink(`${exfil.path}/evil.wal`, `${isolated.path}/${dbRel}-wal`);
@@ -432,7 +432,7 @@ describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () =
 	});
 
 	test("symlinked -shm sidecar rejected with INDEX_FILE_SYMLINK", async () => {
-		const isolated = await createTempVault({ ".vault-mcp": { "index.sqlite3": "fake" } });
+		const isolated = await createTempVault({ ".markdown-mcp": { "index.sqlite3": "fake" } });
 		const exfil = await createTempVault({ "evil.shm": "exfil" });
 		try {
 			await createSymlink(`${exfil.path}/evil.shm`, `${isolated.path}/${dbRel}-shm`);
@@ -451,7 +451,7 @@ describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () =
 	// and either crashes openSqlite or — in the block-device case —
 	// redirects index writes onto a real partition.
 	test("directory at index.sqlite3 rejected with INDEX_FILE_NOT_REGULAR", async () => {
-		const isolated = await createTempVault({ ".vault-mcp": { "index.sqlite3": {} } });
+		const isolated = await createTempVault({ ".markdown-mcp": { "index.sqlite3": {} } });
 		try {
 			await expectPathRejection(
 				() => assertIndexFilesAreRegular(`${isolated.path}/${dbRel}`),
@@ -465,7 +465,7 @@ describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () =
 
 	test("directory at -wal sidecar rejected with INDEX_FILE_NOT_REGULAR", async () => {
 		const isolated = await createTempVault({
-			".vault-mcp": { "index.sqlite3": "fake", "index.sqlite3-wal": {} },
+			".markdown-mcp": { "index.sqlite3": "fake", "index.sqlite3-wal": {} },
 		});
 		try {
 			await expectPathRejection(
@@ -480,7 +480,7 @@ describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () =
 
 	test("directory at -shm sidecar rejected with INDEX_FILE_NOT_REGULAR", async () => {
 		const isolated = await createTempVault({
-			".vault-mcp": { "index.sqlite3": "fake", "index.sqlite3-shm": {} },
+			".markdown-mcp": { "index.sqlite3": "fake", "index.sqlite3-shm": {} },
 		});
 		try {
 			await expectPathRejection(

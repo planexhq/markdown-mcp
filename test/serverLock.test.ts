@@ -71,7 +71,7 @@ describe("server lockfile — conflict refusal", () => {
 
 			const { code, stderr } = spawnServerSync(vault.path, []);
 			expect(code).toBe(1);
-			expect(stderr).toContain("Another vault-mcp server");
+			expect(stderr).toContain("Another markdown-mcp server");
 			expect(stderr).toContain("--include-hidden=true");
 			expect(stderr).toContain("--include-hidden=false");
 		} finally {
@@ -124,7 +124,7 @@ describe("server lockfile — conflict refusal", () => {
 
 			const { code, stderr } = spawnServerSync(vault.path, []);
 			expect(code).toBe(1);
-			expect(stderr).toContain("Another vault-mcp server");
+			expect(stderr).toContain("Another markdown-mcp server");
 		} finally {
 			await second.close();
 		}
@@ -266,7 +266,7 @@ describe("server lockfile — foreign-host slot preserved when local PID is dead
 
 describe("server lockfile — hostname check", () => {
 	test("foreign-host live-PID slot is logged + skipped, target left in place", async () => {
-		// Cross-host NFS mount: a foreign-host vault-mcp wrote the slot.
+		// Cross-host NFS mount: a foreign-host markdown-mcp wrote the slot.
 		// PID is meaningless locally; can't probe liveness via process.kill;
 		// don't escalate (would block legit local startup if the PID
 		// happens to match a local process) and don't unlink (might
@@ -301,7 +301,7 @@ describe("server lockfile — hostname check", () => {
 		// Opposite policy → same-host conflict (no hostname → assume local).
 		const { code, stderr } = spawnServerSync(vault.path, []);
 		expect(code).toBe(1);
-		expect(stderr).toContain("Another vault-mcp server");
+		expect(stderr).toContain("Another markdown-mcp server");
 
 		await unlink(legacyShapePath).catch(() => {});
 	}, 30_000);
@@ -313,7 +313,7 @@ describe("server lockfile — own-slot PID-reuse recovery", () => {
 		await mkdir(indexPath, { recursive: true });
 		const ourPath = ownLockPath(vault.path, process.pid);
 		// Plant a leftover lockfile at our own PID slot (simulates a
-		// previous vault-mcp process with the same recycled PID that died
+		// previous markdown-mcp process with the same recycled PID that died
 		// without cleanup).
 		await writeFile(ourPath, `${JSON.stringify({ includeHidden: true })}\n`);
 
@@ -334,7 +334,7 @@ describe("server lockfile — symlink defense", () => {
 		const indexPath = indexDir(vault.path);
 		await mkdir(indexPath, { recursive: true });
 		const ourPath = ownLockPath(vault.path, process.pid);
-		const targetPath = join(await mkdtemp(join(tmpdir(), "vault-mcp-symlink-target-")), "sentinel.txt");
+		const targetPath = join(await mkdtemp(join(tmpdir(), "markdown-mcp-symlink-target-")), "sentinel.txt");
 		const sentinel = "DO_NOT_OVERWRITE";
 		await writeFile(targetPath, sentinel);
 		await symlink(targetPath, ourPath);
@@ -355,7 +355,7 @@ describe("server lockfile — symlink defense", () => {
 		// PID 1 (init) is reliably alive on POSIX, so the slot's lstat will
 		// short-circuit on "non-regular" before any kill probe / read.
 		const foreignPath = join(indexPath, lockFileNameForPid(1));
-		const targetPath = join(await mkdtemp(join(tmpdir(), "vault-mcp-symlink-target-")), "foreign-target.txt");
+		const targetPath = join(await mkdtemp(join(tmpdir(), "markdown-mcp-symlink-target-")), "foreign-target.txt");
 		const sentinel = "FOREIGN_DO_NOT_TOUCH";
 		await writeFile(targetPath, sentinel);
 		await symlink(targetPath, foreignPath);
@@ -396,7 +396,7 @@ describe("server lockfile — legacy server.lock cleanup", () => {
 		const indexPath = indexDir(vault.path);
 		await mkdir(indexPath, { recursive: true });
 		const legacyPath = join(indexPath, LEGACY_LOCK_FILE_NAME);
-		const targetPath = join(await mkdtemp(join(tmpdir(), "vault-mcp-symlink-target-")), "legacy-target.txt");
+		const targetPath = join(await mkdtemp(join(tmpdir(), "markdown-mcp-symlink-target-")), "legacy-target.txt");
 		const sentinel = "LEGACY_TARGET_INTACT";
 		await writeFile(targetPath, sentinel);
 		await symlink(targetPath, legacyPath);

@@ -1,7 +1,7 @@
 /**
  * Integration test — large tier (~50K files).
  *
- * Gated behind `VAULT_MCP_INTEGRATION=1`. Generation alone takes ~30–60s
+ * Gated behind `MARKDOWN_MCP_INTEGRATION=1`. Generation alone takes ~30–60s
  * on commodity SSD; full indexing pushes total runtime past 5 min on
  * slower hardware. Run on a tagged-release pipeline, not per-PR.
  *
@@ -15,7 +15,7 @@ import type { GetVaultTreeResult } from "../../src/types.js";
 import { spawnTestServer, type TestClient, waitForWarm } from "../helpers/mcp-client.js";
 
 const FILES = 50_000;
-const SHOULD_RUN = process.env.VAULT_MCP_INTEGRATION === "1";
+const SHOULD_RUN = process.env.MARKDOWN_MCP_INTEGRATION === "1";
 
 let vault: { path: string; cleanup(): Promise<void>; files: number };
 let conn: TestClient;

@@ -29,7 +29,7 @@ const FIXTURE: VaultStructure = {
 };
 
 // Two separate vault dirs with identical content — both servers share the
-// same on-disk SQLite (`<vault>/.vault-mcp/index.sqlite3`) within a single
+// same on-disk SQLite (`<vault>/.markdown-mcp/index.sqlite3`) within a single
 // vault, so a single shared vault would cross-contaminate: the hidden-mode
 // server would index `.dotfile.md` and the default-mode server would then
 // see those rows on its next reconcile. Independent vaults preserve the
@@ -47,13 +47,13 @@ beforeAll(async () => {
 	await waitForWarm(defaultConn.client);
 	await waitForWarm(hiddenConn.client);
 	// Cache-dir gate test fixture: write a markdown file inside the
-	// hidden-mode server's `.vault-mcp/` AFTER warm so the watcher's
+	// hidden-mode server's `.markdown-mcp/` AFTER warm so the watcher's
 	// isIndexCachePath ignore prevents reindex chatter. The file must EXIST
 	// for the readNote.assertNotePathString gate to fire — validatePath's
 	// segment-walk lstat would otherwise return PATH_NOT_FOUND first and
 	// mask the cache-dir rejection path.
 	await writeFile(
-		join(hiddenVault.path, ".vault-mcp", "notes.md"),
+		join(hiddenVault.path, ".markdown-mcp", "notes.md"),
 		"# Inside cache\n\nshould be unreachable\n",
 		"utf8",
 	);
@@ -88,25 +88,25 @@ describe("--include-hidden gates every surface together", () => {
 		expect(paths).toContain(".obsidian");
 	});
 
-	test("--include-hidden does NOT surface server's own .vault-mcp cache dir", async () => {
+	test("--include-hidden does NOT surface server's own .markdown-mcp cache dir", async () => {
 		// Mirrors watcher.ts's hard exclusion: the server creates
-		// `.vault-mcp/index.sqlite3` (+ `-wal`/`-shm`) under the vault root.
+		// `.markdown-mcp/index.sqlite3` (+ `-wal`/`-shm`) under the vault root.
 		// Surfacing them in the tree leaks server internals and, because
-		// `.vault-mcp` sorts before any letter-named content, would consume
+		// `.markdown-mcp` sorts before any letter-named content, would consume
 		// the first page on small `pageSize` requests.
 		const paths = await listTreePaths(hiddenConn.client);
-		expect(paths).not.toContain(".vault-mcp");
-		expect(paths.some((p) => p.startsWith(".vault-mcp/"))).toBe(false);
+		expect(paths).not.toContain(".markdown-mcp");
+		expect(paths.some((p) => p.startsWith(".markdown-mcp/"))).toBe(false);
 	});
 
-	test("--include-hidden: get_vault_tree({ path: '.vault-mcp' }) rejects with PATH_NOT_FOUND", async () => {
+	test("--include-hidden: get_vault_tree({ path: '.markdown-mcp' }) rejects with PATH_NOT_FOUND", async () => {
 		// `resolveStartPath`'s isHiddenPath gate is bypassed under
 		// --include-hidden, so without the isIndexCachePath gate
 		// the walk descends into the cache and exposes index.sqlite3 +
 		// WAL/SHM siblings as items[].
 		const r = await hiddenConn.client.callTool({
 			name: "get_vault_tree",
-			arguments: { path: ".vault-mcp", depth: 5, pageSize: 50 },
+			arguments: { path: ".markdown-mcp", depth: 5, pageSize: 50 },
 		});
 		expect(r.isError).toBeTruthy();
 		const err = r.structuredContent as { code?: string; param?: string };
@@ -114,14 +114,14 @@ describe("--include-hidden gates every surface together", () => {
 		expect(err.param).toBe("path");
 	});
 
-	test("--include-hidden: get_fragment rejects .vault-mcp/* paths", async () => {
-		// `.vault-mcp/notes.md` exists on disk (planted in beforeAll) so
+	test("--include-hidden: get_fragment rejects .markdown-mcp/* paths", async () => {
+		// `.markdown-mcp/notes.md` exists on disk (planted in beforeAll) so
 		// validatePath succeeds and we exercise the readNote
 		// assertNotePathString isIndexCachePath gate specifically — not the
 		// fall-through PATH_NOT_FOUND from a missing file.
 		const r = await hiddenConn.client.callTool({
 			name: "get_fragment",
-			arguments: { file: ".vault-mcp/notes.md", anchor: { kind: "file" } },
+			arguments: { file: ".markdown-mcp/notes.md", anchor: { kind: "file" } },
 		});
 		expect(r.isError).toBeTruthy();
 		const err = r.structuredContent as { code?: string; message?: string };
@@ -129,13 +129,13 @@ describe("--include-hidden gates every surface together", () => {
 		expect(err.message ?? "").toContain("server cache directory");
 	});
 
-	test("--include-hidden: search.scope.path rejects .vault-mcp", async () => {
+	test("--include-hidden: search.scope.path rejects .markdown-mcp", async () => {
 		// classifyScope mirrors readNote: isIndexCachePath gate after the
 		// hidden-path gate so PATH_NOT_FOUND with `param: 'scope.path'`
 		// surfaces under --include-hidden too.
 		const r = await hiddenConn.client.callTool({
 			name: "search",
-			arguments: { query: "x", scope: { path: ".vault-mcp" } },
+			arguments: { query: "x", scope: { path: ".markdown-mcp" } },
 		});
 		expect(r.isError).toBeTruthy();
 		const err = r.structuredContent as { code?: string; param?: string };
@@ -143,11 +143,11 @@ describe("--include-hidden gates every surface together", () => {
 		expect(err.param).toBe("scope.path");
 	});
 
-	test("--include-hidden: note:// resource rejects .vault-mcp/* read", async () => {
+	test("--include-hidden: note:// resource rejects .markdown-mcp/* read", async () => {
 		// Same fixture as the get_fragment test: file exists so we exercise
 		// the readNote.assertNotePathString gate, not the validatePath
 		// fall-through.
-		const r = await hiddenConn.client.readResource({ uri: "note://.vault-mcp/notes.md" }).then(
+		const r = await hiddenConn.client.readResource({ uri: "note://.markdown-mcp/notes.md" }).then(
 			() => "ok" as const,
 			(err) => err,
 		);

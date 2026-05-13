@@ -165,8 +165,8 @@ async function resolveStartPath(
 	if (!includeHidden && isHiddenPath(safe.relative)) return null;
 	// Server's own cache dir is rejected as a tree root regardless of
 	// `--include-hidden`. The dirent filter in `shouldEmitDirent` only excludes
-	// `.vault-mcp` when encountered as a child of vault root — without this
-	// resolver-level gate, `path: ".vault-mcp"` under `--include-hidden` would
+	// `.markdown-mcp` when encountered as a child of vault root — without this
+	// resolver-level gate, `path: ".markdown-mcp"` under `--include-hidden` would
 	// walk inside the cache and enumerate `index.sqlite3` + WAL/SHM siblings.
 	if (isIndexCachePath(safe.relative)) return null;
 	try {
@@ -230,7 +230,7 @@ async function* walkTreeDfs(
 		// can correlate "tree truncated" with the underlying failure.
 		if (!isVanishedErrno(err)) {
 			console.error(
-				`vault-mcp tree: skipping subtree ${startRel || "(vault root)"} (readdir error: ${getErrnoCode(err) ?? "unknown"})`,
+				`markdown-mcp tree: skipping subtree ${startRel || "(vault root)"} (readdir error: ${getErrnoCode(err) ?? "unknown"})`,
 			);
 		}
 		return;
@@ -273,7 +273,7 @@ async function* walkTreeDfs(
  * Per-entry filter for the tree walk + child counter. Symlinks are
  * skipped (D8 — symlinks are rejected at every surface), the server's
  * own top-level cache dir is skipped regardless of `includeHidden` via
- * `isIndexCachePath` (FS-aware case-folding so a `.Vault-MCP/` aliasing
+ * `isIndexCachePath` (FS-aware case-folding so a `.Markdown-MCP/` aliasing
  * the cache on macOS APFS / Windows NTFS is also excluded — byte-wise
  * compare against `INDEX_DIR_NAME` alone would leak the cache through
  * the tree), hidden names are skipped per the all-or-nothing server

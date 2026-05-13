@@ -7,7 +7,7 @@
  * concurrency deadlock) surfaces here without requiring opt-in.
  *
  * Medium (~5K) and large (~50K) tiers live in sibling files gated
- * behind `VAULT_MCP_INTEGRATION=1` to keep CI under 10 min.
+ * behind `MARKDOWN_MCP_INTEGRATION=1` to keep CI under 10 min.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "vitest";

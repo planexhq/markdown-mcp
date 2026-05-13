@@ -1,5 +1,5 @@
 /**
- * Test helper that spawns a built `vault-mcp` server as a subprocess
+ * Test helper that spawns a built `markdown-mcp` server as a subprocess
  * and connects to it via the SDK's stdio client transport. Returns the
  * connected `Client` and a tear-down function.
  *
@@ -80,7 +80,7 @@ export async function spawnTestServer(
 	});
 
 	const client = new Client(
-		{ name: "vault-mcp-test-client", version: "1.0.0-w1" },
+		{ name: "markdown-mcp-test-client", version: "1.0.0-w1" },
 		{
 			capabilities: {},
 		},
@@ -97,8 +97,8 @@ export async function spawnTestServer(
 }
 
 /**
- * Spawn a `vault-mcp` server child WITHOUT the MCP handshake. Streams
- * stderr into a captured buffer; resolves once the "vault-mcp running
+ * Spawn a `markdown-mcp` server child WITHOUT the MCP handshake. Streams
+ * stderr into a captured buffer; resolves once the "markdown-mcp running
  * on stdio" log line lands (proving `main()` finished startup —
  * lockfile written, SQLite opened, scanner kicked off). The caller
  * inspects the captured stderr and decides when to SIGTERM. Used by
@@ -119,7 +119,7 @@ export interface SpawnAndWaitOptions {
 }
 
 /**
- * Spawn `vault-mcp` and resolve once stderr contains `waitFor`. Single
+ * Spawn `markdown-mcp` and resolve once stderr contains `waitFor`. Single
  * stderr listener shared between buffer accumulation and trigger
  * detection — the `resolved` guard prevents double-resolve when the
  * trigger lands in a chunk that also contains later content.
@@ -164,7 +164,7 @@ export async function spawnAndWaitForStartup(
 ): Promise<SpawnedServer> {
 	return spawnAndWaitForStderr(vaultPath, {
 		extraArgs,
-		waitFor: "vault-mcp running on stdio",
+		waitFor: "markdown-mcp running on stdio",
 		timeoutMs,
 	});
 }

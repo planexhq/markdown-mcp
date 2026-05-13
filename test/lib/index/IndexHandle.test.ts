@@ -859,11 +859,11 @@ describe("sweepIndexCacheRows — cold-start cache-prefix sweep", () => {
 		return row.n;
 	}
 
-	test("sweeps `.vault-mcp/*` rows from all file-keyed tables", () => {
+	test("sweeps `.markdown-mcp/*` rows from all file-keyed tables", () => {
 		// `replaceFile` has no validatePath gate, so storage writes can
 		// land a cache-prefix row directly.
 		index.replaceFile({
-			file: ".vault-mcp/cache.md",
+			file: ".markdown-mcp/cache.md",
 			mtime: 500,
 			size: 50,
 			fragments: [
@@ -876,19 +876,19 @@ describe("sweepIndexCacheRows — cold-start cache-prefix sweep", () => {
 			],
 			frontmatter: { created: null, updated: null, fields_json: "{}", tags: ["secret"] },
 		});
-		expect(countWhere(opened.db, "fragments", "file", ".vault-mcp/")).toBeGreaterThan(0);
-		expect(countWhere(opened.db, "frontmatter", "file", ".vault-mcp/")).toBe(1);
-		expect(countWhere(opened.db, "frontmatter_tags", "file", ".vault-mcp/")).toBe(1);
-		expect(countWhere(opened.db, "file_metrics", "file", ".vault-mcp/")).toBe(1);
+		expect(countWhere(opened.db, "fragments", "file", ".markdown-mcp/")).toBeGreaterThan(0);
+		expect(countWhere(opened.db, "frontmatter", "file", ".markdown-mcp/")).toBe(1);
+		expect(countWhere(opened.db, "frontmatter_tags", "file", ".markdown-mcp/")).toBe(1);
+		expect(countWhere(opened.db, "file_metrics", "file", ".markdown-mcp/")).toBe(1);
 
 		index.sweepIndexCacheRows();
 
-		expect(countWhere(opened.db, "fragments", "file", ".vault-mcp/")).toBe(0);
-		expect(countWhere(opened.db, "frontmatter", "file", ".vault-mcp/")).toBe(0);
-		expect(countWhere(opened.db, "frontmatter_tags", "file", ".vault-mcp/")).toBe(0);
-		expect(countWhere(opened.db, "file_metrics", "file", ".vault-mcp/")).toBe(0);
-		expect(countWhere(opened.db, "wikilinks", "source_file", ".vault-mcp/")).toBe(0);
-		expect(countWhere(opened.db, "heading_history", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "fragments", "file", ".markdown-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter", "file", ".markdown-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter_tags", "file", ".markdown-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "file_metrics", "file", ".markdown-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "wikilinks", "source_file", ".markdown-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "heading_history", "file", ".markdown-mcp/")).toBe(0);
 	});
 
 	test("preserves non-cache rows", () => {
@@ -900,7 +900,7 @@ describe("sweepIndexCacheRows — cold-start cache-prefix sweep", () => {
 			frontmatter: { created: null, updated: null, fields_json: "{}", tags: [] },
 		});
 		index.replaceFile({
-			file: ".vault-mcp/cache.md",
+			file: ".markdown-mcp/cache.md",
 			mtime: 500,
 			size: 50,
 			fragments: [headingRow({ stable_id: "h:c", heading_path: ["C"], heading_text: "C", structural_path: "h1[1]" })],
@@ -909,7 +909,7 @@ describe("sweepIndexCacheRows — cold-start cache-prefix sweep", () => {
 
 		index.sweepIndexCacheRows();
 
-		expect(countWhere(opened.db, "frontmatter", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter", "file", ".markdown-mcp/")).toBe(0);
 		expect(countWhere(opened.db, "frontmatter", "file", "notes/")).toBe(1);
 		expect(countWhere(opened.db, "fragments", "file", "notes/")).toBeGreaterThan(0);
 		expect(countWhere(opened.db, "file_metrics", "file", "notes/")).toBe(1);
@@ -922,19 +922,19 @@ describe("sweepIndexCacheRows — cold-start cache-prefix sweep", () => {
 	});
 
 	test("sweeps mixed-case cache rows (case-insensitive FS bypass closed)", () => {
-		// Mixed-case `.Vault-MCP/*` rows can land via a legacy walker or a
+		// Mixed-case `.Markdown-MCP/*` rows can land via a legacy walker or a
 		// planted DB. The cold-start sweep must mirror `isIndexCachePath`'s
 		// case-fold (`lower(file) GLOB`) so those rows are cleaned before
 		// the warm-publish window lets search/get_links serve them.
 		index.replaceFile({
-			file: ".Vault-MCP/notes.md",
+			file: ".Markdown-MCP/notes.md",
 			mtime: 500,
 			size: 50,
 			fragments: [headingRow({ stable_id: "h:m", heading_path: ["M"], heading_text: "M", structural_path: "h1[1]" })],
 			frontmatter: { created: null, updated: null, fields_json: "{}", tags: ["secret"] },
 		});
 		index.replaceFile({
-			file: ".VAULT-MCP/index.sqlite3.md",
+			file: ".MARKDOWN-MCP/index.sqlite3.md",
 			mtime: 600,
 			size: 60,
 			fragments: [headingRow({ stable_id: "h:u", heading_path: ["U"], heading_text: "U", structural_path: "h1[1]" })],
@@ -944,12 +944,12 @@ describe("sweepIndexCacheRows — cold-start cache-prefix sweep", () => {
 		index.sweepIndexCacheRows();
 
 		// `countWhere` uses LIKE (case-insensitive in SQLite default), so
-		// it sees both `.vault-mcp/*` and `.Vault-MCP/*` rows; both should
+		// it sees both `.markdown-mcp/*` and `.Markdown-MCP/*` rows; both should
 		// be zero after the sweep.
-		expect(countWhere(opened.db, "fragments", "file", ".vault-mcp/")).toBe(0);
-		expect(countWhere(opened.db, "frontmatter", "file", ".vault-mcp/")).toBe(0);
-		expect(countWhere(opened.db, "frontmatter_tags", "file", ".vault-mcp/")).toBe(0);
-		expect(countWhere(opened.db, "file_metrics", "file", ".vault-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "fragments", "file", ".markdown-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter", "file", ".markdown-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "frontmatter_tags", "file", ".markdown-mcp/")).toBe(0);
+		expect(countWhere(opened.db, "file_metrics", "file", ".markdown-mcp/")).toBe(0);
 	});
 });
 
@@ -966,16 +966,16 @@ describe("sweepIndexCacheRows — case-sensitive FS routing", () => {
 		return row.n;
 	}
 
-	test("preserves `.Vault-MCP/*` user content on case-sensitive FS", () => {
+	test("preserves `.Markdown-MCP/*` user content on case-sensitive FS", () => {
 		index.replaceFile({
-			file: ".Vault-MCP/notes.md",
+			file: ".Markdown-MCP/notes.md",
 			mtime: 500,
 			size: 50,
 			fragments: [headingRow({ stable_id: "h:u", heading_path: ["U"], heading_text: "U", structural_path: "h1[1]" })],
 			frontmatter: { created: null, updated: null, fields_json: "{}", tags: ["secret"] },
 		});
 		index.replaceFile({
-			file: ".vault-mcp/cache.md",
+			file: ".markdown-mcp/cache.md",
 			mtime: 600,
 			size: 60,
 			fragments: [headingRow({ stable_id: "h:c", heading_path: ["C"], heading_text: "C", structural_path: "h1[1]" })],
@@ -984,20 +984,20 @@ describe("sweepIndexCacheRows — case-sensitive FS routing", () => {
 
 		index.sweepIndexCacheRows();
 
-		expect(countExact(opened.db, "fragments", "file", ".vault-mcp/cache.md")).toBe(0);
-		expect(countExact(opened.db, "frontmatter", "file", ".vault-mcp/cache.md")).toBe(0);
-		expect(countExact(opened.db, "file_metrics", "file", ".vault-mcp/cache.md")).toBe(0);
-		expect(countExact(opened.db, "fragments", "file", ".Vault-MCP/notes.md")).toBeGreaterThan(0);
-		expect(countExact(opened.db, "frontmatter", "file", ".Vault-MCP/notes.md")).toBe(1);
-		expect(countExact(opened.db, "frontmatter_tags", "file", ".Vault-MCP/notes.md")).toBe(1);
-		expect(countExact(opened.db, "file_metrics", "file", ".Vault-MCP/notes.md")).toBe(1);
+		expect(countExact(opened.db, "fragments", "file", ".markdown-mcp/cache.md")).toBe(0);
+		expect(countExact(opened.db, "frontmatter", "file", ".markdown-mcp/cache.md")).toBe(0);
+		expect(countExact(opened.db, "file_metrics", "file", ".markdown-mcp/cache.md")).toBe(0);
+		expect(countExact(opened.db, "fragments", "file", ".Markdown-MCP/notes.md")).toBeGreaterThan(0);
+		expect(countExact(opened.db, "frontmatter", "file", ".Markdown-MCP/notes.md")).toBe(1);
+		expect(countExact(opened.db, "frontmatter_tags", "file", ".Markdown-MCP/notes.md")).toBe(1);
+		expect(countExact(opened.db, "file_metrics", "file", ".Markdown-MCP/notes.md")).toBe(1);
 	});
 });
 
 describe("sweepIndexCacheRows — snapshot bump on rows-changed", () => {
 	test("bumps snapshot when a cache row is deleted", () => {
 		index.replaceFile({
-			file: ".vault-mcp/cache.md",
+			file: ".markdown-mcp/cache.md",
 			mtime: 500,
 			size: 50,
 			fragments: [headingRow({ stable_id: "h:c", heading_path: ["C"], heading_text: "C", structural_path: "h1[1]" })],

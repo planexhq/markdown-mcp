@@ -17,7 +17,7 @@ import { SERVER_BIN } from "./helpers/mcp-client.js";
 let tmpDir: string;
 
 beforeEach(async () => {
-	tmpDir = await mkdtemp(join(tmpdir(), "vault-mcp-cli-entry-"));
+	tmpDir = await mkdtemp(join(tmpdir(), "markdown-mcp-cli-entry-"));
 });
 
 afterEach(async () => {
@@ -49,10 +49,10 @@ describe("CLI entry detection", () => {
 
 	test("invocation through a bin symlink matches direct-invocation behavior", async () => {
 		// Reproduces the `npm`/`npx` install layout where
-		// `node_modules/.bin/vault-mcp` is a symlink to `dist/index.js`.
+		// `node_modules/.bin/markdown-mcp` is a symlink to `dist/index.js`.
 		// Without realpath on both sides of the entry comparison,
 		// `main()` never runs and the process exits 0 with empty stderr.
-		const symlinkPath = join(tmpDir, "vault-mcp-bin");
+		const symlinkPath = join(tmpDir, "markdown-mcp-bin");
 		await symlink(SERVER_BIN, symlinkPath);
 
 		const { code, stderr } = runServer(symlinkPath);

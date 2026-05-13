@@ -583,7 +583,7 @@ export class IndexHandle implements VaultFileIndex {
 
 	/**
 	 * Storage-layer cache-prefix predicate: search / get_links SQL has
-	 * none, so a pre-existing or planted DB with `.vault-mcp/*` rows
+	 * none, so a pre-existing or planted DB with `.markdown-mcp/*` rows
 	 * would leak through the warm-publish window.
 	 */
 	sweepIndexCacheRows(): void {

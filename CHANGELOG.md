@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to vault-mcp are documented in this file.
+All notable changes to markdown-mcp are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
@@ -27,7 +27,7 @@ Initial release. Six tools + one resource, MCP spec **2025-06-18**, stdio transp
 - Vault-root `lstat`-before-`realpath` startup sequence (rejects a symlinked vault root).
 - Hard caps: 10 MB per file (`FILE_TOO_LARGE`), 50K AST nodes (`MARKDOWN_PARSE_ERROR.reason = "ast_node_cap_exceeded"`), 32-segment path depth (`PATH_OUTSIDE_VAULT`).
 - All filter SQL is parameterized; FTS5 input runs through `query-sanitize-v1` (D23).
-- Threat-model vectors V1–V7 covered by tests; V2 (prompt injection via vault content) documented as a host-layer responsibility per `docs/THREAT_MODEL.md`.
+- Threat-model vectors V1–V7 covered by tests; V2 (prompt injection via vault content) is a host-layer responsibility — the server faithfully returns the vault content the host queried, and the host is responsible for sandboxing the surfaced text.
 
 ### Infrastructure
 
@@ -51,11 +51,11 @@ Verified on a 10K-file synthetic vault:
 - Search p95 < 100 ms (W3 budget)
 - Watcher event-to-index lag p95 within debounce window (W4 budget)
 
-Run `npm run bench` to reproduce. Numbers are documented in [`bench/README.md`](bench/README.md).
+Run `npm run bench` to reproduce locally.
 
 ### Locked-in design
 
-Architecture decisions D1–D35 are recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md). Internal algorithm IDs that ship with v1.0.0:
+Internal algorithm IDs that ship with v1.0.0:
 
 - `query-sanitize-v1` (D23)
 - `bm25-fragment-v1` and `filter-preview-v1` snippet algorithms (D19, D33)
@@ -64,4 +64,4 @@ Architecture decisions D1–D35 are recorded in [`docs/DECISIONS.md`](docs/DECIS
 
 Algorithm IDs are versioned in `_meta`; behavior changes bump the id rather than mutating under the old name.
 
-[1.0.0]: https://github.com/<owner>/vault-mcp/releases/tag/v1.0.0
+[1.0.0]: https://github.com/planexhq/markdown-mcp/releases/tag/v1.0.0

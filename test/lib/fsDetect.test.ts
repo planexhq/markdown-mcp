@@ -2,7 +2,7 @@
  * `detectCaseInsensitiveFs` probe — startup gate that distinguishes
  * macOS APFS / Windows NTFS (case-insensitive default) from Linux ext4 /
  * btrfs (case-sensitive default) so `isIndexCachePath` preserves user
- * `.Vault-MCP/` access on case-sensitive FS while still folding mixed-
+ * `.Markdown-MCP/` access on case-sensitive FS while still folding mixed-
  * case agent input to the cache on case-insensitive FS.
  */
 
@@ -47,11 +47,11 @@ describe("detectCaseInsensitiveFs", () => {
 	test("probe directory is cleaned up before return", async () => {
 		await detectCaseInsensitiveFs(vault.path);
 		// No probe dirs should remain. We can't predict the random suffix
-		// from outside; just verify the vault root has no `.vault-mcp-
+		// from outside; just verify the vault root has no `.markdown-mcp-
 		// case-probe-*` entries.
 		const { readdir } = await import("node:fs/promises");
 		const entries = await readdir(vault.path);
-		const leftover = entries.filter((name) => name.startsWith(".vault-mcp-case-probe-"));
+		const leftover = entries.filter((name) => name.startsWith(".markdown-mcp-case-probe-"));
 		expect(leftover).toEqual([]);
 	});
 
@@ -69,7 +69,7 @@ describe("detectCaseInsensitiveFs", () => {
 		// the probe's case-sensitive signal.
 		if (process.platform !== "darwin" && process.platform !== "win32") return;
 		const { mkdir, rmdir } = await import("node:fs/promises");
-		const probe = join(vault.path, ".vault-mcp-case-probe-aliassanity");
+		const probe = join(vault.path, ".markdown-mcp-case-probe-aliassanity");
 		await mkdir(probe);
 		try {
 			const upperStat = await lstat(probe.toUpperCase());

@@ -117,7 +117,7 @@ export async function validateVaultRoot(input: string): Promise<VaultRoot> {
 /**
  * Refuse to open the SQLite cache path if its parent directory is a
  * symlink (or anything other than a real directory). Without this guard,
- * a hostile vault that pre-plants `.vault-mcp` as a symlink would
+ * a hostile vault that pre-plants `.markdown-mcp` as a symlink would
  * redirect all index writes outside the vault — `mkdir(..., recursive)`
  * silently follows symlinks, and the subsequent `Database` open follows
  * them too. ENOENT is fine: the caller will mkdir a fresh directory.

@@ -81,7 +81,7 @@ export function startMerkleTick(opts: MerkleTickOptions): MerkleTickHandle {
 				}
 				result = await reconcile(vaultRoot, index, coordinator, reindexFile, includeHidden);
 			} catch (err) {
-				console.error(`vault-mcp merkle: tick failed: ${errorMessage(err)}`);
+				console.error(`markdown-mcp merkle: tick failed: ${errorMessage(err)}`);
 			} finally {
 				const current = index.getStatus().state;
 				if (current === "reconciling") {
@@ -104,7 +104,7 @@ export function startMerkleTick(opts: MerkleTickOptions): MerkleTickHandle {
 					!index.hasPendingRetries()
 				) {
 					index.markScanFinalized();
-					console.error("vault-mcp merkle: index finalized after clean reconcile.");
+					console.error("markdown-mcp merkle: index finalized after clean reconcile.");
 				}
 				inFlightPromise = null;
 			}
@@ -243,7 +243,7 @@ async function batchedReindex(
 					const outcome = await coordinator.enqueue(rel, () => reindexFile(rel));
 					if (outcome === "parse_failed") failedFiles.add(rel);
 				} catch (err) {
-					console.error(`vault-mcp merkle: reindex ${label} ${rel}: ${errorMessage(err)}`);
+					console.error(`markdown-mcp merkle: reindex ${label} ${rel}: ${errorMessage(err)}`);
 					// Conservative: treat unknown errors as failures.
 					failedFiles.add(rel);
 				}
@@ -277,10 +277,10 @@ async function pruneVanished(
 				// watcher.ts's onUnlink path so `scan_complete` finalizes
 				// without a process restart.
 				if (index.clearPendingRetry(rel)) {
-					console.error(`vault-mcp: scan finalized after merkle reconcile (via: ${rel})`);
+					console.error(`markdown-mcp: scan finalized after merkle reconcile (via: ${rel})`);
 				}
 			} catch (err) {
-				console.error(`vault-mcp merkle: removeFile ${rel}: ${errorMessage(err)}`);
+				console.error(`markdown-mcp merkle: removeFile ${rel}: ${errorMessage(err)}`);
 			}
 		});
 	});
@@ -355,7 +355,7 @@ async function* walkVaultMarkdown(
 		// preserve their rows so a transient blip doesn't drop search hits.
 		if (isVanishedErrno(err)) return;
 		console.error(
-			`vault-mcp merkle: skipping subtree ${relParent || "(vault root)"} (readdir error: ${getErrnoCode(err) ?? "unknown"})`,
+			`markdown-mcp merkle: skipping subtree ${relParent || "(vault root)"} (readdir error: ${getErrnoCode(err) ?? "unknown"})`,
 		);
 		failedSubtrees.add(relParent);
 		return;

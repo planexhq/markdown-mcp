@@ -8,7 +8,7 @@
  * `server-<pid>.lock`. The orphan then composed with PID reuse to
  * surface bogus conflicts on the next start.
  *
- * Uses the `VAULT_MCP_TEST_STARTUP_DELAY_MS` env-var hook in
+ * Uses the `MARKDOWN_MCP_TEST_STARTUP_DELAY_MS` env-var hook in
  * `src/index.ts` to deterministically pause main() between lock
  * acquisition and the rest of startup.
  */

@@ -94,7 +94,7 @@ export function startWatcher(opts: WatcherOptions): Watcher {
 			try {
 				await reindexFile(rel);
 			} catch (err) {
-				console.error(`vault-mcp watcher: reindex failed for ${rel}: ${errorMessage(err)}`);
+				console.error(`markdown-mcp watcher: reindex failed for ${rel}: ${errorMessage(err)}`);
 			}
 		});
 	};
@@ -119,10 +119,10 @@ export function startWatcher(opts: WatcherOptions): Watcher {
 				// reindexCallback) so the scan finalizes instead of staying
 				// at `warming` until process restart.
 				if (index.clearPendingRetry(rel)) {
-					console.error(`vault-mcp: scan finalized after watcher unlink (via: ${rel})`);
+					console.error(`markdown-mcp: scan finalized after watcher unlink (via: ${rel})`);
 				}
 			} catch (err) {
-				console.error(`vault-mcp watcher: removeFile failed for ${rel}: ${errorMessage(err)}`);
+				console.error(`markdown-mcp watcher: removeFile failed for ${rel}: ${errorMessage(err)}`);
 			}
 		});
 	};
@@ -131,7 +131,7 @@ export function startWatcher(opts: WatcherOptions): Watcher {
 	fsWatcher.on("change", onChange);
 	fsWatcher.on("unlink", onUnlink);
 	fsWatcher.on("error", (err) => {
-		console.error(`vault-mcp watcher: ${errorMessage(err)}`);
+		console.error(`markdown-mcp watcher: ${errorMessage(err)}`);
 	});
 
 	// Eager listener so chokidar's `ready` event is captured even if no
@@ -176,7 +176,7 @@ export function toVaultRelative(vaultRoot: VaultRoot, absPath: string): string |
 }
 
 /**
- * `ignored` callback. Filters: non-NFC paths, the vault-mcp index dir,
+ * `ignored` callback. Filters: non-NFC paths, the markdown-mcp index dir,
  * hidden paths (when `includeHidden` is off), and non-markdown files.
  * Directories are ALWAYS traversable — chokidar passes `stats?.isFile()`
  * so dir entries pass the markdown filter (they don't have an extension

@@ -3,10 +3,10 @@
  *
  * `isIndexCachePath` needs different comparison semantics per FS: on
  * case-insensitive filesystems (macOS APFS, Windows NTFS default),
- * `.Vault-MCP/...` aliases to the server's lowercase cache on disk and
+ * `.Markdown-MCP/...` aliases to the server's lowercase cache on disk and
  * must be folded to lowercase before comparing or a mixed-case input
  * would slip past the cache-dir gate and leak the SQLite cache. On
- * case-sensitive filesystems (Linux ext4 / btrfs default), `.Vault-MCP/`
+ * case-sensitive filesystems (Linux ext4 / btrfs default), `.Markdown-MCP/`
  * is a distinct inode and may be legitimate user content; byte-wise
  * compare preserves access.
  *
@@ -27,9 +27,10 @@ import { lstat, mkdir, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { getErrnoCode } from "./error.js";
+import { INDEX_DIR_NAME } from "./hiddenPath.js";
 
 export async function detectCaseInsensitiveFs(vaultRoot: string): Promise<boolean> {
-	const probeName = `.vault-mcp-case-probe-${randomBytes(8).toString("hex")}`;
+	const probeName = `${INDEX_DIR_NAME}-case-probe-${randomBytes(8).toString("hex")}`;
 	const lowerPath = join(vaultRoot, probeName);
 	const upperPath = join(vaultRoot, probeName.toUpperCase());
 	try {

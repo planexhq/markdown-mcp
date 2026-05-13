@@ -1,7 +1,7 @@
 /**
  * SIGTERM during `acquireServerLock`'s reconcile pass — between own-slot
  * creation and the function's return — must still release the lockfile.
- * Uses `VAULT_MCP_TEST_RECONCILE_DELAY_MS` to deterministically pause
+ * Uses `MARKDOWN_MCP_TEST_RECONCILE_DELAY_MS` to deterministically pause
  * inside the `onSlotCreated` callback (mirror of `STARTUP_DELAY_MS` for
  * the post-acquire window covered by `index.signalDuringStartup`).
  */

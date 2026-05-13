@@ -43,7 +43,7 @@ export const FAKE_VAULT_ROOT: VaultRoot = { absolute: "/nonexistent-vault-root-f
 export async function createTempVault(
 	structure: VaultStructure = {},
 ): Promise<{ path: string; cleanup: () => Promise<void> }> {
-	const root = await mkdtemp(join(tmpdir(), "vault-mcp-test-"));
+	const root = await mkdtemp(join(tmpdir(), "markdown-mcp-test-"));
 	await populate(root, structure);
 	return {
 		path: root,

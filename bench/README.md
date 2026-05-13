@@ -1,4 +1,4 @@
-# vault-mcp benchmarks
+# markdown-mcp benchmarks
 
 Three scripts that quantify the W3 + W4 performance budgets against synthetic vaults.
 

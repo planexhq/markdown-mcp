@@ -5,7 +5,7 @@
  * hoist closed the SIGTERM leak path; this test covers the parallel
  * thrown-error path.
  *
- * Uses the `VAULT_MCP_TEST_STARTUP_FAIL_AFTER_LOCK=1` env-var hook in
+ * Uses the `MARKDOWN_MCP_TEST_STARTUP_FAIL_AFTER_LOCK=1` env-var hook in
  * `src/index.ts` to deterministically throw immediately after the
  * lock + test-delay gate, before any other resources are populated.
  */
@@ -59,7 +59,7 @@ describe("startup throw after lock acquisition", () => {
 
 		const second = await spawnAndWaitForStderr(vault.path, {
 			extraArgs: ["--include-hidden"],
-			waitFor: "vault-mcp running on stdio",
+			waitFor: "markdown-mcp running on stdio",
 		});
 		try {
 			expect(second.child.pid).toBeDefined();

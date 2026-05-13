@@ -48,7 +48,7 @@ import type { ErrorCode as VaultErrorCode } from "./types.js";
  * Server name + version reported in the MCP `initialize` handshake.
  */
 const SERVER_INFO = {
-	name: "vault-mcp",
+	name: "markdown-mcp",
 	version: "1.0.0",
 } as const;
 
@@ -96,7 +96,7 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: 
 		if (typeof requested !== "string" || requested < MIN_PROTOCOL_VERSION) {
 			throw new McpError(
 				ErrorCode.InvalidRequest,
-				`vault-mcp requires MCP protocol version ${MIN_PROTOCOL_VERSION} or newer; client requested ${requested}.`,
+				`markdown-mcp requires MCP protocol version ${MIN_PROTOCOL_VERSION} or newer; client requested ${requested}.`,
 			);
 		}
 		// Per MCP spec: when the client requests a version the server does

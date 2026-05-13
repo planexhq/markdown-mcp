@@ -1,7 +1,7 @@
 /**
  * Integration test — medium tier (~5K files).
  *
- * Gated behind `VAULT_MCP_INTEGRATION=1` so default `npm test` stays
+ * Gated behind `MARKDOWN_MCP_INTEGRATION=1` so default `npm test` stays
  * under 10 min on commodity CI. Generation + indexing of 5K files
  * takes ~30s on a fast machine.
  *
@@ -14,7 +14,7 @@ import type { GetVaultTreeResult, SearchOutput } from "../../src/types.js";
 import { spawnTestServer, type TestClient, waitForWarm } from "../helpers/mcp-client.js";
 
 const FILES = 5_000;
-const SHOULD_RUN = process.env.VAULT_MCP_INTEGRATION === "1";
+const SHOULD_RUN = process.env.MARKDOWN_MCP_INTEGRATION === "1";
 
 let vault: { path: string; cleanup(): Promise<void>; files: number };
 let conn: TestClient;

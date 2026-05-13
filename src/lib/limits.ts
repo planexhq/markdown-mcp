@@ -1,5 +1,5 @@
 /**
- * Hard caps for vault-mcp inputs.
+ * Hard caps for markdown-mcp inputs.
  *
  * Centralized so consumers (validatePath in W1; parser, FTS, scanner in
  * W2+) all reference the same constants. Drift between callers is the
