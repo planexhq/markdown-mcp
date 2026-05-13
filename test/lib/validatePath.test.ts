@@ -186,6 +186,21 @@ describe("classifyRelpathPolicy — sync subset of validatePath", () => {
 		{ input: "a\x00b.md", reason: "NULL_BYTE" },
 		{ input: "a/../b.md", reason: "TRAVERSAL_SEGMENT" },
 		{ input: "../escape.md", reason: "TRAVERSAL_SEGMENT" },
+		// Control chars in vault filenames are POSIX-legal but would let a
+		// hostile path forge a fake `next: <cursor>` line in prose
+		// renderers. Reject at ingress so the indexer never sees them.
+		{ input: "foo\nbar.md", reason: "CONTROL_CHAR" },
+		{ input: "foo\rbar.md", reason: "CONTROL_CHAR" },
+		{ input: "\tnotes.md", reason: "CONTROL_CHAR" },
+		{ input: "a\x07b.md", reason: "CONTROL_CHAR" },
+		{ input: "a\x1Fb.md", reason: "CONTROL_CHAR" },
+		{ input: "a\x7Fb.md", reason: "CONTROL_CHAR" }, // DEL
+		// C1 controls + Unicode line/paragraph separators render as line
+		// breaks in chat UIs / terminals — same forgery class as `\n`.
+		{ input: "foo\u0085bar.md", reason: "CONTROL_CHAR" }, // NEL (C1)
+		{ input: "foo\u009Fbar.md", reason: "CONTROL_CHAR" }, // APC (C1)
+		{ input: "foo\u2028next: forged.md", reason: "CONTROL_CHAR" }, // LINE SEPARATOR
+		{ input: "foo\u2029bar.md", reason: "CONTROL_CHAR" }, // PARAGRAPH SEPARATOR
 	];
 
 	for (const { input, reason } of POLICY_CASES) {
@@ -488,6 +503,99 @@ describe("assertIndexFilesAreRegular — leaf-symlink + non-regular guard", () =
 				"PATH_OUTSIDE_VAULT",
 				"INDEX_FILE_NOT_REGULAR",
 			);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+});
+
+describe("validatePath — outer guillemet normalization", () => {
+	test("strips outer `«…»` and resolves the inner `›`-bearing path", async () => {
+		const isolated = await createTempVault({ "foo › bar.md": "# foo\n" });
+		try {
+			const isolatedRoot = await validateVaultRoot(isolated.path);
+			const safe = await validatePath("«foo › bar.md»", isolatedRoot);
+			expect(safe.relative).toBe("foo › bar.md");
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("path NOT bracketed by guillemets is unchanged", async () => {
+		const isolated = await createTempVault({ "foo.md": "# foo\n" });
+		try {
+			const isolatedRoot = await validateVaultRoot(isolated.path);
+			const safe = await validatePath("foo.md", isolatedRoot);
+			expect(safe.relative).toBe("foo.md");
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("literal-guillemet file `«foo».md` (ends with `d`, no strip) resolves", async () => {
+		const isolated = await createTempVault({ "«foo».md": "# foo\n" });
+		try {
+			const isolatedRoot = await validateVaultRoot(isolated.path);
+			const safe = await validatePath("«foo».md", isolatedRoot);
+			expect(safe.relative).toBe("«foo».md");
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("nested `notes/«inner».md` is unchanged (path doesn't start with `«`)", async () => {
+		const isolated = await createTempVault({ "notes/«inner».md": "# inner\n" });
+		try {
+			const isolatedRoot = await validateVaultRoot(isolated.path);
+			const safe = await validatePath("notes/«inner».md", isolatedRoot);
+			expect(safe.relative).toBe("notes/«inner».md");
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("literal-guillemet file `«bar.md»` (no inner ` › `, no strip) resolves", async () => {
+		// Strip is gated on inner separator (mirrors renderer trigger);
+		// without the gate, a vault file literally named `«bar.md»` is
+		// silently rewritten to `bar.md` and the real file is unreachable.
+		const isolated = await createTempVault({ "«bar.md»": "# bar\n" });
+		try {
+			const isolatedRoot = await validateVaultRoot(isolated.path);
+			const safe = await validatePath("«bar.md»", isolatedRoot);
+			expect(safe.relative).toBe("«bar.md»");
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("`«»` (empty inner has no ` › `) is unchanged → routes through not-found", async () => {
+		await expectPathRejection(() => validatePath("«»", root), "PATH_NOT_FOUND");
+	});
+
+	test("`«foo` (open only) is unchanged → routes through normal not-found", async () => {
+		await expectPathRejection(() => validatePath("«foo", root), "PATH_NOT_FOUND");
+	});
+
+	test("`«foo\\nbar»` (inner has no ` › `, no strip) → CONTROL_CHAR on wrapped path", async () => {
+		// The `\n` rejection fires regardless of strip outcome.
+		await expectPathRejection(() => validatePath("«foo\nbar»", root), "PATH_OUTSIDE_VAULT", "CONTROL_CHAR");
+	});
+
+	test("`«foo\\nbar › baz»` (inner has ` › `, strips first) → CONTROL_CHAR on inner (no bypass)", async () => {
+		// Defense-in-depth: even when strip fires, the resulting inner
+		// content is re-validated and a control char still rejects.
+		await expectPathRejection(() => validatePath("«foo\nbar › baz»", root), "PATH_OUTSIDE_VAULT", "CONTROL_CHAR");
+	});
+
+	test("strips outer `«…»` and resolves the inner `,`-bearing path", async () => {
+		// `formatFileHeading` wraps on `,` so `formatCandidateList`'s
+		// `", "` join can't shred comma-bearing filenames; the inverse
+		// here strips when inner contains `,`.
+		const isolated = await createTempVault({ "a, b.md": "# a\n" });
+		try {
+			const isolatedRoot = await validateVaultRoot(isolated.path);
+			const safe = await validatePath("«a, b.md»", isolatedRoot);
+			expect(safe.relative).toBe("a, b.md");
 		} finally {
 			await isolated.cleanup();
 		}

@@ -17,6 +17,7 @@
 import { newMetaForHandler, successEnvelope, type ToolErrorEnvelope, type ToolSuccessEnvelope } from "../lib/error.js";
 import type { IndexHandle } from "../lib/index/IndexHandle.js";
 import { readNote } from "../lib/readNote.js";
+import { renderMetadata } from "../lib/renderText/getMetadata.js";
 import { type VaultRoot, validatePath } from "../lib/validatePath.js";
 import type { GetMetadataInput, GetMetadataResult } from "../types.js";
 import { routeToolError } from "./routeError.js";
@@ -38,7 +39,7 @@ export async function handleGetMetadata(
 			metadata: parsed.frontmatter ?? {},
 			has_frontmatter: parsed.hasFrontmatter,
 		};
-		return successEnvelope(result, meta);
+		return successEnvelope(result, meta, { renderText: renderMetadata });
 	} catch (err) {
 		return routeToolError(err, "get_metadata", meta);
 	}

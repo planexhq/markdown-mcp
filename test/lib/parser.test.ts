@@ -12,7 +12,8 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { ParseError, parseFile } from "../../src/lib/parser.js";
+import { normalizeHeadingPath, ParseError, parseFile } from "../../src/lib/parser.js";
+import { formatHeadingPath } from "../../src/lib/renderText/_shared.js";
 
 const FIXTURES = fileURLToPath(new URL("../fixtures/vault/parser/", import.meta.url));
 
@@ -263,6 +264,307 @@ describe("parser — frontmatter", () => {
 		const fm = parsed.frontmatter as Record<string, unknown>;
 		expect(fm.a).toBe("foo");
 		expect(fm.b).toBe("foo");
+	});
+
+	// Non-JSON-native YAML values (Infinity, NaN, Set, Map) round-trip
+	// through `yaml.stringify` in the prose renderer but get coerced to
+	// `null` / `{}` by JSON.stringify at the MCP envelope layer. The
+	// parser normalizes them up front so both channels agree.
+	test("Infinity / -Infinity / NaN normalize to null (matches JSON wire)", () => {
+		const source = "---\npos: .inf\nneg: -.inf\nbad: .nan\n---\n# H\n";
+		const parsed = parseFile(source, "x.md");
+		const fm = parsed.frontmatter as Record<string, unknown>;
+		expect(fm.pos).toBeNull();
+		expect(fm.neg).toBeNull();
+		expect(fm.bad).toBeNull();
+	});
+
+	test("YAML negative zero normalizes to positive zero (matches JSON wire)", () => {
+		// `yaml.parse("x: -0")` produces JavaScript `-0`; `yaml.stringify`
+		// emits `x: -0` (sign preserved) while `JSON.stringify` emits `x: 0`
+		// (sign dropped per ECMA-262 SerializeJSONValue). Same channel-
+		// divergence class as Infinity/NaN above.
+		const source = "---\nx: -0\nnested:\n  y: -0\nlist: [-0, 1]\n---\n# H\n";
+		const parsed = parseFile(source, "x.md");
+		const fm = parsed.frontmatter as Record<string, unknown>;
+		expect(Object.is(fm.x, 0)).toBe(true);
+		expect(Object.is(fm.x, -0)).toBe(false);
+		expect(Object.is((fm.nested as Record<string, unknown>).y, 0)).toBe(true);
+		expect(Object.is((fm.list as number[])[0], 0)).toBe(true);
+	});
+
+	test("YAML !!set normalizes to array of members", () => {
+		const source = "---\nflags: !!set\n  ? alpha\n  ? beta\n---\n# H\n";
+		const parsed = parseFile(source, "x.md");
+		const fm = parsed.frontmatter as Record<string, unknown>;
+		expect(Array.isArray(fm.flags)).toBe(true);
+		expect((fm.flags as unknown[]).sort()).toEqual(["alpha", "beta"]);
+	});
+
+	test("YAML !!omap normalizes to plain object", () => {
+		// eemeli/yaml parses `!!omap` as a `Map` instance; left unnormalized,
+		// JSON.stringify reduces it to `{}` while yaml.stringify round-trips
+		// the entries — the channel divergence this fix exists to prevent.
+		const source = "---\nordered: !!omap\n  - one: 1\n  - two: 2\n---\n# H\n";
+		const parsed = parseFile(source, "x.md");
+		const fm = parsed.frontmatter as Record<string, unknown>;
+		expect(fm.ordered).toEqual({ one: 1, two: 2 });
+	});
+
+	test("nested Infinity inside arrays / objects also normalizes", () => {
+		const source = "---\nseries: [1, .inf, 3]\nrange:\n  max: .inf\n---\n# H\n";
+		const parsed = parseFile(source, "x.md");
+		const fm = parsed.frontmatter as Record<string, unknown>;
+		expect(fm.series).toEqual([1, null, 3]);
+		expect((fm.range as Record<string, unknown>).max).toBeNull();
+	});
+
+	test("__proto__ key stays an OWN property (no prototype pollution)", () => {
+		// `yaml.parse` returns `__proto__` as an own property safely; the bug
+		// is that the prior `normalizeForJson` rebuilt via `out["__proto__"]
+		// = X` on a plain `{}`, which triggers the legacy prototype setter
+		// → scanner reads inherited `fm.tags` while JSON.stringify shows no
+		// tags. Object.create(null) makes `__proto__` a normal own key.
+		// The `!!omap` is the trigger that forces normalizeForJson to fire.
+		const source = "---\n__proto__:\n  tags: [injected-tag]\nordered: !!omap\n  - foo: 1\n---\n# H\n";
+		const parsed = parseFile(source, "x.md");
+		const fm = parsed.frontmatter as Record<string, unknown>;
+		expect(Object.hasOwn(fm, "__proto__")).toBe(true);
+		expect(fm.tags).toBeUndefined(); // no inheritance via prototype chain
+		// JSON wire matches what the prose channel shows — frontmatter has
+		// a literal `__proto__` key with the nested object, no inherited tags
+		expect(JSON.stringify(fm)).toContain('"__proto__":{"tags":["injected-tag"]}');
+	});
+
+	test("cyclic !!set → ParseError reason='syntax' (not RangeError)", () => {
+		// `yaml.parse` admits `a: &a !!set\n  ? *a` as a Set containing
+		// itself. JSON.stringify can't catch the cycle (Set serializes as
+		// `{}`), so without WeakSet tracking the recursive normalize loops
+		// to RangeError → INTERNAL_ERROR + pendingRetry wedge. We expect
+		// the same MARKDOWN_PARSE_ERROR routing as the existing
+		// plain-object cycle case above.
+		const source = "---\na: &a !!set\n  ? *a\n---\n# H\n";
+		expect(() => parseFile(source, "x.md")).toThrow(ParseError);
+		expect(() => parseFile(source, "x.md")).toThrow(/cyclic/i);
+	});
+
+	test("cyclic !!omap → ParseError reason='syntax'", () => {
+		// Symmetric to the !!set case; eemeli/yaml parses `!!omap` as Map
+		// instance which also serializes as `{}` and would slip past the
+		// JSON.stringify probe.
+		const source = "---\na: &a !!omap\n  - self: *a\n---\n# H\n";
+		expect(() => parseFile(source, "x.md")).toThrow(ParseError);
+		expect(() => parseFile(source, "x.md")).toThrow(/cyclic/i);
+	});
+
+	test("!!omap with self-aliasing key → ParseError (key-side cycle)", () => {
+		// `a: &a !!omap\n  - ? *a\n    : v` parses to a Map whose entry's
+		// KEY is the outer Map itself. `String(theMap)` reduces it to the
+		// bogus literal `"[object Map]"`, so the value-side `seen` check
+		// never sees the cycle. The Map-branch pre-empt catches it before
+		// the coercion.
+		const source = "---\na: &a !!omap\n  - ? *a\n    : v\n---\n# H\n";
+		expect(() => parseFile(source, "x.md")).toThrow(ParseError);
+		expect(() => parseFile(source, "x.md")).toThrow(/cyclic/i);
+	});
+
+	test("!!omap with non-stringifiable mapping key → ParseError (not TypeError leak)", () => {
+		// eemeli/yaml parses `!!omap` with a complex key as `Map(1) { {…} =>
+		// value }`; `normalizeForJson`'s `String(k)` then runs `ToPrimitive`
+		// on the key object — non-callable `toString` + default `valueOf`
+		// throws `TypeError: Cannot convert object to primitive value`. The
+		// `JSON.stringify` probe earlier in the stage doesn't catch it
+		// (Map serializes to `{}` without visiting entries).
+		const source = "---\nordered: !!omap\n  - ? { toString: 1 }\n    : value\n---\n# H\n";
+		expect(() => parseFile(source, "x.md")).toThrow(ParseError);
+		try {
+			parseFile(source, "x.md");
+		} catch (e) {
+			if (e instanceof ParseError) {
+				expect(e.reason).toBe("syntax");
+				expect(e.message).toMatch(/normalization failed/);
+			}
+		}
+	});
+
+	test("YAML alias to shared sub-object (DAG, not cycle) parses cleanly", () => {
+		// Aliases that reference the same sub-object from two parents are a
+		// DAG, not a cycle. A seen-set without remove-on-exit would
+		// false-positive on the second visit and throw. The normalizeForJson
+		// gray-set must delete on exit so DAGs round-trip while genuine
+		// self-reference still trips during nested recursion.
+		const source = "---\nshared: &s\n  x: 1\na: *s\nb: *s\n---\n# H\n";
+		expect(() => parseFile(source, "x.md")).not.toThrow();
+		const parsed = parseFile(source, "x.md");
+		const fm = parsed.frontmatter as Record<string, unknown>;
+		expect((fm.a as Record<string, unknown>).x).toBe(1);
+		expect((fm.b as Record<string, unknown>).x).toBe(1);
+	});
+
+	test("!!timestamp preserves Date (not {} via empty Object.keys)", () => {
+		// `Object.keys(new Date())` is `[]`, so the generic-object branch in
+		// normalizeForJson would rebuild Date as `{}` and the scanner's
+		// `normalizeDateValue(v instanceof Date)` check would miss → null
+		// `frontmatter.created` column + `fields_json.created: {}`.
+		const source = "---\ncreated: !!timestamp 2024-01-01T00:00:00Z\n---\n# H\n";
+		const parsed = parseFile(source, "x.md");
+		const fm = parsed.frontmatter as Record<string, unknown>;
+		expect(fm.created).toBeInstanceOf(Date);
+		expect(Number.isNaN((fm.created as Date).getTime())).toBe(false);
+		// JSON wire uses Date.prototype.toJSON → ISO string
+		expect(JSON.stringify(fm)).toContain('"created":"2024-01-01T00:00:00.000Z"');
+	});
+
+	test("!!binary canonicalizes to base64 string (not numeric-keyed object)", () => {
+		// yaml.parse returns a Buffer (Uint8Array) for `!!binary`. The
+		// generic-object branch would emit `{"0":72,"1":101,...}` via numeric
+		// keys. Canonicalizing to base64 keeps both JSON and yamlStringify
+		// channels readable AND lets the agent round-trip via
+		// `Buffer.from(value, "base64")`.
+		const source = "---\nblob: !!binary SGVsbG8=\n---\n# H\n";
+		const parsed = parseFile(source, "x.md");
+		const fm = parsed.frontmatter as Record<string, unknown>;
+		expect(fm.blob).toBe("SGVsbG8=");
+		expect(Buffer.from(fm.blob as string, "base64").toString("utf8")).toBe("Hello");
+	});
+});
+
+describe("parser — normalizeHeadingPath", () => {
+	test("array form passes through with NFC + trim + whitespace-collapse", () => {
+		expect(normalizeHeadingPath(["  Auth  ", "OAuth2  "])).toEqual(["Auth", "OAuth2"]);
+	});
+
+	test("string form splits on ASCII `>`", () => {
+		expect(normalizeHeadingPath("Auth > OAuth2")).toEqual(["Auth", "OAuth2"]);
+	});
+
+	test("string form ALSO splits on `›` (renderer display separator)", () => {
+		// Every prose renderer emits `Auth › OAuth2`. An agent copying that
+		// verbatim into a follow-up call must round-trip without manual ASCII
+		// conversion; outgoing links carry no `stable_id` fallback so a miss
+		// here is a permanent dead-end.
+		expect(normalizeHeadingPath("Auth › OAuth2")).toEqual(["Auth", "OAuth2"]);
+	});
+
+	test("string form tolerates mixed separators", () => {
+		expect(normalizeHeadingPath("A › B > C")).toEqual(["A", "B", "C"]);
+	});
+
+	test("empty segments are dropped", () => {
+		expect(normalizeHeadingPath("A > > B")).toEqual(["A", "B"]);
+		expect(normalizeHeadingPath([" ", "A", ""])).toEqual(["A"]);
+	});
+
+	test("bare `›` inside heading text stays a single segment (no false split)", () => {
+		// Renderer emits ` › ` with adjacent whitespace
+		// (`controlChars.ts:HEADING_PATH_SEP`); a heading `# A›B` indexes as
+		// `headingPath: ["A›B"]`. String-form lookup must round-trip
+		// without conflating the in-text `›`/`>` with a separator.
+		expect(normalizeHeadingPath("A›B")).toEqual(["A›B"]);
+		expect(normalizeHeadingPath("A>B")).toEqual(["A>B"]);
+	});
+
+	test("backslash-escaped separators do NOT split", () => {
+		// Renderer escapes `\s[›>]\s` → `\s\\[›>]\s` so a heading whose own
+		// text literally contains `" › "` survives the round-trip through
+		// the prose channel. Negative lookbehind on `\\` keeps the splitter
+		// from firing; per-segment unescape strips the backslash.
+		expect(normalizeHeadingPath("Cost \\› Benefit")).toEqual(["Cost › Benefit"]);
+		expect(normalizeHeadingPath("A \\> B")).toEqual(["A > B"]);
+		// Mixed: escaped separator in one segment, real separator joining
+		// to the next. The real separator splits; the escaped one survives.
+		expect(normalizeHeadingPath("Cost \\› Benefit › Outer")).toEqual(["Cost › Benefit", "Outer"]);
+	});
+
+	test("doubled backslash preserves literal `\\›` / `\\>`", () => {
+		// Negative lookbehind on `(?<!\\)\\([›>])` skips the `\›` inside
+		// `\\›`; the trailing `\\` → `\` step restores the literal.
+		expect(normalizeHeadingPath("Cost \\\\› Benefit")).toEqual(["Cost \\› Benefit"]);
+		expect(normalizeHeadingPath("Regex \\\\> Quantifier")).toEqual(["Regex \\> Quantifier"]);
+		expect(normalizeHeadingPath("A\\\\B")).toEqual(["A\\B"]);
+		expect(normalizeHeadingPath("C:\\\\Users\\\\Bob")).toEqual(["C:\\Users\\Bob"]);
+	});
+
+	test("render → parse round-trip preserves the original path", () => {
+		// End-to-end contract: the rendered string from `formatHeadingPath`
+		// must parse back through `normalizeHeadingPath` to the original
+		// array. Outgoing-link targets rely on this — no `target_stable_id`
+		// channel, so the rendered string IS the addressing.
+		const cases: string[][] = [
+			["Auth", "OAuth2"],
+			["Cost › Benefit"],
+			["A > B", "Section"],
+			["Outer", "Cost › Benefit", "Trailing"],
+			["A›B"],
+			["A\\B"],
+			["C:\\Users\\Bob"],
+			["Regex \\> Quantifier"],
+			["Cost \\› Benefit"],
+			["Outer", "Regex \\> Inner", "Tail"],
+			// Separators at segment start/end need anchor-aware escape too.
+			["> operator"],
+			["Cost ›"],
+			[">"],
+			["Parent", "> operator", "Child"],
+			["Cost ›", "Outer"],
+			// Adjacent spaced separators inside a single segment must each
+			// escape independently — a consuming `(^|\s)...(\s|$)` regex
+			// would eat the shared trailing space and miss the second `>`.
+			["A > > B"],
+			["A › › B"],
+			["Parent", "A > > B", "Child"],
+			["› inner › end"],
+		];
+		for (const path of cases) {
+			expect(normalizeHeadingPath(formatHeadingPath(path))).toEqual(path);
+		}
+	});
+
+	test("literal backslash before prose-escaped control char round-trips", () => {
+		// `escapeBackslashes` doubles a literal `\` to `\\`, then
+		// `sanitizePathForProse` may inject `\xHH` immediately after —
+		// yielding `\\\xHH` on the wire. Single-pass `String.prototype.
+		// replace` consumes `\\` first (leftmost alternative wins) and
+		// advances past it before scanning for the next escape; a
+		// pass-pair with single-char negative lookbehind can't tell the
+		// trailing half of `\\` from the leading `\` of a `\xHH`.
+
+		// Hand-constructed encoded forms (lock the wire contract bidirectionally).
+		expect(normalizeHeadingPath("A\\\\\\x85B")).toEqual(["A\\\u0085B"]); // literal `\` + NEL
+		expect(normalizeHeadingPath("A\\\\\\u2028B")).toEqual(["A\\ B"]); // literal `\` + LS (collapses via normalizeHeadingText)
+		expect(normalizeHeadingPath("A\\\\\\nB")).toEqual(["A\\ B"]); // literal `\` + LF (collapses)
+
+		// Render → parse round-trip for the same heading shapes.
+		expect(normalizeHeadingPath(formatHeadingPath(["A\\\u0085B"]))).toEqual(["A\\\u0085B"]);
+	});
+
+	test("decodes renderer prose escapes (round-trip from formatHeadingPath)", () => {
+		// `sanitizePathForProse` emits `\n`/`\r`/`\t`/`\xHH`/`\uHHHH` for
+		// control chars; without the decoder pass, copying a rendered path
+		// back into `heading_path` searches for the literal escape text
+		// (e.g. 4-char `\x85`) instead of the underlying control codepoint.
+		// `normalizeHeadingText` collapses U+2028/U+2029 + JS-`\s` controls
+		// to a single space; NEL (U+0085) is Cc not in `\s` so it survives,
+		// matching array-form input behavior.
+		expect(normalizeHeadingPath("H\\x85forged")).toEqual(["H\u0085forged"]);
+		expect(normalizeHeadingPath("A\\u2028B")).toEqual(["A B"]);
+		expect(normalizeHeadingPath("A\\tB")).toEqual(["A B"]);
+		expect(normalizeHeadingPath("X\\nY")).toEqual(["X Y"]);
+		// `sanitizePathForProse` emits lowercase hex (`toString(16)` default);
+		// the decoder is deliberately wider so an agent hand-constructing
+		// `heading_path` with uppercase still round-trips.
+		expect(normalizeHeadingPath("A\\xC2\\u2028B")).toEqual(["A\u00C2 B"]);
+		// Literal `\` + escape-shaped text in heading: parser must NOT decode
+		// (the `\\` survives separator/prose decode, then unescapes to `\`).
+		expect(normalizeHeadingPath("A\\\\x85B")).toEqual(["A\\x85B"]);
+		expect(normalizeHeadingPath("A\\\\nB")).toEqual(["A\\nB"]);
+		expect(normalizeHeadingPath("A\\\\u2028B")).toEqual(["A\\u2028B"]);
+		// Render → parse round-trip for control-char headings. NEL preserves
+		// (not whitespace); TAB/LF/LS collapse via `normalizeHeadingText`.
+		expect(normalizeHeadingPath(formatHeadingPath(["H\u0085forged"]))).toEqual(["H\u0085forged"]);
+		expect(normalizeHeadingPath(formatHeadingPath(["A\tB", "C"]))).toEqual(["A B", "C"]);
+		expect(normalizeHeadingPath(formatHeadingPath(["A\u2028B"]))).toEqual(["A B"]);
+		expect(normalizeHeadingPath(formatHeadingPath(["A\nB"]))).toEqual(["A B"]);
 	});
 });
 

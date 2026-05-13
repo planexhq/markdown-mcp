@@ -473,7 +473,9 @@ async function cleanupLegacyEntry(
 		// `unlink` doesn't follow symlinks, but we still refuse to remove
 		// non-regular legacy entries — they could be user-managed pointers
 		// the operator deliberately placed.
-		console.error(`markdown-mcp serverLock: leaving non-regular legacy entry at ${legacyPath} (${kindOf(probe.stats)})`);
+		console.error(
+			`markdown-mcp serverLock: leaving non-regular legacy entry at ${legacyPath} (${kindOf(probe.stats)})`,
+		);
 		return;
 	}
 
@@ -526,7 +528,9 @@ async function inspectForeignSlot(
 		// Foreign non-regular entries we don't touch; the own-PID slot is
 		// the only one we hard-refuse on. A hostile vault planting weird
 		// names at random PID slots doesn't compromise our own slot.
-		console.error(`markdown-mcp serverLock: ignoring non-regular foreign entry at ${otherPath} (${kindOf(probe.stats)})`);
+		console.error(
+			`markdown-mcp serverLock: ignoring non-regular foreign entry at ${otherPath} (${kindOf(probe.stats)})`,
+		);
 		return;
 	}
 	const otherMtimeMs = probe.stats.mtimeMs;

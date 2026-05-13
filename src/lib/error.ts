@@ -239,21 +239,32 @@ export interface ToolSuccessEnvelope<T> {
 }
 
 /**
- * Wrap a typed payload + meta envelope as a successful tool result. The
- * `content[0].text` mirrors `structuredContent` as JSON for clients that
- * don't read structured content. Optional `extraBlocks` are appended
- * after the JSON block — used by `get_vault_tree` to emit
- * `resource_link` blocks for markdown items.
+ * Wrap a typed payload + meta envelope as a successful tool result.
+ *
+ * `content[0].text` carries an LLM-readable prose rendering of the
+ * payload when `options.renderText` is supplied; without it, the legacy
+ * `JSON.stringify` form is emitted as a safe fallback so any tool that
+ * forgets to pass one stays well-formed. `structuredContent` is the
+ * canonical machine-readable channel and is always populated verbatim
+ * — clients with `structuredContent` support should prefer it; the
+ * prose channel exists to cut tokens for LLM consumers (Claude Code,
+ * Codex) that read `content[0].text` directly.
+ *
+ * `options.extraBlocks` are appended after the text block — used by
+ * `get_vault_tree` to emit `resource_link` blocks for markdown items.
  */
 export function successEnvelope<T extends object>(
 	structuredContent: T,
 	meta: MetaEnvelope,
-	extraBlocks?: ReadonlyArray<ExtraContentBlock>,
+	options?: {
+		renderText?: (sc: T, meta: MetaEnvelope) => string;
+		extraBlocks?: ReadonlyArray<ExtraContentBlock>;
+	},
 ): ToolSuccessEnvelope<T> {
-	const content: ToolSuccessEnvelope<T>["content"] = [
-		{ type: "text", text: JSON.stringify(structuredContent, null, 2) },
-		...(extraBlocks ?? []),
-	];
+	const text = options?.renderText
+		? options.renderText(structuredContent, meta)
+		: JSON.stringify(structuredContent, null, 2);
+	const content: ToolSuccessEnvelope<T>["content"] = [{ type: "text", text }, ...(options?.extraBlocks ?? [])];
 	return {
 		content,
 		structuredContent: structuredContent as T & Record<string, unknown>,

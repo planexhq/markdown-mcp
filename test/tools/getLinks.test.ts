@@ -168,6 +168,14 @@ const LINKS_FIXTURE: VaultStructure = {
 	// `../target` so the SQL prefilter matches.
 	"redundant-dot-target.md": "# Redundant Dot Target\n",
 	"redundant-dot-rel/source.md": "# Caller\n\n[[./../redundant-dot-target]]\n",
+	// Mid-incoming continuation: 2 incoming + 1 outgoing. `pageSize:1`
+	// returns the first incoming with a `{phase:"in"}` cursor — the
+	// outgoing phase has NOT been visited yet, so `finalize` must omit
+	// `outgoing` (not advertise `outgoing:[]` to clients that stop on
+	// empty pages).
+	"mid-in-target.md": "# MIT\n\n[[A]]\n",
+	"mid-in-source-a.md": "# MITa\n\n[[mid-in-target]]\n",
+	"mid-in-source-b.md": "# MITb\n\n[[mid-in-target]]\n",
 };
 
 let vault: { path: string; cleanup: () => Promise<void> };
@@ -435,8 +443,11 @@ describe("get_links — narrowing", () => {
 			heading_path: ["DoesNotExist"],
 			direction: "both",
 		});
-		expect(out.outgoing).toBeUndefined();
-		expect(out.incoming).toBeUndefined();
+		// Requested-direction signal is preserved: `direction: "both"` with
+		// no results yields empty arrays for both, distinguishable from a
+		// one-direction request where the unrequested side stays undefined.
+		expect(out.outgoing).toEqual([]);
+		expect(out.incoming).toEqual([]);
 		expect(out.resolved_anchor).toBeUndefined();
 	});
 
@@ -836,11 +847,15 @@ describe("get_links — outgoing probe before sentinel cursor", () => {
 	test("file with incoming + outgoing at exact boundary still emits cursor", async () => {
 		// Brief contract: incoming exhausts first. Page 1 = 1 incoming
 		// (filled exact), boundary probe sees outgoing has rows → emits
-		// OUT_PHASE_START sentinel. Page 2 = 1 outgoing.
+		// OUT_PHASE_START sentinel. Page 2 = 1 outgoing. The unvisited
+		// outgoing phase must NOT advertise `outgoing: []` on page 1 —
+		// that would let a client treat outgoing as exhausted before
+		// following the cursor.
 		const page1 = await callLinks({ file: "single-each.md", direction: "both", pageSize: 1 });
 		expect(page1.incoming?.length).toBe(1);
 		expect((page1.incoming ?? []).map((i) => i.source_file)).toContain("single-each-caller.md");
 		expect(page1.nextCursor).toBeDefined();
+		expect(page1.outgoing).toBeUndefined();
 		const page2 = await callLinks({
 			file: "single-each.md",
 			direction: "both",
@@ -848,6 +863,49 @@ describe("get_links — outgoing probe before sentinel cursor", () => {
 			cursor: page1.nextCursor,
 		});
 		expect(page2.outgoing?.length).toBe(1);
+	});
+
+	test("mid-incoming continuation cursor also omits unvisited outgoing", async () => {
+		// 2 incoming + 1 outgoing, pageSize:1. Page 1 returns the first
+		// incoming row + `{phase:"in", ...}` cursor (more incoming to
+		// come); outgoing has NOT been visited yet. The previous gate
+		// (which only fired for `phase:"out"`) would set `outgoing:[]`
+		// here and let a client treat outgoing as exhausted before the
+		// continuation cursor reaches the outgoing phase.
+		const page1 = await callLinks({ file: "mid-in-target.md", direction: "both", pageSize: 1 });
+		expect(page1.incoming?.length).toBe(1);
+		expect(page1.nextCursor).toBeDefined();
+		expect(page1.outgoing).toBeUndefined();
+
+		// Page 2 may emit the second incoming + cursor or the outgoing
+		// depending on the keyset boundary; only invariant is that all
+		// three rows surface across the pagination chain (2 incoming +
+		// 1 outgoing) without phantom `outgoing:[]` advertisements on
+		// any unvisited-outgoing page.
+		const seenIncoming = new Set<string>(page1.incoming?.map((i) => i.source_file) ?? []);
+		let seenOutgoing = 0;
+		let cursor = page1.nextCursor;
+		let pages = 1;
+		while (cursor && pages++ < 10) {
+			const out: GetLinksResult = await callLinks({
+				file: "mid-in-target.md",
+				direction: "both",
+				pageSize: 1,
+				cursor,
+			});
+			for (const row of out.incoming ?? []) seenIncoming.add(row.source_file);
+			for (const _ of out.outgoing ?? []) seenOutgoing++;
+			// Every unvisited-outgoing page must omit `outgoing`. The only
+			// page allowed to set `outgoing: []` is after outgoing has run
+			// and emitted nothing — which doesn't happen for this fixture
+			// (1 outgoing row exists).
+			if (out.outgoing !== undefined && out.outgoing.length === 0) {
+				throw new Error("outgoing: [] advertised before outgoing phase reached");
+			}
+			cursor = out.nextCursor;
+		}
+		expect([...seenIncoming].sort()).toEqual(["mid-in-source-a.md", "mid-in-source-b.md"]);
+		expect(seenOutgoing).toBe(1);
 	});
 });
 

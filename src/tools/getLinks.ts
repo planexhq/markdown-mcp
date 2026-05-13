@@ -43,6 +43,7 @@ import { isIndexWarming } from "../lib/index_status.js";
 import { clampPageSize, MAX_PAGE_SIZE, MAX_PATH_DEPTH } from "../lib/limits.js";
 import { type HeadingMeta, headingPathsEqual, normalizeHeadingPath, type ParsedFile } from "../lib/parser.js";
 import { assertNotePathPolicy, readNote } from "../lib/readNote.js";
+import { renderLinks } from "../lib/renderText/getLinks.js";
 import { type VaultRoot, validatePath } from "../lib/validatePath.js";
 import { getVaultExtensions } from "../lib/vaultExtensions.js";
 import { resolveWikilink, stripMarkdownExt, type VaultFileIndex } from "../lib/wikilinks.js";
@@ -231,7 +232,7 @@ export async function handleGetLinks(
 				// the last scanned key so the client resumes scanning past
 				// the false-positive cluster.
 				const more = { phase: "in" as const, key: lastScannedKey };
-				return finalize(result, outRows, inRows, responseMeta, more, requestHash, snapshotMtime);
+				return finalize(result, outRows, inRows, responseMeta, more, requestHash, snapshotMtime, wantOut, wantIn);
 			}
 			// `direction: "both"` exact-page boundary: incoming filled the
 			// page with no more in-phase rows. The wantOut gate below would
@@ -247,10 +248,10 @@ export async function handleGetLinks(
 					pageSize: 1,
 				});
 				if (probeRows.length === 0) {
-					return finalize(result, outRows, inRows, responseMeta, null, requestHash, snapshotMtime);
+					return finalize(result, outRows, inRows, responseMeta, null, requestHash, snapshotMtime, wantOut, wantIn);
 				}
 				const sentinel = { phase: "out" as const, key: OUT_PHASE_START };
-				return finalize(result, outRows, inRows, responseMeta, sentinel, requestHash, snapshotMtime);
+				return finalize(result, outRows, inRows, responseMeta, sentinel, requestHash, snapshotMtime, wantOut, wantIn);
 			}
 		}
 
@@ -272,11 +273,21 @@ export async function handleGetLinks(
 				lastEmitted = { phase: "out", key: rowToKey(row) };
 			}
 			if (rows.length > pageRemaining && taken.length === pageRemaining) {
-				return finalize(result, outRows, inRows, responseMeta, lastEmitted, requestHash, snapshotMtime);
+				return finalize(
+					result,
+					outRows,
+					inRows,
+					responseMeta,
+					lastEmitted,
+					requestHash,
+					snapshotMtime,
+					wantOut,
+					wantIn,
+				);
 			}
 		}
 
-		return finalize(result, outRows, inRows, responseMeta, null, requestHash, snapshotMtime);
+		return finalize(result, outRows, inRows, responseMeta, null, requestHash, snapshotMtime, wantOut, wantIn);
 	} catch (err) {
 		return routeToolError(err, "get_links", meta);
 	}
@@ -290,9 +301,21 @@ function finalize(
 	moreFromKey: { phase: "out" | "in"; key: LinksKeysetKey } | null,
 	requestHash: string,
 	snapshotMtime: number,
+	wantOut: boolean,
+	wantIn: boolean,
 ): ToolSuccessEnvelope<GetLinksResult> {
-	if (outgoing.length > 0) result.outgoing = outgoing;
-	if (incoming.length > 0) result.incoming = incoming;
+	// Preserve the direction signal: a requested direction surfaces as an
+	// array (possibly empty) so callers can distinguish "no results" from
+	// "direction not queried". Omit `outgoing` only when it was requested
+	// but the outgoing phase has not been visited and the page emits a
+	// continuation cursor (incoming early-return OR boundary probe sentinel
+	// — both share `outgoing.length === 0 && moreFromKey !== null`).
+	// Setting `outgoing: []` here would let a client treat outgoing as
+	// exhausted before the cursor reaches it. When `moreFromKey === null`,
+	// outgoing was genuinely visited and any empty array is the truth.
+	const outgoingUnvisited = wantOut && outgoing.length === 0 && moreFromKey !== null;
+	if (wantOut && !outgoingUnvisited) result.outgoing = outgoing;
+	if (wantIn) result.incoming = incoming;
 	if (moreFromKey) {
 		const env: CursorEnvelope = {
 			v: 1,
@@ -303,7 +326,7 @@ function finalize(
 		};
 		result.nextCursor = encodeCursor(env);
 	}
-	return successEnvelope(result, meta);
+	return successEnvelope(result, meta, { renderText: renderLinks });
 }
 
 interface NarrowError {

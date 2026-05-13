@@ -36,6 +36,7 @@ import {
 	type ParsedFile,
 } from "../lib/parser.js";
 import { readNote } from "../lib/readNote.js";
+import { renderFragment } from "../lib/renderText/getFragment.js";
 import { estimateTokens, getTokenizerId } from "../lib/tokenizer.js";
 import { type VaultRoot, validatePath } from "../lib/validatePath.js";
 import {
@@ -101,7 +102,7 @@ export async function handleGetFragment(
 			if (heading) {
 				const fragment = buildHeadingFragment(heading, parsed, "fresh", vaultIndex);
 				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
-				return successEnvelope(fragment, meta);
+				return successEnvelope(fragment, meta, { renderText: renderFragment });
 			}
 			const history = index?.getHistoryRow(safePath.relative, normalized) ?? null;
 			if (history !== null) {
@@ -134,7 +135,7 @@ export async function handleGetFragment(
 			case "file": {
 				const fragment = buildFileFragment(parsed, vaultIndex);
 				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
-				return successEnvelope(fragment, meta);
+				return successEnvelope(fragment, meta, { renderText: renderFragment });
 			}
 
 			case "heading_path": {
@@ -142,7 +143,7 @@ export async function handleGetFragment(
 				if (path.length === 0) {
 					const fragment = buildPreambleFragment(parsed, vaultIndex);
 					await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
-					return successEnvelope(fragment, meta);
+					return successEnvelope(fragment, meta, { renderText: renderFragment });
 				}
 				const matches = parsed.headings.filter((h) => headingPathsEqual(h.headingPath, path));
 				if (matches.length === 0) {
@@ -181,11 +182,15 @@ export async function handleGetFragment(
 				}
 				const fragment = buildHeadingFragment(heading, parsed, "fresh", vaultIndex);
 				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
-				return successEnvelope(fragment, meta);
+				return successEnvelope(fragment, meta, { renderText: renderFragment });
 			}
 
 			case "block": {
-				const blockId = input.anchor.id;
+				// Tolerate leading `^`: the outline renderer emits `^abc` for
+				// blocks (matching Obsidian's wikilink fragment convention
+				// `[[file#^abc]]`); the canonical stored id is bare so an agent
+				// copying the rendered form must round-trip.
+				const blockId = input.anchor.id.startsWith("^") ? input.anchor.id.slice(1) : input.anchor.id;
 				const block = parsed.blocks.find((b) => b.id === blockId);
 				if (!block) {
 					return headingNotFoundEnvelope(
@@ -201,7 +206,7 @@ export async function handleGetFragment(
 				}
 				const fragment = buildBlockFragment(block, parsed, vaultIndex);
 				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
-				return successEnvelope(fragment, meta);
+				return successEnvelope(fragment, meta, { renderText: renderFragment });
 			}
 		}
 	} catch (err) {
@@ -247,7 +252,7 @@ async function resolveStaleStableId(
 		fragment.requested_stable_id = requestedStableId;
 		if (candidates.length > 0) fragment.fuzzy_candidates = candidates;
 		await maybeExpandEmbeds(fragment, expandEmbedsOpt, vaultRoot, vaultIndex, includeHidden);
-		return successEnvelope(fragment, fuzzyMeta);
+		return successEnvelope(fragment, fuzzyMeta, { renderText: renderFragment });
 	}
 	return headingNotFoundEnvelope(
 		{

@@ -31,6 +31,7 @@ import { constants as fsConstants, type Stats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize, relative, sep } from "node:path";
 import type { PathRejectionReason, SafePath, VaultError } from "../types.js";
+import { CANDIDATE_LIST_SEP, CONTROL_CHAR_CLASS_TAIL, HEADING_PATH_SEP } from "./controlChars.js";
 import { errorMessage, getErrnoCode, isVanishedErrno, vaultError } from "./error.js";
 import { isNonNfc } from "./hiddenPath.js";
 import { indexCacheFiles } from "./index/sqlite.js";
@@ -65,6 +66,26 @@ export class PathValidationError extends Error {
  */
 const PERCENT_ENCODED_RE = /%[0-9a-fA-F]{2}/;
 const BACKSLASH_RE = /\\/;
+// Inverse of `formatFileHeading`'s `«…»` wrap (`renderText/_shared.ts`).
+// The wrap fires when output contains ` › ` (heading-path fence) or
+// `, ` (candidate-list fence); mirror both triggers here so a vault
+// file literally named `«foo.md»` (no inner separator) isn't rewritten
+// to `foo.md` before validation. Inner content still flows through the
+// regular pipeline below so `«foo\nbar»` is rejected by `CONTROL_CHAR`.
+function stripOuterGuillemets(input: string): string {
+	if (input.length < 2 || !input.startsWith("«") || !input.endsWith("»")) return input;
+	const inner = input.slice(1, -1);
+	return inner.includes(HEADING_PATH_SEP) || inner.includes(CANDIDATE_LIST_SEP) ? inner : input;
+}
+// C0 controls minus NUL (NUL has its own rejection above) plus the
+// class tail (DEL + C1 + U+2028 / U+2029) shared with the prose-side
+// `PROSE_CONTROL_RE_*` in `renderText/_shared.ts`. POSIX admits these
+// in filenames but they break prose-channel rendering: a `\n` in
+// `${row.file}` forges a fake `next: <cursor>` line that an LLM client
+// can mistake for a server pagination cursor. U+2028 / U+2029 are
+// visually rendered as line breaks in many chat UIs and terminals —
+// same forgery class as a literal `\n`.
+const CONTROL_CHAR_RE = new RegExp(`[\\x01-\\x1F${CONTROL_CHAR_CLASS_TAIL}]`);
 const PARENT_REL_PREFIX = `..${sep}`;
 
 /**
@@ -224,6 +245,7 @@ export type SyncPathRejection =
 	| "EMPTY_PATH"
 	| "PATH_TOO_LONG"
 	| "NULL_BYTE"
+	| "CONTROL_CHAR"
 	| "PERCENT_ENCODED"
 	| "BACKSLASH"
 	| "ABSOLUTE_PATH"
@@ -247,6 +269,7 @@ export function classifyRelpathPolicy(input: string): SyncPathRejection | null {
 	if (input === "") return "EMPTY_PATH";
 	if (input.length > MAX_PATH_LENGTH) return "PATH_TOO_LONG";
 	if (input.includes("\x00")) return "NULL_BYTE";
+	if (CONTROL_CHAR_RE.test(input)) return "CONTROL_CHAR";
 	if (PERCENT_ENCODED_RE.test(input)) return "PERCENT_ENCODED";
 	if (BACKSLASH_RE.test(input)) return "BACKSLASH";
 	if (isAbsolute(input)) return "ABSOLUTE_PATH";
@@ -266,6 +289,7 @@ const POLICY_REJECTION_MESSAGES: Record<SyncPathRejection, string> = {
 	EMPTY_PATH: "Path is empty.",
 	PATH_TOO_LONG: `Path exceeds ${MAX_PATH_LENGTH} characters.`,
 	NULL_BYTE: "Path contains NUL byte.",
+	CONTROL_CHAR: "Path contains a control character (newline, tab, DEL, etc.); use printable characters only.",
 	PERCENT_ENCODED: "Path contains percent-encoded octet; pass paths in their decoded form.",
 	BACKSLASH: "Path contains backslash; use forward slashes.",
 	ABSOLUTE_PATH: "Path is absolute; pass vault-relative paths.",
@@ -282,7 +306,8 @@ const POLICY_REJECTION_MESSAGES: Record<SyncPathRejection, string> = {
  * {@link validateVaultRoot}).
  */
 export async function validatePath(input: string, vaultRoot: VaultRoot): Promise<SafePath> {
-	const policyReason = classifyRelpathPolicy(input);
+	const stripped = stripOuterGuillemets(input);
+	const policyReason = classifyRelpathPolicy(stripped);
 	if (policyReason !== null) {
 		throw new PathValidationError(
 			vaultError("PATH_OUTSIDE_VAULT", POLICY_REJECTION_MESSAGES[policyReason], {
@@ -296,7 +321,7 @@ export async function validatePath(input: string, vaultRoot: VaultRoot): Promise
 	// normalization-insensitive but we keep input form consistent for
 	// containment checks. Do NOT also normalize realpath output —
 	// containment compares against the FS-native form.
-	const normalized = input.normalize("NFC");
+	const normalized = stripped.normalize("NFC");
 
 	// Strip a leading "./" if present (common shorthand). Treat as empty
 	// segment elsewhere — the split below ignores it.

@@ -157,6 +157,7 @@ export interface SafePath {
 export type PathRejectionReason =
 	| "PATH_TOO_LONG"
 	| "NULL_BYTE"
+	| "CONTROL_CHAR"
 	| "PERCENT_ENCODED"
 	| "BACKSLASH"
 	| "ABSOLUTE_PATH"
@@ -311,6 +312,7 @@ export interface Embed {
 	target_block_id?: string;
 	kind: EmbedKind;
 	resolved: boolean;
+	duplicate_heading?: boolean;
 	candidates?: Array<{ file: string; heading_path?: string[] }>;
 	expanded: boolean;
 	expanded_content?: string;

@@ -12,7 +12,14 @@
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { basenameNoExt, extractWikilinks, resolveWikilink, stripMarkdownExt } from "../../src/lib/wikilinks.js";
+import {
+	basenameNoExt,
+	buildEmbed,
+	buildOutgoingLink,
+	extractWikilinks,
+	resolveWikilink,
+	stripMarkdownExt,
+} from "../../src/lib/wikilinks.js";
 import { FakeVaultIndex } from "../helpers/fakeVaultIndex.js";
 
 // ─── Extraction ────────────────────────────────────────────────────────────
@@ -325,6 +332,46 @@ describe("wikilinks — resolveWikilink", () => {
 		const idx = new FakeVaultIndex({ files: ["src.md"] });
 		const r = resolveWikilink("#^block-1", "src.md", idx);
 		expect(r).toMatchObject({ resolved: true, targetFile: "src.md", targetBlockId: "block-1" });
+	});
+});
+
+describe("wikilinks — buildEmbed / buildOutgoingLink ambiguity mapping", () => {
+	test("buildEmbed surfaces duplicate_heading + candidates from the resolver", () => {
+		// Without the mapping, `formatOutgoingTarget` skips the ambiguity
+		// branch and an embed against a duplicate-heading target renders as
+		// a bare resolved target. Symmetric with `buildOutgoingLink` below.
+		const idx = new FakeVaultIndex({
+			files: ["auth.md"],
+			headings: {
+				"auth.md": [
+					{ stable_id: "h:1", heading_path: ["A", "Auth"] },
+					{ stable_id: "h:2", heading_path: ["B", "Auth"] },
+				],
+			},
+		});
+		const extracted = extractWikilinks({
+			source: "![[auth#Auth]]",
+			sliceStart: 0,
+			excludedRanges: [],
+		});
+		const e = extracted[0];
+		if (!e) throw new Error("expected one wikilink");
+		const resolved = resolveWikilink(e.rawTarget, "src.md", idx);
+		expect(resolved.duplicateHeading).toBe(true);
+		expect(buildEmbed(e, resolved)).toMatchObject({
+			duplicate_heading: true,
+			candidates: [
+				{ file: "auth.md", heading_path: ["A", "Auth"] },
+				{ file: "auth.md", heading_path: ["B", "Auth"] },
+			],
+		});
+		expect(buildOutgoingLink(e, resolved)).toMatchObject({
+			duplicate_heading: true,
+			candidates: [
+				{ file: "auth.md", heading_path: ["A", "Auth"] },
+				{ file: "auth.md", heading_path: ["B", "Auth"] },
+			],
+		});
 	});
 });
 

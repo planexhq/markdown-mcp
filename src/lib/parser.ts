@@ -43,6 +43,7 @@ import {
 	isInsideAny,
 	isWhitespaceRange,
 } from "./blockIds.js";
+import { NAMED_ESCAPES } from "./controlChars.js";
 import { errorMessage } from "./error.js";
 import { MAX_AST_NODES } from "./limits.js";
 import { buildStructuralPath, type StructuralAncestor, stableId } from "./structuralPath.js";
@@ -275,6 +276,77 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Convert a YAML-parsed tree into a JSON-clean shape with four guarantees:
+ *
+ *   1. Values JSON.stringify silently coerces (`Infinity`/`NaN` → `null`;
+ *      `Set`/`Map` → `{}`) become JSON-native equivalents. Without this,
+ *      the prose channel (`yamlStringify` in renderText/getMetadata.ts)
+ *      and `structuredContent` (JSON.stringify) disagree on the same key.
+ *   2. Output objects use `Object.create(null)`. A YAML `__proto__:` key
+ *      is legal as an own property (yaml.parse keeps it own), but a
+ *      downstream `Object.assign({}, fm)`-style clone on a plain `{}`
+ *      would invoke the legacy setter and silently inject inherited
+ *      `tags` / `created` fields that the wire can't see.
+ *   3. Cyclic `!!set` / `!!omap` graphs throw `ParseError` instead of
+ *      looping to RangeError. `JSON.stringify(parsed)` upstream doesn't
+ *      catch these because Set/Map serialize to `{}`. `seen` is a
+ *      gray-set (add on entry, remove on exit) so YAML aliases used as
+ *      a DAG (`shared: &s\na: *s\nb: *s`) re-evaluate cleanly per branch.
+ *   4. Tagged YAML scalars (Date / Uint8Array) survive the walk. Date
+ *      passes through unchanged so JSON.stringify's `toJSON` emits the
+ *      ISO string and the scanner's `normalizeDateValue` matches
+ *      `instanceof Date`; binary canonicalizes to base64 so both
+ *      channels round-trip. Without these, the generic-object branch
+ *      strips them — `Object.keys(new Date())` is `[]`.
+ */
+function normalizeForJson(v: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
+	if (typeof v === "number") {
+		if (!Number.isFinite(v)) return null;
+		// `yaml.parse("x: -0")` produces JavaScript `-0`; yaml.stringify emits
+		// `x: -0` (sign preserved), JSON.stringify emits `x: 0` (sign dropped
+		// per ECMA-262 SerializeJSONValue). Without canonicalization the
+		// prose and JSON channels diverge on the same key — the same class
+		// guarantee #1 above defends against for `Infinity`/`NaN`.
+		if (Object.is(v, -0)) return 0;
+	}
+	if (v === null || typeof v !== "object") return v;
+	// Tagged YAML scalars — handle BEFORE cycle tracking. A YAML alias
+	// referencing the same Date / Buffer from multiple keys (legal,
+	// uncommon) would otherwise be rejected as cyclic.
+	if (v instanceof Date) return v;
+	if (v instanceof Uint8Array) return Buffer.from(v).toString("base64");
+	if (seen.has(v as object)) {
+		throw new ParseError("syntax", "YAML frontmatter contains a cyclic structure");
+	}
+	seen.add(v as object);
+	try {
+		if (v instanceof Set) return Array.from(v).map((x) => normalizeForJson(x, seen));
+		if (v instanceof Map) {
+			const out = Object.create(null) as Record<string, unknown>;
+			for (const [k, val] of v) {
+				// Pre-empt key-side cycle: `String(k)` reduces a Map-keyed
+				// entry to "[object Map]", so the value-side `seen` check
+				// wouldn't fire. Catches `&a !!omap\n  - ? *a : v` where
+				// `k` IS the outer Map already in `seen`.
+				if (typeof k === "object" && k !== null && seen.has(k as object)) {
+					throw new ParseError("syntax", "YAML frontmatter contains a cyclic structure");
+				}
+				out[String(k)] = normalizeForJson(val, seen);
+			}
+			return out;
+		}
+		if (Array.isArray(v)) return v.map((x) => normalizeForJson(x, seen));
+		const out = Object.create(null) as Record<string, unknown>;
+		for (const k of Object.keys(v as object)) {
+			out[k] = normalizeForJson((v as Record<string, unknown>)[k], seen);
+		}
+		return out;
+	} finally {
+		seen.delete(v as object);
+	}
+}
+
+/**
  * Parse a YAML body and gate it through JSON.stringify. `parseYAML` admits
  * circular structures (self-referential aliases like `a: &a [*a]`) and
  * BigInts (large ints) — both throw at MCP envelope-encode time, so we
@@ -282,19 +354,22 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * an INTERNAL_ERROR leak. Non-object top-level (scalar/array) collapses to
  * `{}` per Brief — frontmatter is always Record<string, unknown>.
  */
+function wrapParseStage<T>(label: string, errorLine: number, fn: () => T): T {
+	try {
+		return fn();
+	} catch (cause) {
+		// `normalizeForJson`'s cyclic-detection throws `ParseError` already;
+		// don't double-wrap or its `reason`/line gets clobbered.
+		if (cause instanceof ParseError) throw cause;
+		throw new ParseError("syntax", `${label}: ${errorMessage(cause)}`, errorLine);
+	}
+}
+
 function parseFrontmatterYaml(yamlBody: string, errorLine = 1): Record<string, unknown> {
-	let parsed: unknown;
-	try {
-		parsed = parseYAML(yamlBody);
-	} catch (cause) {
-		throw new ParseError("syntax", `YAML frontmatter parse failed: ${errorMessage(cause)}`, errorLine);
-	}
-	try {
-		JSON.stringify(parsed);
-	} catch (cause) {
-		throw new ParseError("syntax", `YAML frontmatter is not JSON-serializable: ${errorMessage(cause)}`, errorLine);
-	}
-	return isPlainObject(parsed) ? parsed : {};
+	const parsed = wrapParseStage("YAML frontmatter parse failed", errorLine, () => parseYAML(yamlBody));
+	wrapParseStage("YAML frontmatter is not JSON-serializable", errorLine, () => JSON.stringify(parsed));
+	const normalized = wrapParseStage("YAML frontmatter normalization failed", errorLine, () => normalizeForJson(parsed));
+	return isPlainObject(normalized) ? normalized : {};
 }
 
 /**
@@ -906,12 +981,62 @@ export function normalizeHeadingText(text: string): string {
 /**
  * Canonicalize an agent-supplied `heading_path` to the array form used
  * by every `parsed.headings[].headingPath` field. Accepts either an
- * array or `"A > B"` string form; each component is normalized through
- * {@link normalizeHeadingText} and empty segments dropped. Shared by
+ * array or `"A > B"` / `"A › B"` string form; each component is
+ * normalized through {@link normalizeHeadingText} and empty segments
+ * dropped. `›` (U+203A) is accepted because every prose renderer uses
+ * it as the display separator — agents copying a rendered path
+ * verbatim must round-trip without manual ASCII conversion. Shared by
  * `get_fragment` and `get_links` narrowing.
+ *
+ * The separator MUST have whitespace adjacent (renderer always emits
+ * `" › "` with spaces — see `controlChars.ts:HEADING_PATH_SEP`). Bare `›`
+ * or `>` inside heading text (e.g. `# A›B`) thus stays a single
+ * segment rather than falsely splitting; the array form remains the
+ * collision-free canonical input.
+ *
+ * Inverse of `formatHeadingPath` in `_shared.ts` — the renderer's
+ * escape contract and this regex must move together. Renderer emits
+ * four escape channels: `\›` / `\>` for whitespace-adjacent separators
+ * (interior or boundary) inside a segment, `\\` for any literal `\` in
+ * heading text, `\n` / `\r` / `\t` for newline/CR/tab via
+ * `PROSE_ESCAPE_TABLE`, and `\xHH` / `\uHHHH` for other C0/C1/DEL +
+ * LS/PS controls via `sanitizePathForProse`.
+ *
+ * Single-pass left-to-right decode via `HEADING_DECODE_RE`. The `\\`
+ * alternative MUST come first in the alternation so leftmost-match
+ * consumes a doubled literal before the engine looks at the next
+ * character — otherwise `\\\xHH` (literal `\` followed by escaped
+ * control char) is misread as `\` + `\xHH`-as-literal-text. A
+ * pass-pair with single-char negative lookbehind can't disambiguate
+ * the trailing half of `\\` from the leading `\` of a `\xHH`.
+ *
+ * Agents hand-constructing string-form `heading_path` must follow the
+ * same contract: send `\\` for any literal `\` they want preserved.
  */
+const HEADING_PATH_SPLIT_RE = /\s+(?:(?<!\\)[›>]\s+)+/;
+const HEADING_DECODE_RE = /\\(\\|n|r|t|›|>|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4})/g;
+
+const NAMED_DECODE_TABLE: Record<string, string> = {
+	...Object.fromEntries(NAMED_ESCAPES.map(([ch, kind]) => [kind, ch])),
+	"\\": "\\",
+	"›": "›",
+	">": ">",
+};
+
+function decodeHeadingEscape(_match: string, esc: string): string {
+	const named = NAMED_DECODE_TABLE[esc];
+	if (named !== undefined) return named;
+	return String.fromCharCode(Number.parseInt(esc.slice(1), 16));
+}
+
 export function normalizeHeadingPath(path: string | string[]): string[] {
-	const components = typeof path === "string" ? path.split(/\s*>\s*/) : path;
+	if (typeof path !== "string") {
+		return path.map(normalizeHeadingText).filter((s) => s.length > 0);
+	}
+	const components = path.split(HEADING_PATH_SPLIT_RE).map((s) => {
+		if (!s.includes("\\")) return s;
+		return s.replace(HEADING_DECODE_RE, decodeHeadingEscape);
+	});
 	return components.map(normalizeHeadingText).filter((s) => s.length > 0);
 }
 

@@ -36,6 +36,7 @@ import { isHiddenPath, isIndexCachePath } from "../lib/hiddenPath.js";
 import type { IndexHandle, SearchRow, SearchScopeClause } from "../lib/index/IndexHandle.js";
 import { isIndexWarming } from "../lib/index_status.js";
 import { clampPageSize } from "../lib/limits.js";
+import { renderSearch } from "../lib/renderText/search.js";
 import { QUERY_ALGORITHM_ID, sanitizeQuery } from "../lib/search/sanitize.js";
 import {
 	BM25_SNIPPET_ALGORITHM_ID,
@@ -102,7 +103,9 @@ export async function handleSearch(
 				query_note: outcome.kind === "empty" ? `empty query (${outcome.reason})` : "empty query",
 				snippet_algorithm: BM25_SNIPPET_ALGORITHM_ID,
 			};
-			return successEnvelope({ items: [], retriever: "bm25" } satisfies SearchOutput, successMeta);
+			return successEnvelope({ items: [], retriever: "bm25" } satisfies SearchOutput, successMeta, {
+				renderText: renderSearch,
+			});
 		}
 
 		if (isIndexWarming(indexStatus.state)) {
@@ -161,7 +164,7 @@ export async function handleSearch(
 
 		const successMeta: MetaEnvelope = { ...meta, snippet_algorithm: snippetAlgo };
 		if (queryNote !== undefined) successMeta.query_note = queryNote;
-		return successEnvelope(out, successMeta);
+		return successEnvelope(out, successMeta, { renderText: renderSearch });
 	} catch (err) {
 		return routeToolError(err, "search", meta);
 	}

@@ -29,8 +29,17 @@ const StableId = z
 	.describe("Heading stable_id from get_file_outline.");
 
 const HeadingPathInput = z
-	.union([z.string().describe("'A > B' string form."), z.array(z.string().min(1)).describe("Canonical string[] form.")])
-	.describe("Heading path: 'A > B' string OR string[] (array form is unambiguous).");
+	.union([
+		z
+			.string()
+			.describe(
+				"String form — `\\›` / `\\>` / `\\\\` / `\\n` / `\\xHH` / `\\uHHHH` decode. Use for prose-derived input.",
+			),
+		z
+			.array(z.string().min(1))
+			.describe("Array form — RAW segments, no escape decoding. Use structuredContent.heading_path verbatim."),
+	])
+	.describe("Heading path: array (raw, canonical) OR string (escape-encoded, prose-derived).");
 
 const Cursor = z.string().describe("Opaque pagination cursor; pass next page's nextCursor verbatim.");
 
@@ -65,7 +74,7 @@ const HeadingPathAnchor = z.strictObject({
 
 const BlockAnchor = z.strictObject({
 	kind: z.literal("block"),
-	id: z.string().min(1).describe("Block ID without the leading caret."),
+	id: z.string().min(1).describe("Block ID; a leading `^` (Obsidian wikilink convention) is tolerated and stripped."),
 });
 
 const FileAnchor = z.strictObject({

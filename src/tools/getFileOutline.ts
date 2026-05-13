@@ -15,6 +15,7 @@
 import { newMetaForHandler, successEnvelope, type ToolErrorEnvelope, type ToolSuccessEnvelope } from "../lib/error.js";
 import type { IndexHandle } from "../lib/index/IndexHandle.js";
 import { readNote } from "../lib/readNote.js";
+import { renderOutline } from "../lib/renderText/getFileOutline.js";
 import { getTokenizerId } from "../lib/tokenizer.js";
 import { type VaultRoot, validatePath } from "../lib/validatePath.js";
 import type { GetFileOutlineInput, GetFileOutlineResult } from "../types.js";
@@ -36,7 +37,7 @@ export async function handleGetFileOutline(
 			outline: parsed.outline,
 			blockIndex: parsed.blockIndex,
 		};
-		return successEnvelope(result, meta);
+		return successEnvelope(result, meta, { renderText: renderOutline });
 	} catch (err) {
 		return routeToolError(err, "get_file_outline", meta);
 	}

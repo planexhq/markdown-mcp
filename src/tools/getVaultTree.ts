@@ -37,6 +37,7 @@ import { isHiddenName, isHiddenPath, isIndexCachePath } from "../lib/hiddenPath.
 import type { IndexHandle } from "../lib/index/IndexHandle.js";
 import { isIndexWarming } from "../lib/index_status.js";
 import { clampPageSize, MAX_PATH_DEPTH } from "../lib/limits.js";
+import { renderTree } from "../lib/renderText/getVaultTree.js";
 import { getTokenizerId } from "../lib/tokenizer.js";
 import { PathValidationError, passesPathPolicy, type VaultRoot, validatePath } from "../lib/validatePath.js";
 import { isMarkdownPath } from "../lib/vaultExtensions.js";
@@ -108,7 +109,10 @@ export async function handleGetVaultTree(
 			out.nextCursor = buildNextCursor(requestHash, snapshotMtime, nextCursorAfter);
 		}
 
-		return successEnvelope(out, meta, buildResourceLinks(out.items));
+		return successEnvelope(out, meta, {
+			renderText: renderTree,
+			extraBlocks: buildResourceLinks(out.items),
+		});
 	} catch (err) {
 		return routeToolError(err, "get_vault_tree", meta);
 	}

@@ -564,6 +564,7 @@ export function buildEmbed(extracted: ExtractedWikilink, resolved: ResolvedWikil
 	if (resolved.targetFile !== undefined) embed.target_file = resolved.targetFile;
 	if (resolved.targetHeadingPath !== undefined) embed.target_heading_path = resolved.targetHeadingPath;
 	if (resolved.targetBlockId !== undefined) embed.target_block_id = resolved.targetBlockId;
+	if (resolved.duplicateHeading) embed.duplicate_heading = true;
 	if (resolved.candidates !== undefined) embed.candidates = resolved.candidates;
 	return embed;
 }

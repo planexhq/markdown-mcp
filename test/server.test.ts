@@ -319,6 +319,20 @@ describe("tools/call — W2 real handlers", () => {
 		expect(f.content).not.toMatch(/\^block-one/); // ^id stripped from displayed content
 	});
 
+	test("get_fragment block id tolerates a leading `^` (renderer round-trip)", async () => {
+		// The outline renderer emits `^block-one` (matching Obsidian's
+		// `[[file#^abc]]` convention); an agent copying the rendered form
+		// must round-trip to the same BlockFragment as the bare id.
+		const result = await connection.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "with-blocks.md", anchor: { kind: "block", id: "^block-one" } },
+		});
+		expect(result.isError).toBeFalsy();
+		const f = result.structuredContent as { anchor_kind: string; block_id: string };
+		expect(f.anchor_kind).toBe("block");
+		expect(f.block_id).toBe("block-one");
+	});
+
 	test("get_fragment deferred-block preserves caret-suffixed prior text", async () => {
 		// `^math-block` is a deferred-form block ID addressing `Value x^2`.
 		// The trim regex must strip ONLY `^math-block`, not `^2` from the

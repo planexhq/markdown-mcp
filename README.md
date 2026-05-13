@@ -160,13 +160,19 @@ The `note://{path}` Resource returns the raw on-disk markdown (frontmatter inclu
 
 Inputs are the tool arguments the host passes; outputs are abbreviated tool results (the `_meta` envelope is omitted for brevity; `nextCursor` is shown when relevant).
 
+Every tool returns two parallel channels: `structuredContent` (the typed JSON shown in each example below) for programmatic consumers, and `content[0].text` (a compact markdown rendering of the same data) for LLM consumers that read the prose channel directly. The prose channel uses a few rendering conventions:
+
+- File-with-heading addresses join on ` › ` (e.g. `notes/auth.md › OAuth2`). When a filename contains ` › `, the file portion is always wrapped in `«…»` so the boundary stays unambiguous — both standalone (e.g. `[file]  «notes/foo › bar.md»` in `get_vault_tree`, `«notes/foo › bar.md» · file` in `search` file/preamble rows) and inside addresses (`«notes/foo › bar.md» › OAuth2`). Passing either form back through a `file:` argument round-trips to the same path.
+- Wikilink aliases are quoted JSON-style (`"alias text"`), so embedded `"` and `\` are escaped (`\"`, `\\`).
+- `get_metadata` renders frontmatter as a YAML block whose entire `content[0].text` reparses as valid YAML — header and meta footer are `#`-prefixed comments.
+
 ### `get_vault_tree` — browse the vault
 
 ```jsonc
 // in
 { "path": "projects", "pageSize": 5 }
 
-// out
+// structuredContent
 {
   "items": [
     { "id": "t:1a2b3c…", "type": "dir",  "path": "projects/alpha", "name": "alpha",
@@ -178,22 +184,32 @@ Inputs are the tool arguments the host passes; outputs are abbreviated tool resu
 }
 ```
 
+```text
+// content[0].text
+tree · 2 items
+
+[dir]   projects/alpha/  (rank 1, 12 children)
+[file]  projects/alpha/intro.md  (rank 2, 4 headings, ~312 tok)
+
+next: eyJkZnNfcmFu…
+```
+
 ### `get_file_outline` — heading tree + block IDs
 
 ```jsonc
 // in
 { "file": "projects/alpha/intro.md" }
 
-// out
+// structuredContent
 {
   "outline": [
     { "level": 1, "text": "Authentication", "stable_id": "h:7c2d4e…",
       "anchor": "authentication", "range": { "start": 3, "end": 42 },
-      "bodyTokensApprox": 280, "subheadings": 2,
+      "bodyTokensApprox": 280, "descendantTokensApprox": 420, "subheadings": 2,
       "children": [
         { "level": 2, "text": "OAuth2", "stable_id": "h:f1a08b…",
           "anchor": "oauth2", "range": { "start": 12, "end": 28 },
-          "bodyTokensApprox": 140, "subheadings": 0 }
+          "bodyTokensApprox": 140, "descendantTokensApprox": 140, "subheadings": 0 }
       ] }
   ],
   "blockIndex": {
@@ -204,6 +220,17 @@ Inputs are the tool arguments the host passes; outputs are abbreviated tool resu
 }
 ```
 
+```text
+// content[0].text
+outline · 2 headings, 1 block
+
+# Authentication  (~280 tok body, ~420 tok total, id: h:7c2d4e…, L3-L42)
+  ## OAuth2  (~140 tok, id: h:f1a08b…, L12-L28)
+
+blocks:
+  ^callback-url  (L18-L18, Authentication › OAuth2, id: h:f1a08b…)
+```
+
 ### `get_fragment` — read a heading, block, or whole file
 
 ```jsonc
@@ -211,7 +238,7 @@ Inputs are the tool arguments the host passes; outputs are abbreviated tool resu
 { "file": "projects/alpha/intro.md",
   "anchor": { "kind": "heading_path", "path": ["Authentication", "OAuth2"] } }
 
-// out
+// structuredContent
 {
   "anchor_kind": "heading",
   "file": "projects/alpha/intro.md",
@@ -223,13 +250,28 @@ Inputs are the tool arguments the host passes; outputs are abbreviated tool resu
   "bodyTokensApprox": 140,
   "outgoing_links": [
     { "raw_target": "rfc/6749", "target_file": "rfc/6749.md",
-      "resolved": true, "link_text": "RFC 6749", "link_ordinal": 1 }
+      "resolved": true, "alias": "RFC 6749", "link_text": "RFC 6749", "link_ordinal": 1 }
   ],
   "embeds": []
 }
 ```
 
-Alternative anchors: `{ "kind": "block", "id": "callback-url" }` or `{ "kind": "file" }`.
+```text
+// content[0].text
+fragment · projects/alpha/intro.md › Authentication › OAuth2  (level 2, ~140 tok)
+id: h:f1a08b…
+
+--- begin body 7f3a8c2d4b9e1f60 ---
+## OAuth2
+
+We use the authorization-code flow with PKCE…
+--- end body 7f3a8c2d4b9e1f60 ---
+
+— links (1 outgoing, 0 embeds) —
+  → rfc/6749.md  "RFC 6749"  (ord 1)
+```
+
+Alternative anchors: `{ "kind": "block", "id": "callback-url" }` or `{ "kind": "file" }`. The body is wrapped in `--- begin body <nonce> ---` / `--- end body <nonce> ---` sentinels with a per-call 16-hex nonce so an arbitrary body can't forge the boundary.
 
 ### `search` — BM25 query + frontmatter filter
 
@@ -239,7 +281,7 @@ Alternative anchors: `{ "kind": "block", "id": "callback-url" }` or `{ "kind": "
   "filters": { "tags": { "has": "auth" }, "date": { "gte": "2026-01-01" } },
   "pageSize": 5 }
 
-// out
+// structuredContent
 {
   "items": [
     { "anchor_kind": "heading",
@@ -253,6 +295,15 @@ Alternative anchors: `{ "kind": "block", "id": "callback-url" }` or `{ "kind": "
 }
 ```
 
+```text
+// content[0].text
+search · 1 result · bm25
+
+projects/alpha/intro.md › Authentication › OAuth2  (score 3.42)
+  id: h:f1a08b…
+  snippet: …authorization-code flow with **PKCE**…
+```
+
 Filter-only mode (omit `query`) returns `score_type: "filter"` and a body-preview snippet — useful for "all notes tagged `auth` updated this month."
 
 ### `get_metadata` — frontmatter only
@@ -261,7 +312,7 @@ Filter-only mode (omit `query`) returns `score_type: "filter"` and a body-previe
 // in
 { "file": "projects/alpha/intro.md" }
 
-// out
+// structuredContent
 {
   "metadata": {
     "title": "Auth design",
@@ -273,25 +324,49 @@ Filter-only mode (omit `query`) returns `score_type: "filter"` and a body-previe
 }
 ```
 
+```text
+// content[0].text  (entire block reparses as YAML)
+# metadata · has frontmatter
+
+title: Auth design
+tags:
+  - auth
+  - security
+date: 2026-04-12T00:00:00Z
+owner: platform-team
+```
+
 ### `get_links` — outgoing + backlinks
 
 ```jsonc
 // in
 { "file": "projects/alpha/intro.md", "direction": "both" }
 
-// out
+// structuredContent
 {
   "outgoing": [
     { "raw_target": "rfc/6749", "target_file": "rfc/6749.md",
-      "resolved": true, "link_text": "RFC 6749",
+      "resolved": true, "alias": "RFC 6749", "link_text": "RFC 6749",
       "is_embed": false, "link_ordinal": 1 }
   ],
   "incoming": [
     { "raw_target": "projects/alpha/intro", "source_file": "index.md",
       "source_heading_path": ["Active projects"],
-      "link_text": "Alpha intro", "is_embed": false, "link_ordinal": 3 }
+      "alias": "Alpha intro", "link_text": "Alpha intro",
+      "is_embed": false, "link_ordinal": 3 }
   ]
 }
+```
+
+```text
+// content[0].text
+links
+
+outgoing (1):
+  → rfc/6749.md  "RFC 6749"  (ord 1)
+
+incoming (1):
+  ← index.md › Active projects  "Alpha intro"  (ord 3)
 ```
 
 Narrow to one section with `heading_path: ["Authentication", "OAuth2"]` or `stable_id: "h:f1a08b…"`.
