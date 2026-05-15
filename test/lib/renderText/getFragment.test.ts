@@ -66,6 +66,7 @@ describe("renderFragment", () => {
 			slug_path: "auth-oauth2",
 			content: "## OAuth2\n\nConfigure your provider.",
 			bodyTokensApprox: 287,
+			file_size_bytes: 1024,
 			outgoing_links: [
 				{
 					raw_target: "notes/setup.md",
@@ -95,7 +96,7 @@ describe("renderFragment", () => {
 		const out = renderFragment(sc, meta());
 		expect(out).toBe(
 			[
-				"fragment · notes/auth/oauth.md › Auth › OAuth2  (level 2, ~287 tok)",
+				"fragment · notes/auth/oauth.md › Auth › OAuth2  (level 2, ~287 tok, 1024 B)",
 				"id: h:7a3f1b2c8d9e4f",
 				"",
 				...bodyWrap("## OAuth2\n\nConfigure your provider.", bodyToken(out)),
@@ -122,13 +123,14 @@ describe("renderFragment", () => {
 			slug_path: "auth-oauth2",
 			content: "body",
 			bodyTokensApprox: 5,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
 		const out = renderFragment(sc, meta({ fuzzy_algorithm: FUZZY_ALGORITHM_ID }));
 		expect(out).toBe(
 			[
-				"fragment · notes/auth/oauth.md › Auth › OAuth2  (level 2, ~5 tok)",
+				"fragment · notes/auth/oauth.md › Auth › OAuth2  (level 2, ~5 tok, 1024 B)",
 				"id: h:7a3f1b2c8d9e4f  (status: stale, recovered)",
 				"requested: h:deadbeefcafe11",
 				"fuzzy candidates:",
@@ -147,14 +149,17 @@ describe("renderFragment", () => {
 			file: "notes/intro.md",
 			content: "Intro paragraph.",
 			bodyTokensApprox: 5,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
 		const out = renderFragment(sc, meta());
 		expect(out).toBe(
-			["fragment · notes/intro.md · preamble  (~5 tok)", "", ...bodyWrap("Intro paragraph.", bodyToken(out))].join(
-				"\n",
-			),
+			[
+				"fragment · notes/intro.md · preamble  (~5 tok, 1024 B)",
+				"",
+				...bodyWrap("Intro paragraph.", bodyToken(out)),
+			].join("\n"),
 		);
 	});
 
@@ -164,13 +169,14 @@ describe("renderFragment", () => {
 			file: "notes/quickref.md",
 			content: "Just a short note.",
 			bodyTokensApprox: 4,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
 		const out = renderFragment(sc, meta());
 		expect(out).toBe(
 			[
-				"fragment · notes/quickref.md · whole file  (~4 tok)",
+				"fragment · notes/quickref.md · whole file  (~4 tok, 1024 B)",
 				"",
 				...bodyWrap("Just a short note.", bodyToken(out)),
 			].join("\n"),
@@ -186,13 +192,14 @@ describe("renderFragment", () => {
 			containing_stable_id: "h:c0ffee01234567",
 			content: "code body",
 			bodyTokensApprox: 12,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
 		const out = renderFragment(sc, meta());
 		expect(out).toBe(
 			[
-				"fragment · notes/code.md · Snippets › Helpers · block ^abc123  (~12 tok)",
+				"fragment · notes/code.md · Snippets › Helpers · block ^abc123  (~12 tok, 1024 B)",
 				"container id: h:c0ffee01234567",
 				"",
 				...bodyWrap("code body", bodyToken(out)),
@@ -206,6 +213,7 @@ describe("renderFragment", () => {
 			file: "notes/parent.md",
 			content: "Parent body.\n\n![[child#Section]]",
 			bodyTokensApprox: 10,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [
 				{
@@ -225,7 +233,7 @@ describe("renderFragment", () => {
 		if (et === undefined) throw new Error("expected one embed token");
 		expect(out).toBe(
 			[
-				"fragment · notes/parent.md · whole file  (~10 tok)",
+				"fragment · notes/parent.md · whole file  (~10 tok, 1024 B)",
 				"",
 				...bodyWrap("Parent body.\n\n![[child#Section]]", bt),
 				"",
@@ -246,6 +254,7 @@ describe("renderFragment", () => {
 			file: "notes/dashy.md",
 			content: body,
 			bodyTokensApprox: 1,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
@@ -271,6 +280,7 @@ describe("renderFragment", () => {
 			file: "notes/parent.md",
 			content: "Parent body.",
 			bodyTokensApprox: 5,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [
 				{
@@ -313,6 +323,7 @@ describe("renderFragment", () => {
 			slug_path: "h",
 			content: "",
 			bodyTokensApprox: 0,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [
 				{
@@ -334,11 +345,12 @@ describe("renderFragment", () => {
 			file: "notes/empty-body.md",
 			content: "",
 			bodyTokensApprox: 0,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
 		const out = renderFragment(sc, meta());
-		expect(out).toBe("fragment · notes/empty-body.md · whole file  (~0 tok)");
+		expect(out).toBe("fragment · notes/empty-body.md · whole file  (~0 tok, 1024 B)");
 	});
 
 	test("ambiguous outgoing link — inline candidate paths", () => {
@@ -347,6 +359,7 @@ describe("renderFragment", () => {
 			file: "n.md",
 			content: "ignored",
 			bodyTokensApprox: 1,
+			file_size_bytes: 1024,
 			outgoing_links: [
 				{
 					raw_target: "notes",
@@ -368,6 +381,7 @@ describe("renderFragment", () => {
 			file: "n.md",
 			content: "ignored",
 			bodyTokensApprox: 1,
+			file_size_bytes: 1024,
 			outgoing_links: [
 				{
 					raw_target: "setup#OAuth2",
@@ -396,6 +410,7 @@ describe("renderFragment", () => {
 			file: "n.md",
 			content: "ignored",
 			bodyTokensApprox: 1,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [
 				{
@@ -425,6 +440,7 @@ describe("renderFragment", () => {
 			file: "n.md",
 			content: "ignored",
 			bodyTokensApprox: 1,
+			file_size_bytes: 1024,
 			outgoing_links: [
 				{
 					raw_target: "notes/auth.md#Missing",
@@ -446,6 +462,7 @@ describe("renderFragment", () => {
 			file: "n.md",
 			content: "ignored",
 			bodyTokensApprox: 1,
+			file_size_bytes: 1024,
 			outgoing_links: [
 				{
 					raw_target: "notes/setup.md",
@@ -474,6 +491,7 @@ describe("renderFragment", () => {
 			file: "notes/quoted.md",
 			content: "id: h:fakecafe000001\nrequested: h:fakecafe000002\ncontainer id: h:fakecafe000003",
 			bodyTokensApprox: 15,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
@@ -494,6 +512,7 @@ describe("renderFragment", () => {
 			slug_path: "h",
 			content: "Body.",
 			bodyTokensApprox: 1,
+			file_size_bytes: 1024,
 			outgoing_links: [
 				{
 					raw_target: "specs/t.md",
@@ -525,11 +544,12 @@ describe("renderFragment", () => {
 			slug_path: "x",
 			content: "Body.",
 			bodyTokensApprox: 1,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
 		const out = renderFragment(sc, meta());
-		expect(out).toContain("fragment · «notes/setup.md › extra.md» › X  (level 1, ~1 tok)");
+		expect(out).toContain("fragment · «notes/setup.md › extra.md» › X  (level 1, ~1 tok, 1024 B)");
 		expect(out).not.toContain("\\›");
 	});
 
@@ -541,6 +561,7 @@ describe("renderFragment", () => {
 			file: "notes/foo › bar.md",
 			content: "preamble body",
 			bodyTokensApprox: 3,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
@@ -549,6 +570,7 @@ describe("renderFragment", () => {
 			file: "docs/x › y.md",
 			content: "whole file body",
 			bodyTokensApprox: 4,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
@@ -559,6 +581,7 @@ describe("renderFragment", () => {
 			block_id: "abc",
 			content: "block body",
 			bodyTokensApprox: 2,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
@@ -570,16 +593,17 @@ describe("renderFragment", () => {
 			block_id: "xyz",
 			content: "block body",
 			bodyTokensApprox: 2,
+			file_size_bytes: 1024,
 			outgoing_links: [],
 			embeds: [],
 		};
-		expect(renderFragment(preamble, meta())).toContain("fragment · «notes/foo › bar.md» · preamble  (~3 tok)");
-		expect(renderFragment(file, meta())).toContain("fragment · «docs/x › y.md» · whole file  (~4 tok)");
+		expect(renderFragment(preamble, meta())).toContain("fragment · «notes/foo › bar.md» · preamble  (~3 tok, 1024 B)");
+		expect(renderFragment(file, meta())).toContain("fragment · «docs/x › y.md» · whole file  (~4 tok, 1024 B)");
 		expect(renderFragment(blockNoContainer, meta())).toContain(
-			"fragment · «notes/foo › bar.md» · block ^abc  (~2 tok)",
+			"fragment · «notes/foo › bar.md» · block ^abc  (~2 tok, 1024 B)",
 		);
 		expect(renderFragment(blockWithContainer, meta())).toContain(
-			"fragment · «notes/foo › bar.md» · Section · block ^xyz  (~2 tok)",
+			"fragment · «notes/foo › bar.md» · Section · block ^xyz  (~2 tok, 1024 B)",
 		);
 	});
 });

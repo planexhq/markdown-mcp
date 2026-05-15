@@ -16,6 +16,15 @@ import { getErrnoCode } from "../error.js";
 import { isCanonicalUtcIso } from "../filter.js";
 
 /**
+ * Schema version surfaced to MCP agents via `get_server_info`. Mirrors
+ * the `schema_version` table's `CHECK (version = 1)` constraint; bump
+ * here and add a `CHECK (version = N)` row when a future migration ships.
+ * Single source of truth — DDL and `get_server_info` both reference this
+ * export.
+ */
+export const SCHEMA_VERSION = 1;
+
+/**
  * Output of {@link openSqlite}. `preexisted` distinguishes "fresh DB,
  * scanner must populate" from "existing DB, snapshot is usable" so the
  * server can set initial `index_status` correctly.
@@ -193,6 +202,11 @@ export function runMigrationV1(db: DatabaseType): void {
 		// so a partial scan under one policy followed by a revert-restart
 		// surfaces as a mismatch and forces cold rescan.
 		ensureColumn(db, "index_meta", "inflight_include_hidden", "INTEGER");
+		// Epoch ms of the most recent `markScanFinalized`; surfaced via
+		// `_meta.index_status.last_scan_finished_at` and `get_server_info`
+		// as ISO 8601. Nullable: pre-D36 caches and never-finalized indices
+		// read as NULL, which the formatter renders as field-omitted.
+		ensureColumn(db, "index_meta", "last_scan_finished_at", "INTEGER");
 	}).immediate();
 }
 

@@ -210,6 +210,21 @@ export const GetLinksSchema = z.strictObject({
 	pageSize: PageSize.optional(),
 });
 
+// ─── get_server_info (D37) ─────────────────────────────────────────────────
+
+// Zero-input identity tool. `.optional()` accepts `client.callTool({name})`
+// shorthand (SDK passes `arguments` as `undefined`, not `{}`); without it,
+// the strictObject rejects `undefined` with -32602.
+//
+// Accepted SDK 1.29.0 limitation (D40): `.optional()` makes the advertised
+// JSON Schema in `tools/list` lose `additionalProperties: false`
+// (`normalizeObjectSchema` only matches `def.type === 'object'`, not the
+// `ZodOptional` wrapper). Schema-driven clients see permissive
+// advertisement but runtime still rejects unknown keys. Splitting
+// advertisement from runtime requires an SDK hook that doesn't exist;
+// dropping `.optional()` reintroduces D38's shorthand-broken bug.
+export const GetServerInfoSchema = z.strictObject({}).optional();
+
 // ─── Tool descriptions (used at registration time) ─────────────────────────
 
 export const TOOL_DESCRIPTIONS = {
@@ -223,4 +238,6 @@ export const TOOL_DESCRIPTIONS = {
 	get_metadata: "Parsed YAML frontmatter for a single file as JSON; nested objects preserved.",
 	get_links:
 		"Backlinks (incoming) + forward links (outgoing) for a file or specific section. `direction: in|out|both` (default both); narrow by `heading_path` or `stable_id`.",
+	get_server_info:
+		"Identity / health snapshot for agent self-verification: server version, vault root_hash, index state + freshness, algorithm IDs, registered tools. Zero input. Always succeeds.",
 } as const satisfies Record<string, string>;

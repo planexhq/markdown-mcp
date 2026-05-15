@@ -37,6 +37,7 @@ import {
 	type VaultRoot,
 	validateVaultRoot,
 } from "./lib/validatePath.js";
+import { PACKAGE_VERSION } from "./lib/version.js";
 import { startWatcher, type Watcher } from "./lib/watcher.js";
 import { WriteCoordinator } from "./lib/writeCoordinator.js";
 import { createServer } from "./server.js";
@@ -78,7 +79,7 @@ function parseCli(argv: string[]): CliArgs {
 	};
 }
 
-const USAGE = `markdown-mcp ${process.env.npm_package_version ?? "1.0.0"}
+const USAGE = `markdown-mcp ${PACKAGE_VERSION}
 
 A read-only MCP server giving AI agents structured access to a local markdown vault.
 

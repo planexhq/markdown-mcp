@@ -110,10 +110,18 @@ describe("openSqlite", () => {
 		);
 	});
 
-	test("index_meta has scan_complete + ever_complete + include_hidden + inflight_include_hidden columns", () => {
+	test("index_meta has scan_complete + ever_complete + include_hidden + inflight_include_hidden + last_scan_finished_at columns", () => {
 		const { db } = open();
 		const cols = (db.prepare("PRAGMA table_info(index_meta)").all() as Array<{ name: string }>).map((c) => c.name);
-		expect(cols.sort()).toEqual(["ever_complete", "id", "include_hidden", "inflight_include_hidden", "scan_complete"]);
+		// D37 adds `last_scan_finished_at` via ensureColumn.
+		expect(cols.sort()).toEqual([
+			"ever_complete",
+			"id",
+			"include_hidden",
+			"inflight_include_hidden",
+			"last_scan_finished_at",
+			"scan_complete",
+		]);
 	});
 
 	test("legacy 3-column index_meta upgrades cleanly via ensureColumn", async () => {
@@ -139,22 +147,27 @@ describe("openSqlite", () => {
 					"id",
 					"include_hidden",
 					"inflight_include_hidden",
+					"last_scan_finished_at",
 					"scan_complete",
 				]);
 				const row = opened.db
 					.prepare(
-						"SELECT scan_complete, ever_complete, include_hidden, inflight_include_hidden FROM index_meta WHERE id = 1",
+						"SELECT scan_complete, ever_complete, include_hidden, inflight_include_hidden, last_scan_finished_at FROM index_meta WHERE id = 1",
 					)
 					.get() as {
 					scan_complete: number;
 					ever_complete: number;
 					include_hidden: number | null;
 					inflight_include_hidden: number | null;
+					last_scan_finished_at: number | null;
 				};
 				expect(row.scan_complete).toBe(1);
 				expect(row.ever_complete).toBe(1);
 				expect(row.include_hidden).toBeNull();
 				expect(row.inflight_include_hidden).toBeNull();
+				// D37: newly-added column starts NULL on legacy DBs until the
+				// first post-upgrade `markScanFinalized` populates it.
+				expect(row.last_scan_finished_at).toBeNull();
 			} finally {
 				closeSqlite(opened.db);
 			}
@@ -200,6 +213,7 @@ describe("runMigrationV1 concurrent same-policy peers", () => {
 						"id",
 						"include_hidden",
 						"inflight_include_hidden",
+						"last_scan_finished_at",
 						"scan_complete",
 					]);
 				} finally {

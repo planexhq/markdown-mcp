@@ -33,6 +33,8 @@ const TOOL_NAMES = [
 	"search",
 	"get_metadata",
 	"get_links",
+	// D37 — identity / health snapshot for agent self-verification.
+	"get_server_info",
 ] as const;
 
 /**
@@ -130,7 +132,7 @@ describe("Initialize handshake", () => {
 });
 
 describe("tools/list", () => {
-	test("returns all 6 tools with non-empty input schemas", async () => {
+	test("returns all 7 tools with non-empty input schemas", async () => {
 		const result = await connection.client.listTools();
 		const names = result.tools.map((t) => t.name).sort();
 		expect(names).toEqual([...TOOL_NAMES].sort());
@@ -887,5 +889,7 @@ function stubArgsFor(name: (typeof TOOL_NAMES)[number]): Record<string, unknown>
 			return { file: "foo.md" };
 		case "get_links":
 			return { file: "foo.md" };
+		case "get_server_info":
+			return {};
 	}
 }

@@ -37,11 +37,16 @@ function renderItem(item: VaultTreeItem): string {
 		return `[dir]   ${dirPath}  (rank ${item.dfs_rank}, ${children} ${childLabel})`;
 	}
 	const path = formatFileHeading(item.path);
-	const isMarkdown = isMarkdownPath(item.path);
-	// Markdown files on disk but not in the index (pre-watcher, parse-failed,
-	// EACCES-during-scan) reach materializeItem without stats — label them so
-	// the row doesn't read as a malformed `(rank N, )`.
-	const suffix = isMarkdown ? formatFileSuffix(item) || "unindexed" : "asset";
+	if (!isMarkdownPath(item.path)) {
+		return `[file]  ${path}  (rank ${item.dfs_rank}, asset)`;
+	}
+	const suffix = formatFileSuffix(item);
+	// `subheadings` is set by materializeItem iff `getFileStats()`
+	// returned a row — canonical "indexed" signal. `size_bytes` alone
+	// no longer carries it (D41 made size_bytes live-stat-derived).
+	if (item.subheadings === undefined) {
+		return `[file]  ${path}  (rank ${item.dfs_rank}, ${suffix ? `unindexed, ${suffix}` : "unindexed"})`;
+	}
 	return `[file]  ${path}  (rank ${item.dfs_rank}, ${suffix})`;
 }
 
@@ -57,6 +62,9 @@ function formatFileSuffix(item: VaultTreeItem): string {
 		} else {
 			parts.push(`~${item.bodyTokensApprox} tok`);
 		}
+	}
+	if (item.size_bytes !== undefined) {
+		parts.push(`${item.size_bytes} B`);
 	}
 	if (item.contentKinds && item.contentKinds.length > 0) {
 		parts.push(`contains: ${item.contentKinds.join(", ")}`);

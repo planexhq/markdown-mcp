@@ -26,12 +26,15 @@ import type { IndexHandle } from "./lib/index/IndexHandle.js";
 import { MIN_PROTOCOL_VERSION } from "./lib/limits.js";
 import { ParseError } from "./lib/parser.js";
 import { FileTooLargeError, readSource } from "./lib/readNote.js";
+import { hashVaultRoot } from "./lib/serverInfo.js";
 import { PathValidationError, type VaultRoot, validatePath } from "./lib/validatePath.js";
+import { PACKAGE_VERSION } from "./lib/version.js";
 import {
 	GetFileOutlineSchema,
 	GetFragmentSchema,
 	GetLinksSchema,
 	GetMetadataSchema,
+	GetServerInfoSchema,
 	GetVaultTreeSchema,
 	SearchSchema,
 	TOOL_DESCRIPTIONS,
@@ -40,17 +43,26 @@ import { handleGetFileOutline } from "./tools/getFileOutline.js";
 import { handleGetFragment } from "./tools/getFragment.js";
 import { handleGetLinks } from "./tools/getLinks.js";
 import { handleGetMetadata } from "./tools/getMetadata.js";
+import { handleGetServerInfo, type ServerInfoContext } from "./tools/getServerInfo.js";
 import { handleGetVaultTree } from "./tools/getVaultTree.js";
 import { handleSearch } from "./tools/search.js";
 import type { ErrorCode as VaultErrorCode } from "./types.js";
 
 /**
- * Server name + version reported in the MCP `initialize` handshake.
+ * Server name + version reported in the MCP `initialize` handshake AND
+ * surfaced via `get_server_info` (D37). `version` reads from this package's
+ * `package.json` at module load (see {@link PACKAGE_VERSION}), NOT
+ * `npm_package_version` — that env var is correct only when launched via
+ * `npm exec` from inside this package's working dir; every other launch
+ * mode (direct `node dist/index.js`, `npx` from outside any package,
+ * `npm exec` from a vault with its own package.json) silently produced the
+ * wrong value (D39).
  */
+const SERVER_NAME = "markdown-mcp" as const;
 const SERVER_INFO = {
-	name: "markdown-mcp",
-	version: "1.0.0",
-} as const;
+	name: SERVER_NAME,
+	version: PACKAGE_VERSION,
+};
 
 const INSTRUCTIONS =
 	"Read-only access to a local markdown vault. Use get_vault_tree to discover files, get_file_outline + get_fragment for navigation.";
@@ -79,11 +91,26 @@ export interface ServerConfig {
  */
 export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: ServerConfig = {}): McpServer {
 	const includeHidden = config.includeHidden ?? false;
+	// Process-start timestamp (ISO 8601, UTC). Captured here (D40) so each
+	// `createServer` instance reports its own creation time — agents detect
+	// unexpected restarts between turns by comparing this across calls.
+	// Pre-D40 this was a module-level const evaluated at first import; an
+	// embedder calling `createServer` long after import (or recreating the
+	// server mid-process) saw a stale module-load timestamp instead of the
+	// instance's real start time.
+	const serverStartedAt = new Date().toISOString();
 	// `tools` and `resources` capabilities are auto-registered by the SDK
 	// when registerTool / registerResource fire; no need to pre-declare.
 	// `subscribe: true` was advertised previously but no subscribe handler
 	// is wired (W4 may add one alongside chokidar) — drop the false flag.
 	const server = new McpServer(SERVER_INFO, { instructions: INSTRUCTIONS });
+
+	// Captured at the initialize handshake (below) and surfaced through
+	// `get_server_info.server.mcp_protocol_version`. Defaults to LATEST so
+	// pre-handshake debugging calls (no observed client yet) still get an
+	// honest value; the initialize handler overwrites this with whatever
+	// version the SDK actually negotiated for the session.
+	let negotiatedProtocolVersion: string = LATEST_PROTOCOL_VERSION;
 
 	// D22: declare `2025-06-18` minimum at handshake; reject older clients
 	// rather than letting the SDK negotiate down. `setRequestHandler`
@@ -104,6 +131,7 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: 
 		// future date verbatim would let the client believe the server
 		// implements a protocol it actually doesn't.
 		const negotiated = SUPPORTED_PROTOCOL_VERSIONS.includes(requested) ? requested : LATEST_PROTOCOL_VERSION;
+		negotiatedProtocolVersion = negotiated;
 		// `_capabilities` is the SDK's authoritative snapshot, populated by
 		// the registerTool/registerResource calls below. The public
 		// `registerCapabilities` is a mutator only; no public getter exists,
@@ -118,7 +146,7 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: 
 		};
 	});
 
-	registerTools(server, vaultRoot, index, includeHidden);
+	registerTools(server, vaultRoot, index, includeHidden, () => negotiatedProtocolVersion, serverStartedAt);
 	registerNoteResource(server, vaultRoot, includeHidden);
 	return server;
 }
@@ -130,6 +158,8 @@ function registerTools(
 	vaultRoot: VaultRoot,
 	index: IndexHandle | undefined,
 	includeHidden: boolean,
+	getMcpProtocolVersion: () => string,
+	serverStartedAt: string,
 ): void {
 	server.registerTool(
 		"get_vault_tree",
@@ -200,6 +230,29 @@ function registerTools(
 			return handleGetLinks(input, vaultRoot, index, includeHidden);
 		},
 	);
+
+	// D37: identity/health snapshot. Index optional — when not configured,
+	// `get_server_info` surfaces `index: null` so an agent debugging a stub
+	// server sees the misconfig honestly instead of an opaque INTERNAL_ERROR.
+	// `rootHash` is hashed once here (vault root is constant for process
+	// lifetime) so we don't re-hash on every call.
+	const serverInfoContext: ServerInfoContext = {
+		rootHash: hashVaultRoot(vaultRoot.absolute),
+		includeHidden,
+		startedAt: serverStartedAt,
+		serverName: SERVER_NAME,
+		serverVersion: PACKAGE_VERSION,
+		getMcpProtocolVersion,
+	};
+	server.registerTool(
+		"get_server_info",
+		{
+			title: "Get Server Info",
+			description: TOOL_DESCRIPTIONS.get_server_info,
+			inputSchema: GetServerInfoSchema,
+		},
+		async (input) => handleGetServerInfo(input, serverInfoContext, index),
+	);
 }
 
 // ─── Resource registration ─────────────────────────────────────────────────
@@ -260,7 +313,7 @@ function registerNoteResource(server: McpServer, vaultRoot: VaultRoot, includeHi
 				// file including frontmatter, the brief's contract for
 				// `note://`. Skipping the parser also lets a parse-only
 				// failure like AST cap not block a readable file.
-				const source = await readSource(safePath, includeHidden);
+				const { source } = await readSource(safePath, includeHidden);
 				return {
 					contents: [{ uri: uri.toString(), mimeType: "text/markdown", text: source }],
 				};

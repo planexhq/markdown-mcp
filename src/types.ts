@@ -95,11 +95,45 @@ export interface IndexWarmingProgress {
 }
 
 /**
+ * Current-scan degradation signals (D37). Surfaced inside
+ * {@link IndexStatus.degraded} when one of the gates is set. Both fields
+ * reflect the CURRENT scan only — `failed_subtrees_present` resets at
+ * scanner start, `pending_retries` is the live in-memory set.
+ */
+export interface IndexDegraded {
+	failed_subtrees_present: boolean;
+	pending_retries: number;
+}
+
+/**
  * Index status visible on every `_meta` envelope.
+ *
+ * D37 adds two optional fields:
+ * - `last_scan_finished_at`: ISO 8601 of the most recent clean finalize;
+ *   omitted when never finalized (pre-upgrade caches, partial first scans).
+ * - `degraded`: present only when a current-scan gate is set
+ *   (`failed_subtrees_present` OR `pending_retries > 0`); omit-when-clean
+ *   keeps the common case lean.
  */
 export interface IndexStatus {
 	state: IndexState;
 	files_indexed: number;
+	last_scan_finished_at?: string;
+	degraded?: IndexDegraded;
+}
+
+/**
+ * Atomic combined snapshot returned by `IndexHandle.getStatusSnapshot` (D39).
+ * Extends {@link IndexStatus} with `ever_complete` so `get_server_info` can
+ * pull all four persisted-or-in-memory fields in one prepared-statement read,
+ * preventing the torn `{ever_complete: true, last_scan_finished_at: undefined}`
+ * combination a same-policy multi-process peer's finalize could otherwise
+ * surface between two separate SELECTs. NOT used as the `_meta.index_status`
+ * wire shape — that stays on `IndexStatus` so `ever_complete` doesn't leak
+ * onto every tool's envelope.
+ */
+export interface IndexStatusSnapshot extends IndexStatus {
+	ever_complete: boolean;
 }
 
 /**
@@ -207,6 +241,11 @@ export interface VaultTreeItem {
 	descendantTokensApprox?: number; // file only
 	contentKinds?: ContentKind[];
 	mtime: number;
+	// Live on-disk byte count via `lstat` (mirror of
+	// `get_fragment.file_size_bytes`' read-path source so the D37/D41
+	// cross-check survives the watcher-lag window). Omitted for
+	// directories, symlinks, and vanished-mid-walk files.
+	size_bytes?: number;
 }
 
 export interface GetVaultTreeInput {
@@ -325,6 +364,13 @@ export interface FragmentCommon {
 	bodyTokensApprox: number;
 	outgoing_links: OutgoingLink[];
 	embeds: Embed[];
+	// Byte-size of the WHOLE FILE this fragment belongs to, NOT
+	// `Buffer.byteLength(content)` — `content` may be a sliced section.
+	// Sourced from `readNote().sizeBytes` (D38): the raw read-window byte
+	// count, NOT a re-encoding of the decoded source. The two differ by
+	// the BOM length (3) for UTF-8 files with a leading BOM, because
+	// `TextDecoder` strips the BOM during decode.
+	file_size_bytes: number;
 }
 
 export type StableIdStatus = "fresh" | "stale";
@@ -535,4 +581,61 @@ export interface NoteResourceContent {
 
 export interface NoteResourceResult {
 	contents: [NoteResourceContent];
+}
+
+// ─── get_server_info (D37) ─────────────────────────────────────────────────
+
+/**
+ * Zero-input identity / health snapshot for AI-agent self-verification.
+ * Always succeeds — does not gate on warm state because identity must be
+ * queryable from the moment the server connects. Per D37, this tool is
+ * metadata-only and counts toward the public surface as "7th tool" with
+ * a deliberate exception to the 6-tools principle.
+ */
+export type GetServerInfoInput = Record<string, never> | undefined;
+
+export interface ServerIdentity {
+	name: string;
+	version: string;
+	mcp_protocol_version: string;
+	started_at: string;
+}
+
+export interface VaultIdentity {
+	root_hash: string;
+	include_hidden: boolean;
+	extensions: string[];
+	case_insensitive_fs: boolean;
+}
+
+export interface IndexIdentity {
+	schema_version: number;
+	state: IndexState;
+	files_indexed: number;
+	ever_complete: boolean;
+	last_scan_finished_at?: string;
+	degraded?: IndexDegraded;
+}
+
+export interface AlgorithmIdentity {
+	tokenizer: string;
+	query_algorithm: string;
+	snippet_algorithm_query: string;
+	snippet_algorithm_filter: string;
+	fuzzy_algorithm: string;
+}
+
+export interface CapabilitiesIdentity {
+	tools: string[];
+	resources: string[];
+}
+
+export interface GetServerInfoResult {
+	server: ServerIdentity;
+	vault: VaultIdentity;
+	/** `null` when the server is running without an `IndexHandle` (W1
+	 * stub / misconfig path); identity surfaces stay available. */
+	index: IndexIdentity | null;
+	algorithms: AlgorithmIdentity;
+	capabilities: CapabilitiesIdentity;
 }

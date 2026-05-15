@@ -3,10 +3,10 @@
  * corrupted index file (mtime drift, vanished file, new file).
  */
 
-import { rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { createIndexHandle, type IndexHandle } from "../../src/lib/index/IndexHandle.js";
 import { reindexOne, scanVault } from "../../src/lib/index/scanner.js";
@@ -14,7 +14,7 @@ import { closeSqlite, openSqlite } from "../../src/lib/index/sqlite.js";
 import { type MerkleTickHandle, startMerkleTick } from "../../src/lib/merkle.js";
 import { type VaultRoot, validateVaultRoot } from "../../src/lib/validatePath.js";
 import { WriteCoordinator } from "../../src/lib/writeCoordinator.js";
-import { createTempVault } from "../helpers/vault.js";
+import { createTempVault, type VaultStructure } from "../helpers/vault.js";
 
 interface Fixture {
 	vaultRoot: VaultRoot;
@@ -139,7 +139,7 @@ describe("merkle — N5 drift detection includes size", () => {
 		const file = "alpha.md";
 		const abs = join(fixture.vaultRoot.absolute, file);
 		const stBefore = await stat(abs);
-		const indexedSizeBefore = fixture.index.getFileStats(file)?.size ?? null;
+		const indexedSizeBefore = fixture.index.getFileMeta(file)?.size ?? null;
 		expect(indexedSizeBefore).toBe(stBefore.size);
 
 		// Write new content with a different size; then rewind mtime so the
@@ -157,7 +157,7 @@ describe("merkle — N5 drift detection includes size", () => {
 
 		await fixture.tick.runOnce();
 
-		const indexedSizeAfter = fixture.index.getFileStats(file)?.size ?? null;
+		const indexedSizeAfter = fixture.index.getFileMeta(file)?.size ?? null;
 		expect(indexedSizeAfter).toBe(stAfter.size);
 	});
 });
@@ -174,14 +174,14 @@ describe("merkle — NULL size treated as drift (self-heal channel)", () => {
 		const abs = join(fixture.vaultRoot.absolute, file);
 
 		fixture.dbAccess.run("UPDATE fragments SET size = NULL WHERE file = :file", { file });
-		expect(fixture.index.getFileStats(file)?.size ?? null).toBeNull();
+		expect(fixture.index.getFileMeta(file)?.size ?? null).toBeNull();
 		const mtimeBefore = fixture.index.getFileMtime(file);
 		expect(mtimeBefore).toBeGreaterThan(0);
 
 		await fixture.tick.runOnce();
 
 		const stAfter = await stat(abs);
-		expect(fixture.index.getFileStats(file)?.size ?? null).toBe(stAfter.size);
+		expect(fixture.index.getFileMeta(file)?.size ?? null).toBe(stAfter.size);
 	});
 });
 
@@ -256,6 +256,7 @@ describe("merkle — warming → warm finalization", () => {
 	interface NoScanFixture {
 		index: IndexHandle;
 		tick: MerkleTickHandle;
+		vaultRoot: VaultRoot;
 		cleanup: () => Promise<void>;
 	}
 
@@ -263,7 +264,7 @@ describe("merkle — warming → warm finalization", () => {
 	// `scanVault`, which auto-finalizes a clean vault and defeats the
 	// "warming index recovered by merkle" scenario. Here the index
 	// starts empty + warming so merkle is the only finalization path.
-	async function setupNoScan(structure: Record<string, string>): Promise<NoScanFixture> {
+	async function setupNoScan(structure: VaultStructure): Promise<NoScanFixture> {
 		const v = await createTempVault(structure);
 		const vaultRoot = await validateVaultRoot(v.path);
 		const opened = openSqlite({ dbPath: ":memory:" });
@@ -286,6 +287,7 @@ describe("merkle — warming → warm finalization", () => {
 		return {
 			index,
 			tick,
+			vaultRoot,
 			cleanup: async () => {
 				await tick.stop();
 				closeSqlite(opened.db);
@@ -348,6 +350,80 @@ describe("merkle — warming → warm finalization", () => {
 			expect(f.index.getStatus().state).toBe("warm");
 			expect(f.index.hasPendingRetries()).toBe(false);
 			expect(f.index.getScanComplete()).toBe(true);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("merkle-driven finalize clears sticky failedSubtreesPresent flag", async () => {
+		// Subtree recovers between scanner pass and merkle reconcile; the
+		// sticky flag (set by the prior scanner pass) must clear at
+		// merkle's finalize. Pre-D40 it stayed set until process restart.
+		const f = await setupNoScan({ "alpha.md": "# Alpha\n", "beta.md": "# Beta\n" });
+		try {
+			f.index.setFailedSubtreesPresent(true);
+			expect(f.index.getStatus().degraded?.failed_subtrees_present).toBe(true);
+
+			await f.tick.runOnce();
+
+			expect(f.index.getStatus().state).toBe("warm");
+			expect(f.index.getScanComplete()).toBe(true);
+			expect(f.index.getStatus().degraded).toBeUndefined();
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"merkle observes new EACCES subtree → failedSubtreesPresent surfaces (D41)",
+		async () => {
+			const f = await setupNoScan({
+				"top.md": "# Top\n",
+				locked: { "inside.md": "# Inside\n" },
+			});
+			const lockedDir = join(f.vaultRoot.absolute, "locked");
+			const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			try {
+				await f.tick.runOnce();
+				expect(f.index.getScanComplete()).toBe(true);
+				expect(f.index.getDegradedSignals().failed_subtrees_present).toBe(false);
+
+				await chmod(lockedDir, 0o000);
+				try {
+					await f.tick.runOnce();
+					expect(f.index.getDegradedSignals().failed_subtrees_present).toBe(true);
+					expect(f.index.getStatus().degraded?.failed_subtrees_present).toBe(true);
+				} finally {
+					await chmod(lockedDir, 0o755);
+				}
+
+				// Recovery clears via merkle's end-of-pass write — no
+				// finalize fires (scan_complete already true), so D40's
+				// markScanFinalized-side clear can't reach this path.
+				await f.tick.runOnce();
+				expect(f.index.getDegradedSignals().failed_subtrees_present).toBe(false);
+				expect(f.index.getStatus().degraded).toBeUndefined();
+			} finally {
+				errSpy.mockRestore();
+				await f.cleanup();
+			}
+		},
+	);
+
+	test("merkle clears failedSubtreesPresent when no finalize fires (warm + scan_complete=true)", async () => {
+		// Cross-platform companion: warm index with scan_complete=true
+		// means markScanFinalized is a no-op; flag must still clear.
+		const f = await setupNoScan({ "alpha.md": "# Alpha\n", "beta.md": "# Beta\n" });
+		try {
+			await f.tick.runOnce();
+			expect(f.index.getScanComplete()).toBe(true);
+			f.index.setFailedSubtreesPresent(true);
+			expect(f.index.getDegradedSignals().failed_subtrees_present).toBe(true);
+
+			await f.tick.runOnce();
+
+			expect(f.index.getDegradedSignals().failed_subtrees_present).toBe(false);
+			expect(f.index.getStatus().degraded).toBeUndefined();
 		} finally {
 			await f.cleanup();
 		}

@@ -38,8 +38,20 @@ import { type ParsedFile, ParseError, type ParseFileOptions, parseFile } from ".
 import { openNoFollow, PathValidationError } from "./validatePath.js";
 import { isMarkdownPath } from "./vaultExtensions.js";
 
-export interface NoteData {
+export interface SourceData {
 	source: string;
+	/**
+	 * Raw on-disk byte count from the read window (post-`stat`, pre-decode).
+	 * Surfaced through `get_fragment.file_size_bytes` for agent integrity
+	 * checks against `get_vault_tree.size_bytes` / `fs.stat().size`. Distinct
+	 * from `Buffer.byteLength(source, "utf8")` because `TextDecoder` strips
+	 * the UTF-8 BOM during decode — re-encoding the string under-reports by
+	 * 3 bytes on BOM-prefixed files.
+	 */
+	sizeBytes: number;
+}
+
+export interface NoteData extends SourceData {
 	parsed: ParsedFile;
 }
 
@@ -115,7 +127,7 @@ export async function assertNotePathPolicy(safePath: SafePath, includeHidden = f
  * during the validation window still can't bypass it; `O_NONBLOCK` on
  * the open keeps the FIFO from hanging the server.
  */
-export async function readSource(safePath: SafePath, includeHidden = false): Promise<string> {
+export async function readSource(safePath: SafePath, includeHidden = false): Promise<SourceData> {
 	assertNotePathString(safePath, includeHidden);
 	let fh: FileHandle | undefined;
 	try {
@@ -166,11 +178,13 @@ export async function readSource(safePath: SafePath, includeHidden = false): Pro
 			throw new FileTooLargeError(safePath.relative, MAX_FILE_BYTES, total);
 		}
 		const buf = total === buffer.length ? buffer : buffer.subarray(0, total);
+		let source: string;
 		try {
-			return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+			source = new TextDecoder("utf-8", { fatal: true }).decode(buf);
 		} catch (cause) {
 			throw new ParseError("encoding_failed", `File is not valid UTF-8: ${errorMessage(cause)}`);
 		}
+		return { source, sizeBytes: total };
 	} finally {
 		if (fh !== undefined) await fh.close();
 	}
@@ -186,9 +200,9 @@ export async function readNote(
 	options: ParseFileOptions = {},
 	includeHidden = false,
 ): Promise<NoteData> {
-	const source = await readSource(safePath, includeHidden);
+	const { source, sizeBytes } = await readSource(safePath, includeHidden);
 	const parsed = parseFile(source, safePath.relative, options);
-	return { source, parsed };
+	return { source, parsed, sizeBytes };
 }
 
 function isFsErrorCode(err: unknown, code: string): boolean {

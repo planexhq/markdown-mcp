@@ -87,6 +87,13 @@ export function startMerkleTick(opts: MerkleTickOptions): MerkleTickHandle {
 				if (current === "reconciling") {
 					index.setStatus("warm");
 				}
+				// Mirror scanner end-of-pass: clear/set so a recovered
+				// subtree drops the degraded flag without a restart, and
+				// a fresh EACCES surfaces without waiting for the next
+				// cold scan. Skip on reconcile throw (`result === null`).
+				if (result !== null) {
+					index.setFailedSubtreesPresent(result.failedSubtrees.size > 0);
+				}
 				// Finalize whenever a clean pass discovered scan_complete is
 				// still false. Two arcs hit this branch: (1) cold/warming →
 				// warm (initial scan, or partial scan recovered by merkle);

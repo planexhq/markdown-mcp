@@ -7,13 +7,27 @@
 
 import type { Database as DatabaseType, Statement } from "better-sqlite3";
 
-import type { AnchorKind, ContentKind, IndexState, IndexStatus, SearchScopeKind } from "../../types.js";
+import type {
+	AnchorKind,
+	ContentKind,
+	IndexState,
+	IndexStatus,
+	IndexStatusSnapshot,
+	SearchScopeKind,
+} from "../../types.js";
 import { type FilterKeysetKey, type LinksKeysetKey, parseHeadingPathJson, type ScoreDescKey } from "../cursor.js";
 import { type CompiledFilter, escapeLike, globEscape } from "../filter.js";
 import type { HeadingHistoryRow } from "../fuzzy.js";
 import { INDEX_DIR_NAME, isFsCaseInsensitiveResolved } from "../hiddenPath.js";
 import { transition } from "../index_status.js";
 import { basenameNoExt, type VaultFileIndex } from "../wikilinks.js";
+
+/** Row shape returned by `stmtGetStatusFields` — shared between `readStatusFields` and `buildStatus`. */
+interface StatusFieldsRow {
+	files_indexed: number;
+	last_scan_finished_at: number | null;
+	ever_complete: number;
+}
 
 /**
  * One row to write to the `fragments` table. Heading-kind rows MUST
@@ -156,8 +170,6 @@ export interface ListIncomingArgs {
 
 export interface FileStats {
 	subheadings: number;
-	mtime: number;
-	size: number | null;
 	/** Aggregate body tokens; 0 when v7 `file_metrics` row absent (legacy). */
 	bodyTokensApprox: number;
 	/** Same as `bodyTokensApprox` for files (a leaf has no descendants). */
@@ -216,6 +228,10 @@ export class IndexHandle implements VaultFileIndex {
 	private readonly stmtSetInflightIncludeHidden: Statement;
 	private readonly stmtGetEverComplete: Statement;
 	private readonly stmtFinalize: Statement;
+	// D37: single round-trip for `getStatus()`'s two SELECTs
+	// (files_indexed + last_scan_finished_at). Used by `getStatus()` and
+	// by `getLastScanFinishedAt()` so there's one source-of-SQL.
+	private readonly stmtGetStatusFields: Statement;
 	private readonly stmtListIndexedFiles: Statement;
 	private readonly stmtDeleteWikilinksForFile: Statement;
 	private readonly stmtInsertWikilink: Statement;
@@ -230,15 +246,13 @@ export class IndexHandle implements VaultFileIndex {
 	// iteration over `listIndexedFiles()`.
 	private fileCache: FileCacheSnapshot | null = null;
 
-	// `ever_complete` is one-way set by {@link markScanFinalized} — once
-	// true, never reset, so cache staleness is impossible.
-	// Other persisted flags (`scan_complete`, `inflight_include_hidden`,
-	// `include_hidden`) do NOT cache: under same-policy multi-process
-	// operation a peer's mid-startup finalize between this handle's
-	// construction and a setter call would let the cache go stale
-	// relative to disk. Setters write disk directly; getters issue a
-	// fresh SELECT each call.
-	private everCompletePersisted: boolean;
+	// Persisted-flag getters (`scan_complete`, `inflight_include_hidden`,
+	// `include_hidden`, `ever_complete`) all read disk per call — under
+	// same-policy multi-process operation (round 30) a peer's mid-life
+	// finalize is invisible to any in-memory cache, producing
+	// self-contradictory snapshots (e.g. cached `ever_complete=false`
+	// alongside the peer's freshly-written `last_scan_finished_at`).
+	// Setters write disk directly; getters issue a fresh SELECT each call.
 
 	// Per-file failures the watcher can still recover. Both scanner and
 	// the watcher's `reindexCallback` add via {@link addPendingRetry};
@@ -304,8 +318,6 @@ export class IndexHandle implements VaultFileIndex {
 		this.stmtGetFileStats = db.prepare(
 			`SELECT
 			   SUM(CASE WHEN f.anchor_kind = 'heading' THEN 1 ELSE 0 END) AS subheadings,
-			   MAX(f.mtime) AS mtime,
-			   MAX(f.size) AS size,
 			   COALESCE(m.body_tokens_approx, 0) AS body_tokens_approx,
 			   COALESCE(m.descendant_tokens_approx, 0) AS descendant_tokens_approx,
 			   COALESCE(m.content_kinds_json, '[]') AS content_kinds_json
@@ -366,16 +378,27 @@ export class IndexHandle implements VaultFileIndex {
 		this.stmtSetInflightIncludeHidden = db.prepare(
 			"UPDATE index_meta SET inflight_include_hidden = :value WHERE id = 1",
 		);
-		// Only `ever_complete` is cached (one-way set; staleness impossible).
-		// The other persisted flags use their per-flag getters which read
-		// disk directly — see {@link everCompletePersisted}.
 		this.stmtGetEverComplete = db.prepare("SELECT ever_complete FROM index_meta WHERE id = 1");
 		// Single statement so the finalize columns commit atomically.
 		// `inflight_include_hidden = NULL` clears the in-flight marker in
 		// the same UPDATE — a SIGTERM mid-finalize cannot leave the clear
 		// half-done.
 		this.stmtFinalize = db.prepare(
-			"UPDATE index_meta SET scan_complete = 1, ever_complete = 1, include_hidden = :include_hidden, inflight_include_hidden = NULL WHERE id = 1",
+			"UPDATE index_meta SET scan_complete = 1, ever_complete = 1, include_hidden = :include_hidden, " +
+				"inflight_include_hidden = NULL, last_scan_finished_at = :last_scan_finished_at WHERE id = 1",
+		);
+		// Inline subqueries so the round-trip is one prepared-statement
+		// invocation. `frontmatter` count matches `countFiles()`'s query;
+		// `index_meta` is a single row so the inner SELECT is O(1).
+		// `ever_complete` joined in (D39) so {@link getStatusSnapshot} can
+		// surface an atomic combined snapshot — a peer's `markScanFinalized`
+		// writes all three fields in one UPDATE, and reading them via two
+		// separate SELECTs would expose a torn combination that never
+		// existed on disk.
+		this.stmtGetStatusFields = db.prepare(
+			"SELECT (SELECT COUNT(*) FROM frontmatter) AS files_indexed, " +
+				"(SELECT last_scan_finished_at FROM index_meta WHERE id = 1) AS last_scan_finished_at, " +
+				"(SELECT ever_complete FROM index_meta WHERE id = 1) AS ever_complete",
 		);
 		// `frontmatter` is the canonical "indexed files" set: every
 		// `replaceFile` upserts a row, even for files with zero fragments.
@@ -413,8 +436,6 @@ export class IndexHandle implements VaultFileIndex {
 			db.prepare(`DELETE FROM ${t} WHERE lower(${c}) GLOB :prefix`),
 		);
 		this.stmtsSweepCacheByteWise = sweepTargets.map(([t, c]) => db.prepare(`DELETE FROM ${t} WHERE ${c} GLOB :prefix`));
-		const everCompleteRow = this.stmtGetEverComplete.get() as { ever_complete: number } | undefined;
-		this.everCompletePersisted = everCompleteRow !== undefined && everCompleteRow.ever_complete === 1;
 	}
 
 	/**
@@ -441,9 +462,16 @@ export class IndexHandle implements VaultFileIndex {
 	 * `scan_complete=false AND ever_complete=true`. Startup state
 	 * machine only treats the latter as "warm" — see
 	 * `chooseStartupState`.
+	 *
+	 * Reads disk per call: under same-policy multi-process operation
+	 * (round 30) a peer's finalize is invisible to other peers'
+	 * in-memory state, producing a self-contradictory `get_server_info`
+	 * snapshot (`ever_complete=false` alongside the peer's
+	 * `last_scan_finished_at`). Cost: ~µs via prepared statement.
 	 */
 	getEverComplete(): boolean {
-		return this.everCompletePersisted;
+		const row = this.stmtGetEverComplete.get() as { ever_complete: number } | undefined;
+		return row !== undefined && row.ever_complete === 1;
 	}
 
 	/**
@@ -491,6 +519,12 @@ export class IndexHandle implements VaultFileIndex {
 	 * the last cleanly-finalized snapshot's policy AND the in-flight
 	 * marker is cleared atomically.
 	 *
+	 * Also resets `failedSubtreesPresent` (D40). Merkle-driven finalizes
+	 * did not previously clear this sticky flag, leaving degradation stuck
+	 * `true` until process restart. Both scanner and merkle gate finalize
+	 * on "no failures observed this pass," so clearing here is always
+	 * correct.
+	 *
 	 * Every call writes; no cache-skip. Under same-policy multi-process
 	 * operation a peer's cached `scan_complete=true` can be stale
 	 * relative to disk if another peer writes `scan_complete=0` during
@@ -499,10 +533,16 @@ export class IndexHandle implements VaultFileIndex {
 	 * free.
 	 */
 	markScanFinalized(): void {
-		this.stmtFinalize.run({ include_hidden: this.includeHidden ? 1 : 0 });
-		this.everCompletePersisted = true;
+		// Capture once so the surfaced `last_scan_finished_at` exactly
+		// matches the DB row (no jitter from a second `Date.now()` read).
+		const finishedAt = Date.now();
+		this.stmtFinalize.run({
+			include_hidden: this.includeHidden ? 1 : 0,
+			last_scan_finished_at: finishedAt,
+		});
 		this.setStatus("warm");
 		this.scanIncomplete = false;
+		this.failedSubtreesPresent = false;
 	}
 
 	/**
@@ -552,7 +592,60 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	getStatus(): IndexStatus {
-		return { state: this.state, files_indexed: this.countFiles() };
+		return this.buildStatus(this.readStatusFields());
+	}
+
+	/**
+	 * D39: atomic combined snapshot of `IndexStatus` plus `ever_complete`,
+	 * read in ONE prepared-statement invocation. Used by `buildServerInfo`
+	 * (`get_server_info`) so a same-policy multi-process peer's atomic
+	 * `markScanFinalized` cannot land between two SELECTs and surface a
+	 * `{ever_complete: true, last_scan_finished_at: undefined}` combination
+	 * that never existed on disk.
+	 *
+	 * `_meta.index_status` stays on the narrower {@link IndexStatus} shape
+	 * so `ever_complete` doesn't leak onto every tool's envelope.
+	 */
+	getStatusSnapshot(): IndexStatusSnapshot {
+		const row = this.readStatusFields();
+		return { ...this.buildStatus(row), ever_complete: row.ever_complete === 1 };
+	}
+
+	/**
+	 * D37: epoch-ms of the most recent {@link markScanFinalized}. NULL when
+	 * never finalized. Surfaced as ISO 8601 via {@link getStatus}; this
+	 * accessor returns the raw ms value for tests that need exact-bounds
+	 * comparisons against `Date.now()`.
+	 */
+	getLastScanFinishedAt(): number | null {
+		return this.readStatusFields().last_scan_finished_at;
+	}
+
+	private buildStatus(row: StatusFieldsRow): IndexStatus {
+		const status: IndexStatus = { state: this.state, files_indexed: row.files_indexed };
+		if (row.last_scan_finished_at !== null) {
+			status.last_scan_finished_at = new Date(row.last_scan_finished_at).toISOString();
+		}
+		const degraded = this.getDegradedSignals();
+		if (degraded.failed_subtrees_present || degraded.pending_retries > 0) status.degraded = degraded;
+		return status;
+	}
+
+	private readStatusFields(): StatusFieldsRow {
+		return this.stmtGetStatusFields.get() as StatusFieldsRow;
+	}
+
+	/**
+	 * D37: current-scan degradation signals for `_meta.index_status.degraded`
+	 * and `get_server_info`. `failedSubtreesPresent` is sticky from end of
+	 * the most recent scan (reset at scanner start), so this reflects the
+	 * CURRENT scan only — historical EACCES is not retained.
+	 */
+	getDegradedSignals(): { failed_subtrees_present: boolean; pending_retries: number } {
+		return {
+			failed_subtrees_present: this.failedSubtreesPresent,
+			pending_retries: this.pendingRetries.size,
+		};
 	}
 
 	/**
@@ -937,8 +1030,6 @@ LIMIT :pageSize
 		const row = this.stmtGetFileStats.get({ file }) as
 			| {
 					subheadings: number | null;
-					mtime: number;
-					size: number | null;
 					body_tokens_approx: number;
 					descendant_tokens_approx: number;
 					content_kinds_json: string;
@@ -956,8 +1047,6 @@ LIMIT :pageSize
 		}
 		return {
 			subheadings: row.subheadings ?? 0,
-			mtime: row.mtime,
-			size: row.size,
 			bodyTokensApprox: row.body_tokens_approx,
 			descendantTokensApprox: row.descendant_tokens_approx,
 			contentKinds,

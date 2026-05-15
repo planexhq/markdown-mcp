@@ -317,31 +317,31 @@ async function materializeItem(
 	};
 
 	if (node.type === "file") {
+		// Disk-side fields read live so they match get_fragment.file_size_bytes
+		// (D37/D41 cross-check); indexed parsed-structure stays indexed.
+		const disk = await safeStatFileMeta(join(vaultRoot.absolute, node.relpath));
+		if (disk !== null) {
+			item.mtime = disk.mtime;
+			if (disk.isFile) item.size_bytes = disk.size;
+		}
 		const stats = index?.getFileStats(node.relpath);
 		if (stats !== null && stats !== undefined) {
 			item.subheadings = stats.subheadings;
-			item.mtime = stats.mtime;
 			item.bodyTokensApprox = stats.bodyTokensApprox;
 			item.descendantTokensApprox = stats.descendantTokensApprox;
 			if (stats.contentKinds.length > 0) item.contentKinds = [...stats.contentKinds];
-			return item;
 		}
-		// Indexer-cold file: stat the path directly. Vanish-between-walk-
-		// and-stat is benign — keep the default `mtime: 0`.
-		item.mtime = await safeStatMtime(join(vaultRoot.absolute, node.relpath));
 		return item;
 	}
-	// Directory: parallel `readdir` (children count, lazy-load hint per
-	// the `get_vault_tree` contract) + `stat` (mtime). Per-page cost
-	// scales with dir count; serialized fs ops would dominate for
-	// pageSize-bounded responses with many directories.
+	// Parallel readdir (children count, lazy-load hint) + lstat (mtime):
+	// serialized fs ops would dominate pageSize-bounded responses.
 	const absPath = join(vaultRoot.absolute, node.relpath);
-	const [children, mtime] = await Promise.all([
+	const [children, meta] = await Promise.all([
 		safeChildrenCount(absPath, node.relpath, includeHidden),
-		safeStatMtime(absPath),
+		safeStatFileMeta(absPath),
 	]);
 	item.children = children;
-	item.mtime = mtime;
+	item.mtime = meta?.mtime ?? 0;
 	return item;
 }
 
@@ -362,15 +362,20 @@ async function isRealDirectory(absPath: string): Promise<boolean> {
 	}
 }
 
-async function safeStatMtime(absPath: string): Promise<number> {
+/**
+ * `lstat`, not `stat`: a leaf-symlink swap between walkTreeDfs and now
+ * would leak the target's bytes/mtime. Null result keeps `mtime: 0` and
+ * omits `size_bytes`. `isFile` is false for dir/FIFO/socket swaps that
+ * survived the symlink reject; the file-branch caller gates `size_bytes`
+ * on it so `st.size` (meaningless for non-regular inodes) doesn't leak.
+ */
+async function safeStatFileMeta(absPath: string): Promise<{ mtime: number; size: number; isFile: boolean } | null> {
 	try {
-		// `lstat`, not `stat`: a leaf-symlink swap between walkTreeDfs's
-		// observation and now would otherwise leak the target's mtime.
 		const st = await lstat(absPath);
-		if (st.isSymbolicLink()) return 0;
-		return st.mtimeMs;
+		if (st.isSymbolicLink()) return null;
+		return { mtime: st.mtimeMs, size: st.size, isFile: st.isFile() };
 	} catch {
-		return 0;
+		return null;
 	}
 }
 

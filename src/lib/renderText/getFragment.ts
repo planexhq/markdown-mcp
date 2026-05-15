@@ -47,20 +47,23 @@ export function renderFragment(sc: FragmentResult, meta: MetaEnvelope): string {
 }
 
 function renderHeader(sc: FragmentResult): string {
-	const tokens = `~${sc.bodyTokensApprox} tok`;
+	// `file_size_bytes` is the WHOLE-FILE byte count, distinct from
+	// `bodyTokensApprox` (sliced section). Surfacing both lets agents
+	// reproduce integrity checks (re-fetch via `note://` and compare).
+	const stats = `~${sc.bodyTokensApprox} tok, ${sc.file_size_bytes} B`;
 	switch (sc.anchor_kind) {
 		case "heading":
-			return `fragment · ${formatFileHeading(sc.file, sc.heading_path)}  (level ${sc.level}, ${tokens})`;
+			return `fragment · ${formatFileHeading(sc.file, sc.heading_path)}  (level ${sc.level}, ${stats})`;
 		case "preamble":
-			return `fragment · ${formatFileHeading(sc.file)} · preamble  (${tokens})`;
+			return `fragment · ${formatFileHeading(sc.file)} · preamble  (${stats})`;
 		case "block": {
 			const file = formatFileHeading(sc.file);
 			const path = formatHeadingPath(sc.containing_heading_path);
 			const containerLabel = path.length > 0 ? ` · ${path}` : "";
-			return `fragment · ${file}${containerLabel} · block ^${sc.block_id}  (${tokens})`;
+			return `fragment · ${file}${containerLabel} · block ^${sc.block_id}  (${stats})`;
 		}
 		case "file":
-			return `fragment · ${formatFileHeading(sc.file)} · whole file  (${tokens})`;
+			return `fragment · ${formatFileHeading(sc.file)} · whole file  (${stats})`;
 	}
 }
 

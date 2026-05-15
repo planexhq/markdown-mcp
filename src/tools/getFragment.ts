@@ -75,7 +75,7 @@ export async function handleGetFragment(
 	const meta = newMetaForHandler(index, { tokenizer: getTokenizerId() });
 	try {
 		const safePath = await validatePath(input.file, vaultRoot);
-		const { parsed } = await readNote(safePath, {}, includeHidden);
+		const { parsed, sizeBytes } = await readNote(safePath, {}, includeHidden);
 		// Defer link resolution and embed expansion until the index has a
 		// usable snapshot — pre-warm, basename/heading maps are a strict
 		// subset of the eventual vault, so `[[foo]]` can resolve uniquely
@@ -100,7 +100,7 @@ export async function handleGetFragment(
 			// cached pre-swap id from a fresh post-swap id.
 			const heading = parsed.headings.find((h) => h.stable_id === normalized);
 			if (heading) {
-				const fragment = buildHeadingFragment(heading, parsed, "fresh", vaultIndex);
+				const fragment = buildHeadingFragment(heading, parsed, sizeBytes, "fresh", vaultIndex);
 				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 				return successEnvelope(fragment, meta, { renderText: renderFragment });
 			}
@@ -109,6 +109,7 @@ export async function handleGetFragment(
 				return resolveStaleStableId(
 					history,
 					parsed,
+					sizeBytes,
 					input.stable_id,
 					meta,
 					vaultRoot,
@@ -133,7 +134,7 @@ export async function handleGetFragment(
 		// 2. Dispatch on anchor.kind.
 		switch (input.anchor.kind) {
 			case "file": {
-				const fragment = buildFileFragment(parsed, vaultIndex);
+				const fragment = buildFileFragment(parsed, sizeBytes, vaultIndex);
 				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 				return successEnvelope(fragment, meta, { renderText: renderFragment });
 			}
@@ -141,7 +142,7 @@ export async function handleGetFragment(
 			case "heading_path": {
 				const path = normalizeHeadingPath(input.anchor.path);
 				if (path.length === 0) {
-					const fragment = buildPreambleFragment(parsed, vaultIndex);
+					const fragment = buildPreambleFragment(parsed, sizeBytes, vaultIndex);
 					await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 					return successEnvelope(fragment, meta, { renderText: renderFragment });
 				}
@@ -180,7 +181,7 @@ export async function handleGetFragment(
 						meta,
 					);
 				}
-				const fragment = buildHeadingFragment(heading, parsed, "fresh", vaultIndex);
+				const fragment = buildHeadingFragment(heading, parsed, sizeBytes, "fresh", vaultIndex);
 				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 				return successEnvelope(fragment, meta, { renderText: renderFragment });
 			}
@@ -204,7 +205,7 @@ export async function handleGetFragment(
 						meta,
 					);
 				}
-				const fragment = buildBlockFragment(block, parsed, vaultIndex);
+				const fragment = buildBlockFragment(block, parsed, sizeBytes, vaultIndex);
 				await maybeExpandEmbeds(fragment, input.expand_embeds, vaultRoot, vaultIndex, includeHidden);
 				return successEnvelope(fragment, meta, { renderText: renderFragment });
 			}
@@ -233,6 +234,7 @@ export async function handleGetFragment(
 async function resolveStaleStableId(
 	history: HeadingHistoryRow,
 	parsed: ParsedFile,
+	sizeBytes: number,
 	requestedStableId: string,
 	meta: MetaEnvelope,
 	vaultRoot: VaultRoot,
@@ -248,7 +250,7 @@ async function resolveStaleStableId(
 	}));
 	const fuzzyMeta = { ...meta, fuzzy_algorithm: FUZZY_ALGORITHM_ID };
 	if (recovery.primary !== null) {
-		const fragment = buildHeadingFragment(recovery.primary.heading, parsed, "stale", vaultIndex);
+		const fragment = buildHeadingFragment(recovery.primary.heading, parsed, sizeBytes, "stale", vaultIndex);
 		fragment.requested_stable_id = requestedStableId;
 		if (candidates.length > 0) fragment.fuzzy_candidates = candidates;
 		await maybeExpandEmbeds(fragment, expandEmbedsOpt, vaultRoot, vaultIndex, includeHidden);
@@ -272,6 +274,7 @@ async function resolveStaleStableId(
 function buildHeadingFragment(
 	heading: HeadingMeta,
 	parsed: ParsedFile,
+	sizeBytes: number,
 	status: "fresh" | "stale",
 	vaultIndex: VaultFileIndex | undefined,
 ): HeadingFragment {
@@ -287,6 +290,7 @@ function buildHeadingFragment(
 		file: parsed.relpath,
 		content,
 		bodyTokensApprox: estimateTokens(content),
+		file_size_bytes: sizeBytes,
 		outgoing_links: outgoing,
 		embeds,
 		stable_id: heading.stable_id,
@@ -297,7 +301,11 @@ function buildHeadingFragment(
 	};
 }
 
-function buildPreambleFragment(parsed: ParsedFile, vaultIndex: VaultFileIndex | undefined): PreambleFragment {
+function buildPreambleFragment(
+	parsed: ParsedFile,
+	sizeBytes: number,
+	vaultIndex: VaultFileIndex | undefined,
+): PreambleFragment {
 	const start = parsed.preamble?.offsetRange.start ?? 0;
 	const end = parsed.preamble?.offsetRange.end ?? 0;
 	const content = parsed.preamble ? parsed.source.slice(start, end) : "";
@@ -307,6 +315,7 @@ function buildPreambleFragment(parsed: ParsedFile, vaultIndex: VaultFileIndex | 
 		file: parsed.relpath,
 		content,
 		bodyTokensApprox: estimateTokens(content),
+		file_size_bytes: sizeBytes,
 		outgoing_links: outgoing,
 		embeds,
 	};
@@ -315,6 +324,7 @@ function buildPreambleFragment(parsed: ParsedFile, vaultIndex: VaultFileIndex | 
 function buildBlockFragment(
 	block: BlockMeta,
 	parsed: ParsedFile,
+	sizeBytes: number,
 	vaultIndex: VaultFileIndex | undefined,
 ): BlockFragment {
 	const raw = parsed.source.slice(block.offsetRange.start, block.offsetRange.end);
@@ -332,6 +342,7 @@ function buildBlockFragment(
 		file: parsed.relpath,
 		content,
 		bodyTokensApprox: estimateTokens(content),
+		file_size_bytes: sizeBytes,
 		outgoing_links: outgoing,
 		embeds,
 		block_id: block.id,
@@ -343,7 +354,11 @@ function buildBlockFragment(
 	return result;
 }
 
-function buildFileFragment(parsed: ParsedFile, vaultIndex: VaultFileIndex | undefined): FileFragment {
+function buildFileFragment(
+	parsed: ParsedFile,
+	sizeBytes: number,
+	vaultIndex: VaultFileIndex | undefined,
+): FileFragment {
 	// File fragment excludes frontmatter (Brief decision matrix line 785).
 	const start = fileBodyStartOffset(parsed);
 	const content = parsed.source.slice(start);
@@ -354,6 +369,7 @@ function buildFileFragment(parsed: ParsedFile, vaultIndex: VaultFileIndex | unde
 		file: parsed.relpath,
 		content,
 		bodyTokensApprox: estimateTokens(content),
+		file_size_bytes: sizeBytes,
 		outgoing_links: outgoing,
 		embeds,
 	};

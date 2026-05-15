@@ -128,6 +128,26 @@ describe("renderTree", () => {
 		expect(out).toBe(["tree · 1 item", "", "[file]  notes/just-saved.md  (rank 1, unindexed)"].join("\n"));
 	});
 
+	test("D41-realistic unindexed: live size_bytes present, no parsed stats → `unindexed, K B`", () => {
+		// Live size_bytes alone must not mask the unindexed signal —
+		// `subheadings === undefined` is the canonical indexedness check.
+		const sc: GetVaultTreeResult = {
+			items: [
+				{
+					id: "t:bbbbbbbbbbbbbb",
+					type: "file",
+					path: "notes/just-saved.md",
+					name: "just-saved.md",
+					dfs_rank: 1,
+					mtime: 1_700_000_000_000,
+					size_bytes: 123,
+				},
+			],
+		};
+		const out = renderTree(sc, meta());
+		expect(out).toBe(["tree · 1 item", "", "[file]  notes/just-saved.md  (rank 1, unindexed, 123 B)"].join("\n"));
+	});
+
 	test("warming state surfaces", () => {
 		const sc: GetVaultTreeResult = { items: [] };
 		const out = renderTree(sc, meta({ index_status: { state: "warming", files_indexed: 5 } }));
