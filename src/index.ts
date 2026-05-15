@@ -16,10 +16,12 @@
 
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { PassThrough } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseArgs } from "node:util";
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 
 import { errorMessage } from "./lib/error.js";
 import { detectCaseInsensitiveFs } from "./lib/fsDetect.js";
@@ -27,6 +29,7 @@ import { INDEX_DIR_NAME, setFsCaseInsensitive } from "./lib/hiddenPath.js";
 import { createIndexHandle, type IndexHandle } from "./lib/index/IndexHandle.js";
 import { type IndexOutcome, reindexOne, type ScanResult, scanVault } from "./lib/index/scanner.js";
 import { closeSqlite, detectPreW4Schema, openSqliteWithRecovery } from "./lib/index/sqlite.js";
+import type { InflightTracker } from "./lib/inflightTracker.js";
 import { type MerkleTickHandle, startMerkleTick } from "./lib/merkle.js";
 import { acquireServerLock, ServerLockError, type ServerLockHandle } from "./lib/serverLock.js";
 import { chooseStartupState, computePolicyMismatch } from "./lib/startup.js";
@@ -40,7 +43,7 @@ import {
 import { PACKAGE_VERSION } from "./lib/version.js";
 import { startWatcher, type Watcher } from "./lib/watcher.js";
 import { WriteCoordinator } from "./lib/writeCoordinator.js";
-import { createServer } from "./server.js";
+import { createServer, type ServerInstance } from "./server.js";
 
 interface CliArgs {
 	vault: string;
@@ -117,6 +120,20 @@ export const TEST_ENV = {
 	/** Pause inside `acquireServerLock`'s `onSlotCreated` callback so a signal can land between own-slot creation and reconcile return. */
 	RECONCILE_DELAY_MS: "MARKDOWN_MCP_TEST_RECONCILE_DELAY_MS",
 } as const;
+
+/**
+ * JSON-RPC message-shape predicates for the inflight tracker hooks.
+ * The SDK exports zod-backed `isJSONRPC*` helpers, but every send /
+ * onmessage call would pay a full schema parse — overkill when the
+ * transport only ever produces SDK-shaped messages. The shape checks
+ * are sufficient to disambiguate request / response / notification.
+ */
+function isJsonRpcRequestShape(msg: unknown): boolean {
+	return typeof msg === "object" && msg !== null && "id" in msg && "method" in msg;
+}
+function isJsonRpcResponseShape(msg: unknown): boolean {
+	return typeof msg === "object" && msg !== null && "id" in msg && ("result" in msg || "error" in msg);
+}
 
 function printValidationError(err: PathValidationError): void {
 	console.error(`error: ${err.payload.message}`);
@@ -251,30 +268,58 @@ async function main(): Promise<void> {
 	let scanInProgress: Promise<ScanResult> | null = null;
 	let watcher: Watcher | null = null;
 	let merkleTick: MerkleTickHandle | null = null;
-	let server: ReturnType<typeof createServer> | null = null;
+	let server: ServerInstance["server"] | null = null;
+	let inflight: InflightTracker | null = null;
+	let transport: Transport | null = null;
 	let shuttingDown = false;
 
-	// Order is load-bearing: stop producers → drain coordinator → close
-	// server → close DB → release lock. Releasing earlier opens a window
-	// for a concurrent opposite-policy peer to acquire the lock and start
-	// writing the WAL we still hold. `shuttingDown` guards double-call
-	// (signal during catch-path teardown).
+	// Order is load-bearing: drain in-flight handlers → stop producers →
+	// drain coordinator → close server → close DB → release lock.
+	// Releasing earlier opens a window for a concurrent opposite-policy
+	// peer to acquire the lock and start writing the WAL we still hold.
+	// `shuttingDown` guards double-call (signal during catch-path
+	// teardown).
 	const tearDownAndExit = async (reason: string, exitCode: number): Promise<void> => {
 		if (shuttingDown) return;
 		shuttingDown = true;
 		console.error(reason);
 		scanController?.abort();
-		// Two-phase drain: stop event producers (chokidar, merkle interval,
-		// scanner) FIRST, then drain the coordinator. WriteCoordinator.drain
-		// is a single-pass snapshot — running it in parallel with
-		// watcher.close() lets a chokidar event mid-shutdown enqueue a
-		// task AFTER the snapshot. Phase order guarantees the snapshot
-		// covers every chain. Both phases share the SHUTDOWN_DRAIN_MS
-		// budget via a running clock.
+		// Stop dispatching new RPC requests so they don't race the
+		// later `server.close()` / `process.exit()` sequence. On signal-
+		// driven shutdowns (SIGTERM / SIGINT / SIGHUP) stdin stays open
+		// and a host can deliver a request between the drain's
+		// count-to-zero observation and the final exit; without this
+		// override the SDK's chained dispatcher would still call the
+		// handler, the transport.send would race process.exit, and the
+		// late response would be truncated. In-flight requests (already
+		// past dispatch) are unaffected — they live in the SDK's
+		// `_onrequest` promise chain, not gated by onmessage — so the
+		// drain still completes them honestly.
+		if (transport !== null) transport.onmessage = () => {};
+		// Three-phase drain: (1) wait for outstanding MCP request handlers
+		// so their responses land on stdout BEFORE `server.close()` + the
+		// final `process.exit()` discard a partial stdout buffer — the
+		// race that triggers when a client half-closes stdin while a big
+		// `tools/call` is still mid-response. (2) Stop event producers
+		// (chokidar, merkle interval, scanner). (3) Drain the
+		// WriteCoordinator. WriteCoordinator.drain is a single-pass
+		// snapshot — running it in parallel with watcher.close() lets a
+		// chokidar event mid-shutdown enqueue a task AFTER the snapshot.
+		// Phase order guarantees the snapshot covers every chain. All
+		// three phases share the SHUTDOWN_DRAIN_MS budget via a running
+		// clock.
 		const startTime = Date.now();
 		const remaining = (): number => Math.max(0, SHUTDOWN_DRAIN_MS - (Date.now() - startTime));
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
+			if (inflight !== null) {
+				const inflightResult = await inflight.drain(remaining());
+				if (inflightResult === "timeout") {
+					console.error(
+						`markdown-mcp: tearDown drain timeout while waiting for ${inflight.size()} in-flight request(s); proceeding with close.`,
+					);
+				}
+			}
 			const producerStops = Promise.allSettled([
 				merkleTick?.stop() ?? Promise.resolve(),
 				watcher?.close() ?? Promise.resolve(),
@@ -332,6 +377,15 @@ async function main(): Promise<void> {
 	process.on("SIGINT", () => {
 		void shutdown("SIGINT");
 	});
+	process.on("SIGHUP", () => {
+		void shutdown("SIGHUP");
+	});
+	// PassThrough holder, populated AFTER lock acquisition. See the
+	// `process.stdin.pipe(...)` site below for why the pipe doesn't run
+	// pre-lock: spawnSync-style invocations close their pipe immediately,
+	// which would race the lock-conflict error path and let the child
+	// exit cleanly without surfacing the conflict.
+	let stdinProxy: PassThrough | null = null;
 
 	// Acquire BEFORE opening SQLite: a conflicting concurrent process must
 	// not see our policy mismatch driving its own WAL writes, and we must
@@ -355,6 +409,62 @@ async function main(): Promise<void> {
 	);
 
 	try {
+		// Pipe `process.stdin` to a PassThrough so EOF is detectable
+		// during the post-lock startup window (SQLite open, scanner
+		// setup, the test-injected startup delay). `process.stdin` is
+		// paused by default; its `'end'` event only fires after the
+		// stream is read past EOF, and the SDK transport doesn't attach
+		// its data listener until `transport.start()` runs inside
+		// `server.connect()` — well after this point. Without the pipe,
+		// a client that closes stdin during startup is not noticed
+		// until startup completes; the server keeps holding the lock
+		// and running scanner work after the session is already gone.
+		//
+		// The pipe runs AFTER `acquireServerLock` so spawnSync-style
+		// invocations (whose pipe stdin is at EOF from the start) still
+		// surface lock conflicts as exit 1 via `runOrExitOnLockConflict`
+		// before the stdin-EOF shutdown path can race them.
+		stdinProxy = new PassThrough();
+		const proxy = stdinProxy;
+		// Forward stdin/proxy stream errors through the shutdown path
+		// instead of letting Node's default unhandled-'error' behavior
+		// terminate the process abruptly. The SDK transport attaches its
+		// own error listener on `stdinProxy` only after `server.connect`
+		// runs; before that, an error here (or one forwarded from
+		// `process.stdin` via `pipe`'s onerror) would crash the process
+		// per EventEmitter semantics. Listeners on both streams are
+		// needed because `pipe`'s internal onerror destroys `dest` with
+		// the error when `dest` has no other error listener — emitting
+		// a fresh 'error' on `stdinProxy` that we must also catch.
+		const onStdinStreamError = (err: unknown): void => {
+			console.error(`markdown-mcp: stdin stream error: ${errorMessage(err)}`);
+			void shutdown("STDIN_ERROR");
+		};
+		process.stdin.once("error", onStdinStreamError);
+		proxy.once("error", onStdinStreamError);
+		process.stdin.once("end", () => {
+			// If the proxy has buffered bytes when `process.stdin` EOFs,
+			// the client sent valid request(s) (e.g. `initialize`) then
+			// closed stdin to signal "done sending." Defer shutdown to
+			// the proxy's own `'end'` — the transport (when `server.
+			// connect` runs) consumes the buffer, the wrapped
+			// `transport.send` resolves into `inflight.exit()`, and the
+			// proxy emits `'end'` once its writable side is closed AND
+			// its readable buffer is drained. Without this branch the
+			// buffered payload would be dropped: shutdown would fire
+			// before `server.connect` ever attached a data listener.
+			// Empty buffer at EOF → the original prompt-shutdown case
+			// (client gave up without sending anything).
+			if (proxy.readableLength === 0) {
+				void shutdown("STDIN_EOF");
+				return;
+			}
+			proxy.once("end", () => {
+				void shutdown("STDIN_EOF");
+			});
+		});
+		process.stdin.pipe(stdinProxy);
+
 		// Test-only deterministic pause between lock-acquisition and the rest
 		// of startup. The `index.signalDuringStartup` test uses it to SIGTERM
 		// during the protected window and verify the lockfile is cleaned up.
@@ -488,8 +598,43 @@ async function main(): Promise<void> {
 				return { filesIndexed: 0, filesSkipped: 0, aborted: false } satisfies ScanResult;
 			});
 
-		server = createServer(vaultRoot, index, { includeHidden: args.includeHidden });
-		const transport = new StdioServerTransport();
+		const instance = createServer(vaultRoot, index, { includeHidden: args.includeHidden });
+		server = instance.server;
+		inflight = instance.inflight;
+		// `stdinProxy` is the post-lock-acquire pipe target (see top of
+		// try block). The transport reads from it instead of
+		// `process.stdin` so early-startup EOF detection on `process.stdin`
+		// works without the transport stealing data from it.
+		if (stdinProxy === null) throw new Error("stdinProxy must be initialized before connecting the transport.");
+		transport = new StdioServerTransport(stdinProxy);
+
+		// Wire the inflight counter at the transport boundary so the
+		// teardown drain spans the full request lifecycle, including the
+		// SDK's `await transport.send(response)` step. Tracking the
+		// handler promise alone left a window where `count === 0` between
+		// `handler(request)` resolving and `transport.send(response)`
+		// awaiting stdout drain — a large or backpressured reply was lost
+		// to `process.exit()`. See `lib/inflightTracker.ts` for the
+		// invariant.
+		//
+		// Both hooks are installed BEFORE `server.connect`: the SDK's
+		// `connect` captures the existing `transport.onmessage` and
+		// chain-calls it before its own dispatch (`protocol.js:234-249`),
+		// so our `enter()` fires before the SDK invokes the request
+		// handler. `transport.send` is read fresh on every send call, so
+		// our wrapper is used for all outgoing messages.
+		const originalSend = transport.send.bind(transport);
+		transport.send = async (message) => {
+			try {
+				await originalSend(message);
+			} finally {
+				if (isJsonRpcResponseShape(message)) instance.inflight.exit();
+			}
+		};
+		transport.onmessage = (message) => {
+			if (isJsonRpcRequestShape(message)) instance.inflight.enter();
+		};
+
 		await server.connect(transport);
 		console.error(`markdown-mcp running on stdio (vault: ${vaultRoot.absolute}, db: ${dbPath})`);
 

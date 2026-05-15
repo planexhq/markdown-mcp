@@ -23,6 +23,7 @@ import {
 
 import { errorMessage, internalErrorEnvelope, markdownParseErrorPayload, vaultError } from "./lib/error.js";
 import type { IndexHandle } from "./lib/index/IndexHandle.js";
+import { createInflightTracker, type InflightTracker } from "./lib/inflightTracker.js";
 import { MIN_PROTOCOL_VERSION } from "./lib/limits.js";
 import { ParseError } from "./lib/parser.js";
 import { FileTooLargeError, readSource } from "./lib/readNote.js";
@@ -82,14 +83,28 @@ export interface ServerConfig {
 }
 
 /**
- * Build a configured `McpServer` for the given vault root. Caller is
+ * Returned by `createServer`. The CLI wires `inflight` at the transport
+ * boundary: `transport.onmessage` increments on incoming requests and
+ * `transport.send` decrements after the SDK's send fully resolves —
+ * including stdout-drain wait under backpressure. `tearDownAndExit`
+ * awaits `inflight.drain(...)` before `process.exit()` so the final
+ * response isn't truncated. See `src/lib/inflightTracker.ts`.
+ */
+export interface ServerInstance {
+	server: McpServer;
+	inflight: InflightTracker;
+}
+
+/**
+ * Build a configured `McpServer` for the given vault root plus an
+ * in-flight request tracker scoped to that instance. Caller is
  * responsible for connecting it to a transport.
  *
  * `index` is mandatory for `search` and powers D32 fuzzy stale-id
  * recovery in `get_fragment`. Outline / metadata use it only for the
  * live `_meta.index_status`.
  */
-export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: ServerConfig = {}): McpServer {
+export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: ServerConfig = {}): ServerInstance {
 	const includeHidden = config.includeHidden ?? false;
 	// Process-start timestamp (ISO 8601, UTC). Captured here (D40) so each
 	// `createServer` instance reports its own creation time — agents detect
@@ -146,9 +161,16 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: 
 		};
 	});
 
+	// Tracker is constructed here but wired at the transport boundary by
+	// the caller — `transport.onmessage` increments on incoming requests
+	// and `transport.send` decrements after the response's stdout write
+	// fully resolves. Tracking the handler promise alone is unsafe under
+	// backpressure (see `lib/inflightTracker.ts` doc).
+	const inflight = createInflightTracker();
+
 	registerTools(server, vaultRoot, index, includeHidden, () => negotiatedProtocolVersion, serverStartedAt);
 	registerNoteResource(server, vaultRoot, includeHidden);
-	return server;
+	return { server, inflight };
 }
 
 // ─── Tool registration ─────────────────────────────────────────────────────
