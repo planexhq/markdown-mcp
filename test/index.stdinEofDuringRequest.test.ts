@@ -216,9 +216,7 @@ describe("stdin-EOF during in-flight request", () => {
 				setTimeout(
 					() =>
 						reject(
-							new Error(
-								`child did not exit within 15s. stderr:\n${getStderr()}\nstdout length: ${getStdout().length}`,
-							),
+							new Error(`child did not exit within 15s. stderr:\n${getStderr()}\nstdout length: ${getStdout().length}`),
 						),
 					15_000,
 				),
@@ -226,12 +224,14 @@ describe("stdin-EOF during in-flight request", () => {
 		]);
 		expect(exitCode).toBe(0);
 
-		const lines = getStdout().split("\n").filter((line) => line.length > 0);
+		const lines = getStdout()
+			.split("\n")
+			.filter((line) => line.length > 0);
 		const id2Line = lines.find((line) => line.includes('"id":2'));
 		expect(id2Line).toBeDefined();
 		// Response must be large enough that we actually exercised
 		// backpressure — sanity check.
-		expect(id2Line && id2Line.length).toBeGreaterThan(80_000);
+		expect(id2Line?.length).toBeGreaterThan(80_000);
 		const parsed = JSON.parse(id2Line ?? "");
 		expect(parsed.id).toBe(2);
 		expect(parsed.result?.content?.[0]?.text).toBeDefined();
@@ -296,9 +296,7 @@ describe("stdin-EOF during in-flight request", () => {
 				setTimeout(
 					() =>
 						reject(
-							new Error(
-								`child did not exit within 15s. stderr:\n${getStderr()}\nstdout length: ${getStdout().length}`,
-							),
+							new Error(`child did not exit within 15s. stderr:\n${getStderr()}\nstdout length: ${getStdout().length}`),
 						),
 					15_000,
 				),
@@ -306,7 +304,9 @@ describe("stdin-EOF during in-flight request", () => {
 		]);
 		expect(exitCode).toBe(0);
 
-		const lines = getStdout().split("\n").filter((line) => line.length > 0);
+		const lines = getStdout()
+			.split("\n")
+			.filter((line) => line.length > 0);
 
 		// First request (id:2) was in flight when SIGTERM landed — its
 		// response must arrive intact via the drain.

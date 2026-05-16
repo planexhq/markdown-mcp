@@ -71,9 +71,7 @@ describe("stdin-EOF with buffered request", () => {
 				setTimeout(
 					() =>
 						reject(
-							new Error(
-								`child did not exit within 15s. stderr:\n${stderrBuf}\nstdout:\n${stdoutBuf.slice(0, 500)}`,
-							),
+							new Error(`child did not exit within 15s. stderr:\n${stderrBuf}\nstdout:\n${stdoutBuf.slice(0, 500)}`),
 						),
 					15_000,
 				),
