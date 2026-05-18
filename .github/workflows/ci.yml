@@ -33,9 +33,7 @@ jobs:
       fail-fast: false
       matrix:
         node: ["22.x", "24.x"]
-        os: [macos-latest, ubuntu-latest]
-        # Windows omitted in W1: symlink test fixtures need admin/dev mode
-        # and `O_NOFOLLOW` is silently dropped by libuv on win32.
+        os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -47,5 +45,13 @@ jobs:
         with:
           name: dist
           path: dist/
-      - run: chmod +x dist/index.js
-      - run: npm test
+      # Restore the exec bit lost in the artifact round-trip. The Windows
+      # runner doesn't need it (test spawns invoke `node dist/index.js`
+      # via `process.execPath`, never the shebang).
+      - if: runner.os != 'Windows'
+        run: chmod +x dist/index.js
+      # Invoke vitest directly so npm's `pretest: npm run build` doesn't
+      # overwrite the artifact we just downloaded. The matrix exists to
+      # validate the uploaded dist/ round-trip — `npm test` here would
+      # silently rebuild from local sources and defeat that.
+      - run: npx vitest run

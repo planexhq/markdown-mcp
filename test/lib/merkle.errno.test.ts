@@ -10,6 +10,12 @@
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+// Mirror of scanner.errno's path normalizer: predicates here key on `/`,
+// so each helper converts the live fs path to POSIX form before invoking
+// the predicate. Test bodies that compare against an absolute path
+// should wrap it in `toPosix(...)` too.
+import { toPosix } from "../../src/lib/pathPosix.js";
+
 const realFs = vi.hoisted(() => ({
 	stat: null as unknown as typeof import("node:fs/promises").stat,
 	readdir: null as unknown as typeof import("node:fs/promises").readdir,
@@ -82,15 +88,15 @@ function makeFsError(code: string): NodeJS.ErrnoException {
 
 function mockReaddirErrnoFor(predicate: (path: string) => boolean, code: string): void {
 	vi.mocked(fsPromises.readdir).mockImplementation(((path: import("node:fs").PathLike, opts?: unknown) => {
-		if (typeof path === "string" && predicate(path)) return Promise.reject(makeFsError(code));
+		if (typeof path === "string" && predicate(toPosix(path))) return Promise.reject(makeFsError(code));
 		return (realFs.readdir as (p: import("node:fs").PathLike, o?: unknown) => Promise<unknown>)(path, opts);
 	}) as typeof fsPromises.readdir);
 }
 
 function mockStatErrnoFor(predicate: (path: string) => boolean, code: string): void {
-	vi.mocked(fsPromises.stat).mockImplementation(((path: import("node:fs").PathLike) => {
-		if (typeof path === "string" && predicate(path)) return Promise.reject(makeFsError(code));
-		return realFs.stat(path);
+	vi.mocked(fsPromises.stat).mockImplementation(((path: import("node:fs").PathLike, opts?: unknown) => {
+		if (typeof path === "string" && predicate(toPosix(path))) return Promise.reject(makeFsError(code));
+		return (realFs.stat as (p: import("node:fs").PathLike, o?: unknown) => Promise<unknown>)(path, opts);
 	}) as typeof fsPromises.stat);
 }
 
@@ -103,7 +109,7 @@ function mockStatErrnoFor(predicate: (path: string) => boolean, code: string): v
  */
 function mockLstatErrnoFor(predicate: (path: string) => boolean, code: string): void {
 	vi.mocked(fsPromises.lstat).mockImplementation(((path: import("node:fs").PathLike, opts?: unknown) => {
-		if (typeof path === "string" && predicate(path)) return Promise.reject(makeFsError(code));
+		if (typeof path === "string" && predicate(toPosix(path))) return Promise.reject(makeFsError(code));
 		return (realFs.lstat as (p: import("node:fs").PathLike, o?: unknown) => Promise<unknown>)(path, opts);
 	}) as typeof fsPromises.lstat);
 }
@@ -207,7 +213,7 @@ describe("merkle — readdir errno partition", () => {
 		});
 		expect(s.index.listIndexedFiles().sort()).toEqual(["a.md", "b.md"]);
 
-		mockReaddirErrnoFor((p) => p === s.vaultRoot.absolute, "EACCES");
+		mockReaddirErrnoFor((p) => p === toPosix(s.vaultRoot.absolute), "EACCES");
 
 		const tick = startMerkleTick({
 			vaultRoot: s.vaultRoot,

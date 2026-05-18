@@ -14,6 +14,12 @@
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+// Mock-helper predicates throughout this file key on POSIX `/`-form paths
+// (e.g. `p.endsWith("/sub/b.md")`, `p === `${root}/foo`). Each helper
+// normalizes the live fs path through `toPosix` before invoking the
+// predicate so the same fixture predicates work on Windows.
+import { toPosix } from "../../../src/lib/pathPosix.js";
+
 // `vi.hoisted` shares state between the hoisted factory and the rest of
 // the file — bare `let` declarations sit in TDZ when the factory runs.
 const realFs = vi.hoisted(() => ({
@@ -86,16 +92,16 @@ function makeFsError(code: string): NodeJS.ErrnoException {
  * `((path) => …) as typeof fsPromises.stat` cast into one place.
  */
 function mockStatErrnoFor(predicate: (path: string) => boolean, code: string): void {
-	vi.mocked(fsPromises.stat).mockImplementation(((path: import("node:fs").PathLike) => {
-		if (typeof path === "string" && predicate(path)) return Promise.reject(makeFsError(code));
-		return realFs.stat(path);
+	vi.mocked(fsPromises.stat).mockImplementation(((path: import("node:fs").PathLike, opts?: unknown) => {
+		if (typeof path === "string" && predicate(toPosix(path))) return Promise.reject(makeFsError(code));
+		return (realFs.stat as (p: import("node:fs").PathLike, o?: unknown) => Promise<unknown>)(path, opts);
 	}) as typeof fsPromises.stat);
 }
 
 /** Same shape as {@link mockStatErrnoFor} but for `readdir`. */
 function mockReaddirErrnoFor(predicate: (path: string) => boolean, code: string): void {
 	vi.mocked(fsPromises.readdir).mockImplementation(((path: import("node:fs").PathLike, opts?: unknown) => {
-		if (typeof path === "string" && predicate(path)) return Promise.reject(makeFsError(code));
+		if (typeof path === "string" && predicate(toPosix(path))) return Promise.reject(makeFsError(code));
 		return (realFs.readdir as (p: import("node:fs").PathLike, o?: unknown) => Promise<unknown>)(path, opts);
 	}) as typeof fsPromises.readdir);
 }
@@ -114,9 +120,9 @@ function mockReaddirFilterEntry(filterName: string): void {
 
 /** Same shape as {@link mockStatErrnoFor} but for `lstat`. */
 function mockLstatErrnoFor(predicate: (path: string) => boolean, code: string): void {
-	vi.mocked(fsPromises.lstat).mockImplementation(((path: import("node:fs").PathLike) => {
-		if (typeof path === "string" && predicate(path)) return Promise.reject(makeFsError(code));
-		return realFs.lstat(path);
+	vi.mocked(fsPromises.lstat).mockImplementation(((path: import("node:fs").PathLike, opts?: unknown) => {
+		if (typeof path === "string" && predicate(toPosix(path))) return Promise.reject(makeFsError(code));
+		return (realFs.lstat as (p: import("node:fs").PathLike, o?: unknown) => Promise<unknown>)(path, opts);
 	}) as typeof fsPromises.lstat);
 }
 
@@ -128,15 +134,15 @@ function mockLstatErrnoFor(predicate: (path: string) => boolean, code: string): 
  * at the same path.
  */
 function mockLstatType(predicate: (path: string) => boolean, kind: "symlink" | "directory"): void {
-	vi.mocked(fsPromises.lstat).mockImplementation(((path: import("node:fs").PathLike) => {
-		if (typeof path === "string" && predicate(path)) {
+	vi.mocked(fsPromises.lstat).mockImplementation(((path: import("node:fs").PathLike, opts?: unknown) => {
+		if (typeof path === "string" && predicate(toPosix(path))) {
 			return Promise.resolve({
 				isSymbolicLink: () => kind === "symlink",
 				isDirectory: () => kind === "directory",
 				isFile: () => false,
 			} as unknown as import("node:fs").Stats);
 		}
-		return realFs.lstat(path);
+		return (realFs.lstat as (p: import("node:fs").PathLike, o?: unknown) => Promise<unknown>)(path, opts);
 	}) as typeof fsPromises.lstat);
 }
 
@@ -452,7 +458,7 @@ describe("scanVault — indexOne re-validates path before reading", () => {
 		// at scan start; flipping it false here forces full re-validation.
 		s.index.setScanComplete(false);
 
-		const fooAbs = `${s.vaultRoot.absolute}/foo`;
+		const fooAbs = `${toPosix(s.vaultRoot.absolute)}/foo`;
 		mockLstatType((p) => p === fooAbs, "symlink");
 
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -479,7 +485,7 @@ describe("scanVault — indexOne re-validates path before reading", () => {
 		// symlink check isn't bypassed.
 		expect(s.index.getScanComplete()).toBe(true);
 
-		const fooAbs = `${s.vaultRoot.absolute}/foo`;
+		const fooAbs = `${toPosix(s.vaultRoot.absolute)}/foo`;
 		mockLstatType((p) => p === fooAbs, "symlink");
 
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -512,7 +518,7 @@ describe("scanVault — PATH_NOT_FOUND classification", () => {
 
 		// Mock lstat to reject ENOENT for a.md leaf only. validatePath segment
 		// walk hits ENOENT → throws PathValidationError(PATH_NOT_FOUND).
-		const aMdAbs = `${s.vaultRoot.absolute}/a.md`;
+		const aMdAbs = `${toPosix(s.vaultRoot.absolute)}/a.md`;
 		mockLstatErrnoFor((p) => p === aMdAbs, "ENOENT");
 		// Prune now stat-confirms before removing rows; if the file is
 		// genuinely vanished, stat must also fail.
@@ -537,7 +543,7 @@ describe("scanVault — PATH_NOT_FOUND classification", () => {
 		});
 		expect(s.index.getStatus().state).toBe("cold");
 
-		const aMdAbs = `${s.vaultRoot.absolute}/a.md`;
+		const aMdAbs = `${toPosix(s.vaultRoot.absolute)}/a.md`;
 		mockLstatErrnoFor((p) => p === aMdAbs, "ENOENT");
 
 		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
@@ -558,7 +564,7 @@ describe("scanVault — PATH_NOT_FOUND classification", () => {
 		expect(s.index.getScanComplete()).toBe(true);
 
 		// Leaf swapped to symlink between scans → SYMLINK_SEGMENT.
-		const aMdAbs = `${s.vaultRoot.absolute}/a.md`;
+		const aMdAbs = `${toPosix(s.vaultRoot.absolute)}/a.md`;
 		mockLstatType((p) => p === aMdAbs, "symlink");
 
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -595,7 +601,7 @@ describe("pruneVanishedFiles regular-file gate", () => {
 		// the readdir step seeing it as a non-yielding entity. lstat reports
 		// the new on-disk type so the prune pass's `!isFile()` fires.
 		mockReaddirFilterEntry("swap.md");
-		const swapAbs = `${s.vaultRoot.absolute}/swap.md`;
+		const swapAbs = `${toPosix(s.vaultRoot.absolute)}/swap.md`;
 		mockLstatType((p) => p === swapAbs, "directory");
 
 		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });
@@ -608,7 +614,7 @@ describe("pruneVanishedFiles regular-file gate", () => {
 		expect(s.index.listIndexedFiles()).toEqual(["swap.md"]);
 
 		mockReaddirFilterEntry("swap.md");
-		const swapAbs = `${s.vaultRoot.absolute}/swap.md`;
+		const swapAbs = `${toPosix(s.vaultRoot.absolute)}/swap.md`;
 		mockLstatType((p) => p === swapAbs, "symlink");
 
 		await scanVault({ vaultRoot: s.vaultRoot, index: s.index, concurrency: 1 });

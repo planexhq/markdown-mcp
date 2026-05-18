@@ -23,19 +23,23 @@
  * residual TOCTOU (THREAT_MODEL V1/V6 — Node 22 has no FD-relative
  * `openat` API; closing it requires a native addon, deferred).
  *
- * On Windows, libuv silently ignores `O_NOFOLLOW`. v1 CI is macOS+Linux
- * only; Windows is best-effort via WSL.
+ * On Windows, libuv silently ignores `O_NOFOLLOW`. {@link openNoFollow}
+ * substitutes a pre-open `lstat` + post-open `fstat` dev/ino compare so
+ * a leaf-symlink swap during the validation→open window still gets
+ * rejected; see that function's doc comment for the full reasoning.
  */
 
 import { constants as fsConstants, type Stats } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
-import { isAbsolute, join, normalize, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { PathRejectionReason, SafePath, VaultError } from "../types.js";
 import { CANDIDATE_LIST_SEP, CONTROL_CHAR_CLASS_TAIL, HEADING_PATH_SEP } from "./controlChars.js";
 import { errorMessage, getErrnoCode, isVanishedErrno, vaultError } from "./error.js";
 import { isNonNfc } from "./hiddenPath.js";
 import { indexCacheFiles } from "./index/sqlite.js";
 import { MAX_PATH_DEPTH, MAX_PATH_LENGTH } from "./limits.js";
+import { toPosix } from "./pathPosix.js";
 
 /**
  * Resolved vault root context. Produced once at startup by
@@ -66,6 +70,21 @@ export class PathValidationError extends Error {
  */
 const PERCENT_ENCODED_RE = /%[0-9a-fA-F]{2}/;
 const BACKSLASH_RE = /\\/;
+// NTFS reserved device names per Microsoft Learn (Naming Files, Paths, and
+// Namespaces): CON, PRN, AUX, NUL, COM1-9, LPT1-9, plus the 8859-1
+// superscript variants COM¹/COM²/COM³, LPT¹/LPT²/LPT³ (U+00B9/B2/B3 — NOT
+// the Unicode superscript block U+2070+; only the legacy 8859-1 code
+// points are device-aliased). Reserved case-insensitively, bare or with
+// any extension (`CON.md` ≡ `CON`); `CONFIGS.md` is fine — the trailing
+// `(\.|$)` enforces a base-name boundary. COM0 / LPT0 are NOT enumerated
+// by MS and so are NOT rejected — vaults migrate cross-platform, so a
+// legitimate `COM0.md` note must round-trip.
+const RESERVED_DEVICE_NAME_RE = /^(CON|PRN|AUX|NUL|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])(\.|$)/i;
+// NTFS strips trailing dots and spaces during normalization, so `notes.md.`
+// and `notes.md ` open the same file as `notes.md` while `readdir` only
+// enumerates `notes.md` — breaks the "every addressable path is enumerable"
+// invariant.
+const TRAILING_DOT_OR_SPACE_RE = /[. ]$/;
 // Inverse of `formatFileHeading`'s `«…»` wrap (`renderText/_shared.ts`).
 // The wrap fires when output contains ` › ` (heading-path fence) or
 // `, ` (candidate-list fence); mirror both triggers here so a vault
@@ -87,6 +106,9 @@ function stripOuterGuillemets(input: string): string {
 // same forgery class as a literal `\n`.
 const CONTROL_CHAR_RE = new RegExp(`[\\x01-\\x1F${CONTROL_CHAR_CLASS_TAIL}]`);
 const PARENT_REL_PREFIX = `..${sep}`;
+
+/** True for `/` (always accepted) and the platform separator (`\` on Windows). */
+const isPathSep = (c: string): boolean => c === "/" || c === sep;
 
 /**
  * `path.relative(vaultRoot, ...)` returns an escape path iff it equals
@@ -124,15 +146,167 @@ export function passesPathPolicy(rel: string): boolean {
  * and `reason: "SYMLINK_SEGMENT"` if the configured root is a symlink.
  */
 export async function validateVaultRoot(input: string): Promise<VaultRoot> {
-	// POSIX `lstat` dereferences trailing `/`, `/.`, and `/./` forms,
-	// bypassing the symlink-root check. `path.normalize` collapses dot
-	// segments uniformly; then strip the trailing slash it preserves.
-	// Empty input is kept as-is (normalize("") === ".") so the lstat below
-	// fails with ENOENT instead of silently accepting the CWD.
-	const normalized = input === "" ? "" : normalize(input);
-	const trimmed = normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
-	await assertRealDirectory(trimmed, { label: "Vault root" });
-	return { absolute: await realpath(trimmed) };
+	const trimmed = stripDeviceNamespacePrefix(stripTrailingPathSep(input));
+	const resolved = await walkVaultRoot(trimmed);
+	await assertRealDirectory(resolved, { label: "Vault root" });
+	return { absolute: await realpath(resolved) };
+}
+
+/**
+ * Strip trailing separators and trailing `/.` / `/./` no-op segments,
+ * leaving interior `./..` untouched. `path.resolve` would collapse `..`
+ * lexically — `missing-subdir/..` then resolves to CWD and
+ * `<symlink>/..` to the symlink's lexical parent rather than the FS-
+ * reached parent. Trailing separators still need stripping so POSIX
+ * `lstat` doesn't dereference a symlinked vault root via `dir/`; the
+ * trailing `/.` strip preserves the same semantics for shells that
+ * emit `mylink/.`. Windows drive roots (`C:\`) keep their separator —
+ * `C:` is "current directory on drive C," a different target.
+ */
+function stripTrailingPathSep(input: string): string {
+	if (input === "") return "";
+	let end = input.length;
+	while (end > 0) {
+		const c = input.charAt(end - 1);
+		if (isPathSep(c)) {
+			end--;
+			continue;
+		}
+		if (c === "." && end >= 2 && isPathSep(input.charAt(end - 2))) {
+			end -= 2;
+			continue;
+		}
+		break;
+	}
+	// All chars strippable; preserve the leading char as sole survivor
+	// (`"/"`, `"//"` → `"/"`; `"."`, `"./"` → `"."`).
+	if (end === 0) return input.charAt(0);
+	const stripped = input.slice(0, end);
+	// Restore the trailing separator only when the loop stripped one AND
+	// the stripped form is a Windows root whose semantics flip without
+	// the trailer: bare drive `C:` is drive-relative ("current dir on
+	// drive C") not the drive root; `\\?\C:` and `\\.\C:` are invalid
+	// without the trailer; UNC roots without the trailer are ambiguous.
+	if (end < input.length && sep === "\\" && WIN_ROOT_NEEDING_SEP.test(stripped)) {
+		return `${stripped}${sep}`;
+	}
+	return stripped;
+}
+
+/** Windows root forms requiring a trailing separator: bare drive, verbatim
+ *  namespace drive (`\\?\C:`) / Volume GUID (`\\?\Volume{GUID}`), DOS device
+ *  drive (`\\.\C:`) / Volume GUID (`\\.\Volume{GUID}`), verbatim UNC root
+ *  (`\\?\UNC\server\share`), regular UNC root (`\\server\share`). Volume
+ *  GUID paths are common for unlettered volumes / multi-disk setups and
+ *  name the device object (not the root dir) without the trailer. */
+export const WIN_ROOT_NEEDING_SEP =
+	/^(?:[A-Za-z]:|\\\\(?:[?.]\\[A-Za-z]:|[?.]\\Volume\{[^}\\]+\}|\?\\UNC\\[^\\]+\\[^\\]+|[^\\?.][^\\]*\\[^\\]+))$/;
+
+/**
+ * Strip the `\\?\` / `\\.\` device-namespace prefix from a drive-letter
+ * path (`\\?\C:\notes` → `C:\notes`). libuv's `lstat` / `realpath` reject
+ * the device-namespace *drive-root* forms (`\\?\C:\`) with `EISDIR`, while
+ * the plain drive form resolves normally. Verbatim UNC (`\\?\UNC\…`) and
+ * Volume-GUID (`\\?\Volume{…}\…`) paths are left untouched — stripping
+ * would corrupt the UNC root, and a GUID volume has no plain equivalent.
+ *
+ * A path separator after the drive colon is required: `\\?\C:\…` strips,
+ * but trailerless `\\?\C:` does not. The latter is a malformed root, and
+ * stripping it to bare `C:` would silently retarget the server at the
+ * drive-relative CWD; left unchanged it falls through to `lstat`, which
+ * rejects it.
+ */
+function stripDeviceNamespacePrefix(input: string): string {
+	return /^\\\\[?.]\\([A-Za-z]:[\\/].*)$/.exec(input)?.[1] ?? input;
+}
+
+/**
+ * Vault-root path-segment separators. Windows accepts both `\` and `/`;
+ * POSIX treats `\` as an ordinary filename character, so a vault root such
+ * as `/srv/a\b` must NOT split on it — that shatters the real directory
+ * name `a\b` into two non-existent segments.
+ */
+const VAULT_ROOT_SEGMENT_SEP_RE = sep === "\\" ? /[\\/]+/ : /\/+/;
+
+/**
+ * `..`-aware segment walk for vault-root validation. Windows `lstat` and
+ * `realpath` collapse interior `..` *lexically* before the syscall, so a
+ * single `lstat` of `<dir>/missing/..` wrongly succeeds and `<symlink>/..`
+ * yields the link's lexical parent. Walking component-by-component —
+ * `lstat` each real segment (a missing one throws), and resolving each
+ * `..` via `realpath` + `dirname` — restores POSIX component-walk
+ * semantics on every platform. Intermediate symlinks are tolerated; only
+ * the final target's symlink check (in {@link assertRealDirectory}) is
+ * load-bearing, matching the pre-fix single-`lstat` behavior.
+ */
+async function walkVaultRoot(input: string): Promise<string> {
+	// An empty root would fall through to `cur = root || "."` below and
+	// silently resolve to the process CWD. Reject it. (`parseCli` already
+	// rejects an empty `--vault`; this guards direct callers of the exported
+	// `validateVaultRoot`.)
+	if (input === "") {
+		throw new PathValidationError(
+			vaultError("PATH_OUTSIDE_VAULT", "Vault root is empty.", {
+				param: "vault",
+				reason: "VAULT_ROOT_INACCESSIBLE" satisfies PathRejectionReason,
+			}),
+		);
+	}
+	// `path.parse` truncates a verbatim-UNC root to `\\?\UNC\`, dropping the
+	// `server\share` that together form the real share root — the walk would
+	// then `lstat` the bare `\\?\UNC\server` and reject a valid root. The
+	// plain UNC form (`\\server\share\…`) parses correctly and is supported;
+	// point the operator there rather than mis-walking the verbatim form.
+	if (/^\\\\[?.]\\UNC\\/i.test(input)) {
+		throw new PathValidationError(
+			vaultError(
+				"PATH_OUTSIDE_VAULT",
+				`Verbatim UNC vault root is not supported: ${input} — use the plain \\\\server\\share\\... form.`,
+				{
+					param: "vault",
+					reason: "VAULT_ROOT_INACCESSIBLE" satisfies PathRejectionReason,
+				},
+			),
+		);
+	}
+	const root = parse(input).root;
+	const segments = input
+		.slice(root.length)
+		.split(VAULT_ROOT_SEGMENT_SEP_RE)
+		.filter((s) => s.length > 0 && s !== ".");
+	// Seed the walk base. A relative input has an empty root → seed "." so
+	// realpath/join have a valid base. A bare drive root ("C:") is drive-
+	// relative — the CWD on that drive, not the drive root — so resolve it;
+	// otherwise the first `join` jumps to the drive root (`join("C:","notes")`
+	// → "C:\notes", which differs from drive-relative "C:notes").
+	let cur = /^[A-Za-z]:$/.test(root) ? resolve(root) : root || ".";
+	for (const seg of segments) {
+		try {
+			if (seg === "..") {
+				// `..` cannot traverse out of a non-directory (POSIX → ENOTDIR).
+				// realpath() resolves a file / symlink-to-file target happily, so
+				// guard before taking the parent. realpath output is symlink-free,
+				// so lstat here is a faithful is-it-a-directory check.
+				const real = await realpath(cur);
+				if (!(await lstat(real)).isDirectory()) {
+					throw new Error(`Not a directory: ${cur}`);
+				}
+				cur = dirname(real);
+			} else {
+				cur = join(cur, seg);
+				await lstat(cur);
+			}
+		} catch (cause) {
+			throw new PathValidationError(
+				vaultError("PATH_OUTSIDE_VAULT", `Vault root not accessible: ${cur}`, {
+					param: "vault",
+					reason: "VAULT_ROOT_INACCESSIBLE" satisfies PathRejectionReason,
+					cause: errorMessage(cause),
+				}),
+			);
+		}
+	}
+	return cur;
 }
 
 /**
@@ -248,6 +422,9 @@ export type SyncPathRejection =
 	| "CONTROL_CHAR"
 	| "PERCENT_ENCODED"
 	| "BACKSLASH"
+	| "COLON"
+	| "RESERVED_DEVICE_NAME"
+	| "TRAILING_DOT_OR_SPACE"
 	| "ABSOLUTE_PATH"
 	| "TRAVERSAL_SEGMENT"
 	| "TOO_DEEP";
@@ -272,7 +449,16 @@ export function classifyRelpathPolicy(input: string): SyncPathRejection | null {
 	if (CONTROL_CHAR_RE.test(input)) return "CONTROL_CHAR";
 	if (PERCENT_ENCODED_RE.test(input)) return "PERCENT_ENCODED";
 	if (BACKSLASH_RE.test(input)) return "BACKSLASH";
+	// Test for absolute paths BEFORE the `:` guard so a Windows drive-
+	// prefixed path like `C:/vault/note.md` surfaces as ABSOLUTE_PATH on
+	// Win32 (`node:path.isAbsolute` is platform-aware). Without this
+	// ordering, the COLON branch fires first and points agents at an ADS
+	// fix when the actual issue is "pass a vault-relative path."
 	if (isAbsolute(input)) return "ABSOLUTE_PATH";
+	// `:` is NTFS's alternate-data-stream separator (`note.md:secret` opens a
+	// hidden stream of `note.md`). Reject always-on because vaults migrate
+	// between platforms (sync, NFS, archive extract).
+	if (input.includes(":")) return "COLON";
 
 	const normalized = input.normalize("NFC");
 	const cleaned = normalized.startsWith("./") ? normalized.slice(2) : normalized;
@@ -280,6 +466,8 @@ export function classifyRelpathPolicy(input: string): SyncPathRejection | null {
 	if (segments.length === 0) return "EMPTY_PATH";
 	for (const seg of segments) {
 		if (seg === "." || seg === "..") return "TRAVERSAL_SEGMENT";
+		if (RESERVED_DEVICE_NAME_RE.test(seg)) return "RESERVED_DEVICE_NAME";
+		if (TRAILING_DOT_OR_SPACE_RE.test(seg)) return "TRAILING_DOT_OR_SPACE";
 	}
 	if (segments.length > MAX_PATH_DEPTH) return "TOO_DEEP";
 	return null;
@@ -292,6 +480,10 @@ const POLICY_REJECTION_MESSAGES: Record<SyncPathRejection, string> = {
 	CONTROL_CHAR: "Path contains a control character (newline, tab, DEL, etc.); use printable characters only.",
 	PERCENT_ENCODED: "Path contains percent-encoded octet; pass paths in their decoded form.",
 	BACKSLASH: "Path contains backslash; use forward slashes.",
+	COLON: "Path contains ':'; reserved on NTFS as the alternate-data-stream separator.",
+	RESERVED_DEVICE_NAME: "Path segment is a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9).",
+	TRAILING_DOT_OR_SPACE:
+		"Path segment ends in a dot or space; NTFS strips these during normalization, creating a name-alias.",
 	ABSOLUTE_PATH: "Path is absolute; pass vault-relative paths.",
 	TRAVERSAL_SEGMENT: "Path contains traversal segment.",
 	TOO_DEEP: `Path exceeds maximum depth of ${MAX_PATH_DEPTH} segments.`,
@@ -400,7 +592,7 @@ export async function validatePath(input: string, vaultRoot: VaultRoot): Promise
 
 	// Re-emit relative form using forward slashes for client display
 	// regardless of OS path separator.
-	const relativePosix = sep === "/" ? rel : rel.split(sep).join("/");
+	const relativePosix = toPosix(rel);
 
 	return {
 		input,
@@ -410,29 +602,127 @@ export async function validatePath(input: string, vaultRoot: VaultRoot): Promise
 	};
 }
 
+/** Bounded retries for `openNoFollow`'s win32 identity match — see below. */
+const WIN32_OPEN_RETRIES = 4;
+
 /**
- * Open a previously-validated absolute path with
- * `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`. Returned `FileHandle` is the
+ * Backoff between Win32 vanish-retries. AV scanner and SMB
+ * unlink-then-rename windows are documented at 5–50 ms (cross-platform
+ * editors like vim on Windows and opt-in VS Code atomic save trigger
+ * them). 4 attempts × 3 retry gaps × 25 ms = 75 ms max sleep budget —
+ * covers the upper end of the documented window with headroom for
+ * variance; truly-gone files pay one 25 ms wait per failed open before
+ * settling. Identity-mismatch retry stays delay-free — TOCTOU
+ * resolution, not a save-window race.
+ */
+const WIN32_VANISH_RETRY_DELAY_MS = 25;
+
+/**
+ * Open a previously-validated absolute path. Returned `FileHandle` is the
  * caller's responsibility to close.
  *
- * Two protections layered:
+ * Two protections layered on POSIX:
  *   - `O_NOFOLLOW` refuses a final-component symlink swap that occurred
  *     between `validatePath` and the open (THREAT_MODEL V1/V6).
  *   - `O_NONBLOCK` ensures the open returns immediately for FIFOs / named
- *     pipes that have no writer attached. Without it, `open(O_RDONLY)`
- *     on a FIFO blocks indefinitely waiting for a writer — a trivial
- *     server-hang vector if a vault contains a FIFO. POSIX says
- *     `O_NONBLOCK` is unspecified-but-harmless on regular files, so
- *     normal note reads are unaffected. The caller is responsible for
- *     `fstat`-ing and rejecting non-regular files (see `readNote`).
+ *     pipes that have no writer attached — otherwise `open(O_RDONLY)`
+ *     blocks waiting for a writer, a trivial server-hang vector. The
+ *     caller `fstat`s and rejects non-regular files (see `readNote`).
  *
- * On platforms where `O_NOFOLLOW` is not supported (Windows / libuv
- * silently strips the flag), the protection degrades to "rejected
- * upstream by validatePath segment walk" — acceptable for v1 since
- * Windows is not a CI target.
+ * Windows libuv silently strips `O_NOFOLLOW`, so a swapped-in symlink is
+ * followed during the open itself. Two substitutes layered: (a) a pre-open
+ * `lstat` rejects symlink leaves before the open triggers the libuv follow,
+ * closing the `validatePath → openNoFollow` hang vector for slow UNC
+ * targets; (b) the existing post-open `fstat`/`lstat` identity check stays
+ * for the residual pre-lstat → open race. Both attempts also `continue` on
+ * `ENOENT`/`ENOTDIR` so a benign unlink-then-rename safe-save settles
+ * within one retry, with a {@link WIN32_VANISH_RETRY_DELAY_MS} sleep so
+ * AV/SMB-latent rename windows actually get a chance to land; final-attempt
+ * vanish propagates so a truly-gone file still routes to `PATH_NOT_FOUND`
+ * → prune. A sustained hostile swap never matches and is rejected
+ * (bounded — a DoS at worst, never an escape).
+ *
+ * Residual (V1/V6 in THREAT_MODEL): the pre-open `lstat` closes the
+ * common Win32 attack vector (leaf is a symlink at lstat time →
+ * `SYMLINK_SEGMENT` throw before `open`). The residual race window is
+ * between the pre-open lstat resolving and the `open()` syscall —
+ * microseconds on local FS. An attacker with vault-write access can
+ * theoretically swap the leaf to a symlink pointing at a slow UNC share
+ * or named pipe in that window, causing libuv (which strips `O_NOFOLLOW`)
+ * to block on the open. Node 22 `fs.promises.open` does NOT accept an
+ * `AbortSignal` (verified against the official Node 22 fs/promises API
+ * surface — `open()` takes `(path, flags[, mode])`, no options
+ * parameter), so we cannot cleanly cancel a hanging open. `Promise.race`
+ * with `setTimeout` would leak the libuv worker thread without preventing
+ * `UV_THREADPOOL_SIZE=4` exhaustion under sustained attack. The residual
+ * is bounded by the trusted-vault threat model; worker-thread isolation
+ * or a native `CreateFile` path is reserved for a future hardening round
+ * if cross-mount hostile scenarios emerge.
  */
 export async function openNoFollow(absolutePath: string): Promise<import("node:fs/promises").FileHandle> {
-	return open(absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+	if (process.platform !== "win32") {
+		return open(absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+	}
+	for (let attempt = 0; attempt < WIN32_OPEN_RETRIES; attempt++) {
+		// Pre-open lstat: libuv strips O_NOFOLLOW on Win32, so an open
+		// against a leaf-symlink would follow the link and could hang on a
+		// slow UNC target before the post-open identity check fires. Catch
+		// the symlink here; the post-open check stays for the residual
+		// pre-lstat → open race.
+		let preStatIsSymlink: boolean;
+		try {
+			preStatIsSymlink = (await lstat(absolutePath, { bigint: true })).isSymbolicLink();
+		} catch (err) {
+			if (isVanishedErrno(err) && attempt < WIN32_OPEN_RETRIES - 1) {
+				await sleep(WIN32_VANISH_RETRY_DELAY_MS);
+				continue;
+			}
+			throw err;
+		}
+		if (preStatIsSymlink) {
+			// Symlink leaf is never legitimate post-validatePath; editors
+			// don't transit through leaf-symlinks as a transient state.
+			throw new PathValidationError(
+				vaultError("PATH_OUTSIDE_VAULT", "Path leaf became a symlink.", {
+					param: "file",
+					reason: "SYMLINK_SEGMENT" satisfies PathRejectionReason,
+				}),
+			);
+		}
+		let fh: import("node:fs/promises").FileHandle;
+		try {
+			fh = await open(absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+		} catch (err) {
+			if (isVanishedErrno(err) && attempt < WIN32_OPEN_RETRIES - 1) {
+				await sleep(WIN32_VANISH_RETRY_DELAY_MS);
+				continue;
+			}
+			throw err;
+		}
+		try {
+			const handleStat = await fh.stat({ bigint: true });
+			const leafStat = await lstat(absolutePath, { bigint: true });
+			if (!leafStat.isSymbolicLink() && handleStat.ino === leafStat.ino && handleStat.dev === leafStat.dev) {
+				return fh;
+			}
+		} catch (err) {
+			await fh.close().catch(() => {});
+			if (isVanishedErrno(err) && attempt < WIN32_OPEN_RETRIES - 1) {
+				await sleep(WIN32_VANISH_RETRY_DELAY_MS);
+				continue;
+			}
+			throw err;
+		}
+		// Identity mismatch — a symlink swap or an atomic save raced the
+		// open; close this handle and retry against the settled leaf.
+		await fh.close().catch(() => {});
+	}
+	throw new PathValidationError(
+		vaultError("PATH_OUTSIDE_VAULT", "Path leaf could not be opened without an unresolved swap.", {
+			param: "file",
+			reason: "SYMLINK_SEGMENT" satisfies PathRejectionReason,
+		}),
+	);
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────

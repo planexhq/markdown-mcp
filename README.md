@@ -21,7 +21,7 @@ Six tools — `get_vault_tree`, `get_file_outline`, `get_fragment`, `search`, `g
 ## Requirements
 
 - Node.js **22.0** or later
-- macOS or Linux (Windows is supported via WSL; native Windows is not CI-tested)
+- macOS, Linux, or Windows. All three are CI-tested on every push (Node 22 + 24); a handful of POSIX-only test fixtures (`mkfifo`, `chmod 0o000`) are skipped on Windows but the defenses they cover are still in effect — see the security model section below for the Windows leaf-symlink variant.
 
 ## Run
 
@@ -56,7 +56,7 @@ node dist/index.js --vault /path/to/your/vault
 
 Tested with Claude Desktop, Claude Code, Cursor, and Windsurf. Any MCP-compatible host that speaks stdio + protocol `2025-06-18` works.
 
-> **Windows users**, for any of the host configs below: replace `"command": "npx"` with `"command": "cmd"` and prepend `"/c", "npx"` to `args` — npm's `.cmd` shim isn't directly spawnable from JSON config without it.
+> **Windows users**, for any of the host configs below: npm's `.cmd` shims (`npx.cmd`, and `markdown-mcp.cmd` from a global install) aren't directly spawnable from a JSON config — modern Node rejects spawning `.cmd` without a shell. Wrap the command in `cmd`: set `"command": "cmd"` and prepend `"/c"` plus the original command to `args`. So `args: ["-y", "markdown-mcp", …]` becomes `["/c", "npx", "-y", "markdown-mcp", …]`, and a global install becomes `"command": "cmd"`, `args: ["/c", "markdown-mcp", "--vault", …]`.
 
 ### Claude Desktop / Claude Code
 
@@ -77,7 +77,7 @@ Add to your MCP config:
 }
 ```
 
-The `-y` flag skips npx's "Ok to proceed?" prompt so the host can spawn the server non-interactively. If you globally installed `markdown-mcp`, swap `command: "npx"` + the `-y` / `markdown-mcp` args for `command: "markdown-mcp"` and drop the first two args.
+The `-y` flag skips npx's "Ok to proceed?" prompt so the host can spawn the server non-interactively. If you globally installed `markdown-mcp`, swap `command: "npx"` + the `-y` / `markdown-mcp` args for `command: "markdown-mcp"` and drop the first two args. (On Windows this still needs the `cmd /c` wrapper from the note above — `markdown-mcp` resolves to `markdown-mcp.cmd`.)
 
 ### Cursor
 
@@ -430,10 +430,10 @@ Domain errors come back as `isError: true` with `structuredContent: { code, mess
 
 **How it's enforced** — every path argument runs through a single `validatePath` entry point that:
 
-- Refuses `..`, `\x00`, `%`, `\\`, absolute paths, depth > 32
+- Refuses `..`, `\x00`, `%`, `\\`, `:` (NTFS alternate data streams), Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`), trailing dots / spaces, absolute paths, depth > 32
 - Walks each path segment and `lstat`s it; **rejects symlinks at any depth** (not just the leaf)
 - `lstat`s the vault root itself before resolving — a symlinked vault root is rejected
-- Final read uses `O_NOFOLLOW` so a leaf-symlink swap during the validation window can't be followed
+- Final read uses `O_NOFOLLOW` (POSIX) so a leaf-symlink swap during the validation window can't be followed. On Windows libuv silently strips `O_NOFOLLOW`; instead the read opens the file and then requires the open handle's `dev`/`ino` to match a fresh `lstat` of a non-symlink leaf — proof the handle is bound to the in-vault file the path names. A followed symlink fails that match; a benign concurrent atomic save (write-temp + rename) also perturbs it, so the check retries a few times to let a one-shot save settle. A sustained hostile swap never matches and is rejected — bounded, never an escape.
 
 Markdown ASTs above 50K nodes are refused with `MARKDOWN_PARSE_ERROR.reason = "ast_node_cap_exceeded"` — a complementary cap on parse work (the 10 MB file-size guarantee is enforced before the parser is invoked).
 

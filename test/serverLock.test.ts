@@ -22,7 +22,7 @@ import {
 } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
 	acquireServerLock,
@@ -38,7 +38,14 @@ import {
 } from "../src/lib/serverLock.js";
 import { findDeadPid } from "./helpers/findDeadPid.js";
 import { indexDir, ownLockPath } from "./helpers/indexDir.js";
-import { SERVER_BIN, spawnAndWaitForStartup, spawnTestServer, waitForExit, waitForWarm } from "./helpers/mcp-client.js";
+import {
+	gracefulShutdown,
+	SERVER_BIN,
+	spawnAndWaitForStartup,
+	spawnTestServer,
+	waitForExit,
+	waitForWarm,
+} from "./helpers/mcp-client.js";
 import { createTempVault, type VaultStructure } from "./helpers/vault.js";
 
 const FIXTURE: VaultStructure = {
@@ -373,6 +380,31 @@ describe("server lockfile — symlink defense", () => {
 			await unlink(targetPath).catch(() => {});
 		}
 	});
+
+	test("directory at a foreign PID slot is logged + skipped (startup succeeds)", async () => {
+		// Hostile / accidentally-misnamed directory at a foreign PID slot path.
+		// POSIX: `open(O_RDONLY)` on a directory succeeds; `handle.stat().isFile()`
+		// catches it and returns "absent". Windows: `fs.open()` fails with EISDIR
+		// before returning a handle, so the win32 preflight's `!preLstat.isFile()`
+		// check must catch ALL non-regular kinds (not just symlinks) for parity.
+		// Either path: startup proceeds + the directory is left alone.
+		const indexPath = indexDir(vault.path);
+		await mkdir(indexPath, { recursive: true });
+		const foreignPath = join(indexPath, lockFileNameForPid(1));
+		await mkdir(foreignPath);
+		// Plant a sentinel inside so we can prove the directory is untouched.
+		await writeFile(join(foreignPath, "sentinel.txt"), "FOREIGN_DIR_DO_NOT_TOUCH");
+
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		try {
+			const st = await stat(foreignPath).catch(() => null);
+			expect(st?.isDirectory()).toBe(true);
+			expect(await readFile(join(foreignPath, "sentinel.txt"), "utf8")).toBe("FOREIGN_DIR_DO_NOT_TOUCH");
+		} finally {
+			await handle.release();
+			await rm(foreignPath, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("server lockfile — legacy server.lock cleanup", () => {
@@ -418,7 +450,7 @@ describe("server lockfile — legacy server.lock cleanup", () => {
 });
 
 describe("server lockfile — shutdown cleanup", () => {
-	test("SIGTERM unlinks our per-PID lockfile", async () => {
+	test("graceful shutdown (SIGTERM on POSIX, stdin-EOF on Windows) unlinks our per-PID lockfile", async () => {
 		const server = await spawnAndWaitForStartup(vault.path);
 		try {
 			const pid = server.child.pid;
@@ -426,7 +458,7 @@ describe("server lockfile — shutdown cleanup", () => {
 			const lockPath = ownLockPath(vault.path, pid);
 			await expect(stat(lockPath)).resolves.toBeTruthy();
 
-			server.child.kill("SIGTERM");
+			gracefulShutdown(server.child);
 			await waitForExit(server.child);
 
 			await expect(readFile(lockPath, "utf8")).rejects.toThrow(/ENOENT/);
@@ -492,6 +524,29 @@ describe("server lockfile — legacy lockfile mixed-version interop", () => {
 		await expect(stat(legacyPath)).resolves.toBeTruthy();
 		await unlink(legacyPath).catch(() => {});
 	});
+
+	test.runIf(process.platform === "win32")(
+		"Win32-range PID in legacy server.lock body is parsed and gates startup via PID probe (not rm'd)",
+		async () => {
+			// Win32-range PIDs in the legacy body must parse and route via the
+			// live-peer probe. A POSIX-only gate silently nulls record.pid →
+			// cleanupLegacyEntry rm's the live opposite-policy peer's slot →
+			// both processes share the WAL.
+			const indexPath = indexDir(vault.path);
+			await mkdir(indexPath, { recursive: true });
+			const legacyPath = join(indexPath, LEGACY_LOCK_FILE_NAME);
+			// POSIX_PID_MAX + 1 = 0x80000000 — valid Win32 DWORD, invalid POSIX pid_t.
+			await writeFile(legacyPath, `${JSON.stringify({ pid: 2147483648, includeHidden: true })}\n`);
+
+			await expect(acquireServerLock({ indexDir: indexPath, includeHidden: false })).rejects.toBeInstanceOf(
+				ServerLockConflictError,
+			);
+			// `stat` succeeds = parser accepted the Win32-range PID → live-peer
+			// branch preserved the file. A POSIX-only gate would have rm'd it.
+			await expect(stat(legacyPath)).resolves.toBeTruthy();
+			await unlink(legacyPath).catch(() => {});
+		},
+	);
 });
 
 describe("server lockfile — legacy wx-race absorption", () => {
@@ -681,6 +736,17 @@ describe("server lockfile — foreign-slot unparseable + ESRCH preserves", () =>
 });
 
 describe("server lockfile — extension conflict", () => {
+	// Force a known-default VAULT_EXTENSIONS so the test is robust against
+	// cross-file pollution from vaultExtensions.test.ts stubs that may
+	// linger in shared vitest worker state on some pools (notably on
+	// Windows where worker isolation differs from POSIX).
+	beforeEach(() => {
+		vi.stubEnv("VAULT_EXTENSIONS", "");
+	});
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
 	test("opposite vaultExtensions on a live peer throws ServerLockExtensionConflictError", async () => {
 		const indexPath = indexDir(vault.path);
 		await mkdir(indexPath, { recursive: true });
@@ -689,6 +755,12 @@ describe("server lockfile — extension conflict", () => {
 			liveSlot,
 			`${JSON.stringify({ includeHidden: false, hostname: hostname(), vaultExtensions: ["md", "mdx"] })}\n`,
 		);
+		// Backdate so the simultaneous-start tiebreaker (older-mtime wins,
+		// PID as fallback) is unambiguous: the foreign slot is the "older"
+		// arrival regardless of NTFS mtime quantization (~15 ms ticks) or
+		// vitest's worker PID vs ppid ordering on Windows.
+		const past = new Date(Date.now() - 60_000);
+		await utimes(liveSlot, past, past);
 
 		await expect(acquireServerLock({ indexDir: indexPath, includeHidden: false })).rejects.toBeInstanceOf(
 			ServerLockExtensionConflictError,
@@ -737,29 +809,97 @@ describe("server lockfile — extension conflict", () => {
 });
 
 describe("server lockfile — bogus PID filename gate", () => {
-	test("server-<INT32_MAX+1>.lock with opposite-policy content is skipped, not treated as live peer", async () => {
-		// Filename encodes a PID outside POSIX `pid_t` (signed int32). Without
-		// the gate, `process.kill(pid, 0)` throws `RangeError` →
-		// `isProcessAlive` (non-ESRCH → alive) reads the planted opposite-
-		// policy file as a live peer and blocks startup indefinitely.
-		const indexPath = indexDir(vault.path);
-		await mkdir(indexPath, { recursive: true });
-		const bogusPath = join(indexPath, "server-2147483648.lock");
-		await writeFile(
-			bogusPath,
-			`${JSON.stringify({ includeHidden: true, hostname: hostname(), vaultExtensions: ["md"] })}\n`,
-		);
+	test.skipIf(process.platform === "win32")(
+		"POSIX: server-<INT32_MAX+1>.lock with opposite-policy content is skipped, not treated as live peer",
+		async () => {
+			// On POSIX, `pid_t` is signed int32 — values above this cannot be
+			// live processes. The filename gate silently skips them so a
+			// planted opposite-policy file doesn't block startup via
+			// `isProcessAlive`'s non-ESRCH-as-alive fallback (Node's
+			// `process.kill` throws `ERR_OUT_OF_RANGE`, not ESRCH).
+			const indexPath = indexDir(vault.path);
+			await mkdir(indexPath, { recursive: true });
+			const bogusPath = join(indexPath, "server-2147483648.lock");
+			await writeFile(
+				bogusPath,
+				`${JSON.stringify({ includeHidden: true, hostname: hostname(), vaultExtensions: ["md"] })}\n`,
+			);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
-		try {
-			// Bogus file preserved (don't unlink anything we can't verify).
-			await expect(stat(bogusPath)).resolves.toBeTruthy();
-			await expect(stat(ownLockPath(vault.path, process.pid))).resolves.toBeTruthy();
-		} finally {
-			await handle.release();
-			await unlink(bogusPath).catch(() => {});
-		}
-	});
+			const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+			try {
+				// Bogus file preserved (don't unlink anything we can't verify).
+				await expect(stat(bogusPath)).resolves.toBeTruthy();
+				await expect(stat(ownLockPath(vault.path, process.pid))).resolves.toBeTruthy();
+			} finally {
+				await handle.release();
+				await unlink(bogusPath).catch(() => {});
+			}
+		},
+	);
+
+	test.runIf(process.platform === "win32")(
+		"Win32: server-<INT32_MAX+1>.lock with opposite-policy throws ServerLockConflictError (fail closed)",
+		async () => {
+			// Windows PIDs are unsigned int32; rare-but-legitimate values
+			// exceed POSIX_PID_MAX. Silent-skip would let a real opposite-
+			// policy Windows peer share the WAL. Filename gate accepts;
+			// `isProcessAlive` returns true for un-probeable PIDs (Node's
+			// `process.kill` rejects int32-overflowing pids with a non-ESRCH
+			// errno → "presumed alive"); tiebreaker fires; we wx'd second → throw.
+			const indexPath = indexDir(vault.path);
+			await mkdir(indexPath, { recursive: true });
+			const winHighPidPath = join(indexPath, "server-2147483648.lock");
+			await writeFile(
+				winHighPidPath,
+				`${JSON.stringify({ includeHidden: true, hostname: hostname(), vaultExtensions: ["md"] })}\n`,
+			);
+			// Backdate the planted slot so the simultaneous-start mtime
+			// tiebreaker resolves unambiguously regardless of NTFS mtime
+			// quantization (~15 ms ticks): our slot, written second by
+			// acquireServerLock, must read as the newer arrival → we lose the
+			// tiebreak → throw. Mirrors the backdate at the live-slot and
+			// older-mtime conflict tests above.
+			const past = new Date(Date.now() - 60_000);
+			await utimes(winHighPidPath, past, past);
+
+			try {
+				await expect(acquireServerLock({ indexDir: indexPath, includeHidden: false })).rejects.toBeInstanceOf(
+					ServerLockConflictError,
+				);
+				// Planted file preserved — we don't unlink un-probeable PIDs.
+				await expect(stat(winHighPidPath)).resolves.toBeTruthy();
+			} finally {
+				await unlink(winHighPidPath).catch(() => {});
+			}
+		},
+	);
+
+	test.runIf(process.platform === "win32")(
+		"Win32: server-<UINT32_MAX+1>.lock with opposite-policy is silently skipped (impossible PID)",
+		async () => {
+			// Win32 PIDs are bounded by DWORD (0..0xFFFFFFFF). Values above
+			// that cannot correspond to a real process, so a planted file
+			// must read as "no peer" rather than blocking startup through
+			// the fail-closed un-probeable-PID path.
+			const indexPath = indexDir(vault.path);
+			await mkdir(indexPath, { recursive: true });
+			const impossiblePath = join(indexPath, "server-4294967296.lock");
+			await writeFile(
+				impossiblePath,
+				`${JSON.stringify({ includeHidden: true, hostname: hostname(), vaultExtensions: ["md"] })}\n`,
+			);
+
+			const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+			try {
+				// Planted file preserved — gate skipped without touching it.
+				await expect(stat(impossiblePath)).resolves.toBeTruthy();
+				await expect(stat(ownLockPath(vault.path, process.pid))).resolves.toBeTruthy();
+			} finally {
+				await handle.release();
+				await unlink(impossiblePath).catch(() => {});
+			}
+		},
+	);
 });
 
 describe("server lockfile — reprobe non-regular guard", () => {

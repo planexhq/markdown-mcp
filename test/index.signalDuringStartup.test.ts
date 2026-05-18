@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { TEST_ENV } from "../src/index.js";
 import { ownLockPath } from "./helpers/indexDir.js";
-import { spawnAndWaitForStderr, waitForExit } from "./helpers/mcp-client.js";
+import { gracefulShutdown, spawnAndWaitForStderr, waitForExit } from "./helpers/mcp-client.js";
 import { createTempVault, type VaultStructure } from "./helpers/vault.js";
 
 const FIXTURE: VaultStructure = {
@@ -39,7 +39,7 @@ afterEach(async () => {
 });
 
 describe("signal during startup", () => {
-	test("SIGTERM after lock acquisition but before full startup unlinks the lockfile", async () => {
+	test("graceful shutdown after lock acquisition but before full startup unlinks the lockfile", async () => {
 		const server = await spawnAndWaitForStderr(vault.path, {
 			extraEnv: { [TEST_ENV.STARTUP_DELAY_MS]: String(STARTUP_DELAY_MS) },
 			waitFor: `${TEST_ENV.STARTUP_DELAY_MS}=${STARTUP_DELAY_MS}`,
@@ -50,7 +50,7 @@ describe("signal during startup", () => {
 		// Lockfile exists in the pause window — proves we're past acquire.
 		await expect(stat(lockPath)).resolves.toBeTruthy();
 
-		server.child.kill("SIGTERM");
+		gracefulShutdown(server.child);
 		await waitForExit(server.child);
 
 		await expect(stat(lockPath)).rejects.toThrow(/ENOENT/);

@@ -4,6 +4,26 @@ All notable changes to markdown-mcp are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Native Windows support.** CI now runs the full test suite on `windows-latest` alongside Linux + macOS (Node 22 + 24). A handful of POSIX-only fixtures (`mkfifo`, `chmod 0o000`, SIGTERM-mid-request from a parent process) are gated behind `test.skipIf(process.platform === "win32")`; the defenses they cover are still in effect via different mechanisms (see security section below).
+
+### Fixed
+
+- **`openSqliteWithRecovery` close-before-unlink** (`src/lib/index/sqlite.ts`). The corruption-recovery path called `wipeIndexCache` while the failed `better-sqlite3` `Database` handle was still open. On POSIX `unlink` succeeds while the handle is open; on Windows it fails with `EBUSY`. Now closes the handle before unlinking on every platform — also stops leaking the handle on POSIX, where the issue was previously masked by the kernel.
+
+### Security
+
+- **Windows leaf-symlink TOCTOU defense.** `O_NOFOLLOW` is silently stripped by libuv on Windows, leaving the validation → open window unguarded against a leaf-symlink swap. `openNoFollow` now opens the file and then requires `fstat(handle)` to match a fresh `lstat` of a non-symlink leaf on `dev`/`ino` — proof the handle is bound to the in-vault file the path names (a followed symlink reports the target and fails the match). A benign atomic editor save (write-temp + rename) racing the open also perturbs the match, so the check retries a small bounded number of times to let a one-shot save settle; a sustained hostile swap never matches and is rejected (bounded — never an escape). `serverLock.readAndParse` applies an analogous pre-open `lstat` + post-open `dev`/`ino` guard for foreign-lockfile reads. Both compare with `{ bigint: true }` stats — 64-bit Windows file IDs can exceed `Number.MAX_SAFE_INTEGER` and would collide under JS-number rounding. POSIX paths are unchanged.
+- **`acquireOwnSlot` race-tolerant own-slot cleanup.** A hostile swap-to-directory landing in the microsecond window between the post-read `repostProbe` and the cleanup `rm` previously surfaced as a raw `EISDIR` `SystemError` instead of `ServerLockFileNotRegularError`. The `rm` is now wrapped in a recheck that re-routes a non-regular outcome through the existing typed-error path. Race is platform-agnostic but Windows-prone in practice (coarser timer resolution + slower `mkdir`).
+- **Platform-correct vault-root trailing-separator strip.** `validateVaultRoot` stripped only a trailing `/` before its `lstat`, leaving a trailing `\` intact on Windows (where `path.normalize` keeps it and converts all `/` away). Now uses `path.resolve`, which strips both separators and collapses `.`/`..`. Symlink-root rejection was already sound on the supported Windows matrix — `lstat` flags a reparse point regardless of trailing separator — but the strip is now correct by construction rather than dead code on win32.
+
+### Docs
+
+- **Windows MCP-host config.** The README's `cmd /c` wrapper note now covers the global-install case too: `command: "markdown-mcp"` resolves to `markdown-mcp.cmd` on Windows, which (like `npx.cmd`) is not directly spawnable from a JSON config and must be wrapped in `cmd /c`.
+
 ## [1.0.0] — 2026-05-11
 
 Initial release. Seven tools + one resource, MCP spec **2025-06-18**, stdio transport, single-vault per process, read-only.

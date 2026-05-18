@@ -1,9 +1,9 @@
 /**
  * Prose renderer for `get_links` output.
  *
- * Narrowing-miss case omits the `anchor:` line entirely (round-8 rule)
- * so the agent can distinguish "narrowing found nothing" from "anchor
- * resolved but had no links."
+ * Narrowing-miss case omits the `anchor:` line entirely so the agent
+ * can distinguish "narrowing found nothing" from "anchor resolved but
+ * had no links."
  */
 
 import type { GetLinksResult, IncomingLink, MetaEnvelope, OutgoingLinkRow, ResolvedAnchor } from "../../types.js";

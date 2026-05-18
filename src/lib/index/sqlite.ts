@@ -66,9 +66,19 @@ export function openSqlite(options: OpenSqliteOptions): OpenedSqlite {
 		throw new Error(`openSqlite: policy="open" but ${dbPath} does not exist.`);
 	}
 	const db = new Database(dbPath);
-	for (const pragma of PRAGMAS) db.exec(pragma);
-	registerUdfs(db);
-	runMigrationV1(db);
+	try {
+		for (const pragma of PRAGMAS) db.exec(pragma);
+		registerUdfs(db);
+		runMigrationV1(db);
+	} catch (err) {
+		// Release the file handle before propagating so the corruption-
+		// recovery `wipeIndexCache` in `openSqliteWithRecovery` doesn't
+		// hit EBUSY on Windows (POSIX unlink-while-open doesn't apply).
+		try {
+			db.close();
+		} catch {}
+		throw err;
+	}
 	return { db, preexisted };
 }
 
