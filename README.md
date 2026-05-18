@@ -7,7 +7,7 @@
 
 Agents fed raw markdown end up paraphrasing from memory and fabricating citations. **markdown-mcp** gives them structured, addressable access to a local vault (Obsidian, Foam, plain folder) — heading-anchored fragments, BM25 search, stable IDs for re-fetching — so retrieved content stays verifiable.
 
-Six tools — `get_vault_tree`, `get_file_outline`, `get_fragment`, `search`, `get_metadata`, `get_links` — plus the `note://{path}` resource. Stdio transport, MCP spec `2025-06-18`. Single-vault per process. v1 is read-only; write tools are planned for v2.
+Seven tools — `get_vault_tree`, `get_file_outline`, `get_fragment`, `search`, `get_metadata`, `get_links`, `get_server_info` — plus the `note://{path}` resource. Stdio transport, MCP spec `2025-06-18`. Single-vault per process. v1 is read-only; write tools are planned for v2.
 
 ## Features
 
@@ -120,6 +120,7 @@ Windsurf, Goose, Zed, and other stdio-based MCP hosts accept the same `command` 
 | `--vault <path>` | Vault directory (required). Absolute or relative. |
 | `--polling` | Force fs polling instead of native FS events. Use on network mounts (NFS/SMB) and platforms where chokidar's native events fire unreliably. ~10× slower; only enable when needed. |
 | `--include-hidden` | Include dot-prefixed files and directories on every surface. Default excludes them. All-or-nothing per server. |
+| `--prose-only` | Suppress `structuredContent` on every tool response so the markdown prose body is the sole channel. Useful for token-constrained LLM-consumer workflows. `get_server_info.server.prose_only` reflects the flag for agent self-verification. |
 | `-h`, `--help` | Show usage and exit. |
 
 ## Environment variables
@@ -138,6 +139,7 @@ Windsurf, Goose, Zed, and other stdio-based MCP hosts accept the same `command` 
 | `search` | BM25 full-text + structured frontmatter filter. Two modes: query and filter-only. Discriminated-union response. |
 | `get_metadata` | Parsed YAML frontmatter for one file. |
 | `get_links` | Outgoing wikilinks + incoming backlinks. Optional narrowing by heading_path or stable_id. |
+| `get_server_info` | Identity / health snapshot for agent self-verification: server version, vault `root_hash`, index `state` + freshness, algorithm IDs, registered tools. Zero input. |
 
 The `note://{path}` Resource returns the raw on-disk markdown (frontmatter included) so hosts can stream a literal note when a parsed fragment isn't what they want.
 
@@ -160,7 +162,7 @@ The `note://{path}` Resource returns the raw on-disk markdown (frontmatter inclu
 
 Inputs are the tool arguments the host passes; outputs are abbreviated tool results (the `_meta` envelope is omitted for brevity; `nextCursor` is shown when relevant).
 
-Every tool returns two parallel channels: `structuredContent` (the typed JSON shown in each example below) for programmatic consumers, and `content[0].text` (a compact markdown rendering of the same data) for LLM consumers that read the prose channel directly. The prose channel uses a few rendering conventions:
+Every tool returns two parallel channels: `structuredContent` (the typed JSON shown in each example below) for programmatic consumers, and `content[0].text` (a compact markdown rendering of the same data) for LLM consumers that read the prose channel directly. Pass [`--prose-only`](#cli-flags) to drop `structuredContent` and keep only the prose body. The prose channel uses a few rendering conventions:
 
 - File-with-heading addresses join on ` › ` (e.g. `notes/auth.md › OAuth2`). When a filename contains ` › `, the file portion is always wrapped in `«…»` so the boundary stays unambiguous — both standalone (e.g. `[file]  «notes/foo › bar.md»` in `get_vault_tree`, `«notes/foo › bar.md» · file` in `search` file/preamble rows) and inside addresses (`«notes/foo › bar.md» › OAuth2`). Passing either form back through a `file:` argument round-trips to the same path.
 - Wikilink aliases are quoted JSON-style (`"alias text"`), so embedded `"` and `\` are escaped (`\"`, `\\`).
@@ -370,6 +372,55 @@ incoming (1):
 ```
 
 Narrow to one section with `heading_path: ["Authentication", "OAuth2"]` or `stable_id: "h:f1a08b…"`.
+
+### `get_server_info` — identity / health snapshot
+
+```jsonc
+// in
+{}
+
+// structuredContent
+{
+  "server": { "name": "markdown-mcp", "version": "1.0.0", "mcp_protocol_version": "2025-06-18",
+              "started_at": "2026-05-18T08:23:18.842Z", "prose_only": false },
+  "vault":  { "root_hash": "2cd5a7f35e256539", "include_hidden": false,
+              "extensions": ["md"],
+              // true on macOS/Windows; false on Linux ext4/btrfs
+              "case_insensitive_fs": true },
+  "index":  { "schema_version": 1, "state": "warm", "files_indexed": 6,
+              "ever_complete": true, "last_scan_finished_at": "2026-05-18T08:23:18.881Z" },
+  "algorithms":   { "tokenizer": "heuristic/content-aware-v1",
+                    "query_algorithm": "query-sanitize-v1",
+                    "snippet_algorithm_query": "bm25-fragment-v1",
+                    "snippet_algorithm_filter": "filter-preview-v1",
+                    "fuzzy_algorithm": "stable-id-fuzzy-v1" },
+  "capabilities": { "tools": ["get_vault_tree", "get_file_outline", "get_fragment", "search",
+                              "get_metadata", "get_links", "get_server_info"],
+                    "resources": ["note://"] }
+}
+```
+
+```text
+// content[0].text
+server_info
+
+## Server
+- name: markdown-mcp
+- version: 1.0.0
+- mcp_protocol_version: 2025-06-18
+- started_at: 2026-05-18T08:23:18.842Z
+- prose_only: false
+
+## Vault
+- root_hash: 2cd5a7f35e256539
+- include_hidden: false
+- extensions: md
+- case_insensitive_fs: true
+
+## Index, ## Algorithms, ## Capabilities — same `## Section` + `- key: value` shape; fields mirror the structuredContent above.
+```
+
+Zero input; always succeeds. Agents call it once at session start to confirm they're pointed at the expected vault (compare `root_hash` — sha256-of-realpath, 16 hex — to detect a server pointed at the wrong directory) and to discover which tools and algorithm IDs are registered.
 
 ### `note://{path}` Resource — raw markdown
 

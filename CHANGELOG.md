@@ -4,7 +4,7 @@ All notable changes to markdown-mcp are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] — 2026-05-11
+## [1.0.0] — 2026-05-18
 
 Initial release. Seven tools + one resource, MCP spec **2025-06-18**, stdio transport, single-vault per process, read-only.
 
@@ -18,7 +18,7 @@ Initial release. Seven tools + one resource, MCP spec **2025-06-18**, stdio tran
 - **`get_links`** — Outgoing wikilinks + incoming backlinks, with optional narrowing by `heading_path` or `stable_id`. Cursor sort tuple `{source_file, source_heading_path, link_ordinal}` (D34).
 - **`get_server_info`** — Identity / health snapshot for agent self-verification: server version + vault `root_hash`, index `state` + `files_indexed` + `last_scan_finished_at` + optional `degraded` flags, algorithm IDs, registered tool / resource capability list (D37–D41). Zero input; always succeeds.
 
-Every tool response carries **both** `structuredContent` (machine-readable JSON; authoritative per MCP spec when present) **and** `content[0].text` (markdown prose for human-facing hosts that prefer text rendering). Both reflect the same data; agents that parse `structuredContent` can ignore the text channel.
+Every tool response carries **both** `structuredContent` (machine-readable JSON; authoritative per MCP spec when present) **and** `content[0].text` (markdown prose for human-facing hosts that prefer text rendering). Both reflect the same data; agents that parse `structuredContent` can ignore the text channel. The `--prose-only` flag drops `structuredContent` so the prose body is the sole channel — useful for token-constrained LLM-consumer workflows; the prose renderers carry load-bearing fields (labels, candidates, progress, hash-fenced bodies, `<U+HHHH>` markers for YAML-hostile codepoints) so no data is lost.
 
 ### Resource
 
@@ -45,6 +45,7 @@ Every tool response carries **both** `structuredContent` (machine-readable JSON;
 - `--vault <path>` (required)
 - `--polling` — force fs polling for chokidar (network mounts / unreliable native FS events)
 - `--include-hidden` — include dot-prefixed paths on every surface (all-or-nothing per server)
+- `--prose-only` — suppress `structuredContent` on every tool response; `get_server_info.server.prose_only` reflects the flag for agent self-verification
 - `-h`, `--help`
 
 ### Performance

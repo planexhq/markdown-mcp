@@ -1,8 +1,8 @@
 /**
- * Zod input schemas for the 6 MCP tools.
+ * Zod input schemas for the 7 MCP tools.
  *
  * Reasons this lives in its own file (per Plan-agent guidance):
- * - Six tools' schemas with discriminated unions and recursive `Filter`
+ * - Seven tools' schemas with discriminated unions and recursive `Filter`
  *   add up to >300 LOC; `server.ts` should be wiring only.
  * - Test code can validate fixtures against the schemas directly.
  *

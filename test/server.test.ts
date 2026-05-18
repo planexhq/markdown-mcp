@@ -6,7 +6,7 @@
  * resources/list, resources/read.
  *
  * W1 exit-criteria coverage:
- *   - 6 tools registered, schemas non-empty
+ *   - 7 tools registered, schemas non-empty
  *   - Each tool returns INTERNAL_ERROR envelope (D13) with valid UUIDv4
  *     request_id and `_meta` envelope
  *   - request_id is unique per call

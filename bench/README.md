@@ -39,8 +39,8 @@ Runs 10 queries × N iterations:
 | phrase | BM25 | quoted multi-word |
 | prefix | BM25 | trailing `*` |
 | two-token | BM25 | two common terms |
-| filter-tag | filter-only | `tags.has` |
-| filter-tag-prefix | filter-only | `tags.hasPrefix` |
+| filter-tag-has | filter-only | `tags.has` (single-tag exact) |
+| filter-tag-has-any | filter-only | `tags.has_any` (multi-tag OR) |
 | filter-date | filter-only | reserved date COALESCE chain |
 | filter-priority | filter-only | numeric scalar range |
 | query+filter | mixed | BM25 + tag filter |

@@ -1,7 +1,7 @@
 /**
  * MCP server skeleton.
  *
- * Registers all 6 tools and the `note://` resource. Tool handlers
+ * Registers all 7 tools and the `note://` resource. Tool handlers
  * return the D13 hybrid envelope (successful JSON-RPC result with
  * `isError: true` + `structuredContent` for domain errors); the
  * resource read handler throws `McpError` with `-32603` so the SDK
