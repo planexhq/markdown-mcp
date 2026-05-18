@@ -31,6 +31,15 @@ const STABILITY_THRESHOLD_MS = 100;
 const POLL_INTERVAL_MS = 50;
 const POLLING_INTERVAL_MS = 1000;
 const POLLING_BINARY_INTERVAL_MS = 1500;
+/**
+ * Cap on concurrently in-flight watcher-triggered reindexes. chokidar's
+ * startup `add` flood (one event per file under `ignoreInitial:false`) must
+ * not launch one in-flight parse per vault file — each holds a parsed AST
+ * until commit, so an unbounded flood is O(vault size) memory and OOMs on
+ * large vaults. Matches `scanVault`'s worker count; the value is not
+ * sensitive — any small constant bounds peak in-flight ASTs to N.
+ */
+const REINDEX_CONCURRENCY = 4;
 
 export interface WatcherOptions {
 	vaultRoot: VaultRoot;
@@ -90,14 +99,41 @@ export function startWatcher(opts: WatcherOptions): Watcher {
 		ignored: (path, stats) => shouldIgnore(path, stats, vaultRoot, includeHidden),
 	});
 
+	// Bounded worker pool for `add`/`change` reindexes. chokidar pushes
+	// events faster than `reindexFile` drains them — a large vault's startup
+	// `add` flood arrives in seconds while parsing runs at ~tens of files/s.
+	// `pendingReindex` queues the backlog as cheap path strings; `pumpReindex`
+	// keeps at most `REINDEX_CONCURRENCY` parses — and thus ASTs — in flight.
+	const pendingReindex: string[] = [];
+	let reindexInFlight = 0;
+
+	const pumpReindex = (): void => {
+		while (reindexInFlight < REINDEX_CONCURRENCY && pendingReindex.length > 0) {
+			const rel = pendingReindex.shift();
+			if (rel === undefined) break;
+			reindexInFlight++;
+			void coordinator
+				.enqueue(rel, async () => {
+					try {
+						await reindexFile(rel);
+					} catch (err) {
+						console.error(`markdown-mcp watcher: reindex failed for ${rel}: ${errorMessage(err)}`);
+					}
+				})
+				.finally(() => {
+					reindexInFlight--;
+					pumpReindex();
+				})
+				// The task body swallows its own errors, but `enqueue`'s returned
+				// promise is reject-able by contract — absorb it so this
+				// fire-and-forget `void` chain can't leak an unhandled rejection.
+				.catch(() => {});
+		}
+	};
+
 	const enqueueReindex = (rel: string): void => {
-		void coordinator.enqueue(rel, async () => {
-			try {
-				await reindexFile(rel);
-			} catch (err) {
-				console.error(`markdown-mcp watcher: reindex failed for ${rel}: ${errorMessage(err)}`);
-			}
-		});
+		pendingReindex.push(rel);
+		pumpReindex();
 	};
 
 	const onChange = (absPath: string): void => {
