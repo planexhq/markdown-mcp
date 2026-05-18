@@ -173,8 +173,8 @@ describe("renderOutline", () => {
 		// misses Cc-category controls (U+0085 NEL most notably). Without the
 		// renderer-side escape, the outline row would render as two lines in
 		// a NEL-interpreting chat UI, forging a labeled `forged:` second line
-		// in front of the real `id:`/range suffix. Same forgery class round 7
-		// closed for `formatHeadingPath` segments.
+		// in front of the real `id:`/range suffix. Same forgery class
+		// `formatHeadingPath` defends against for its segments.
 		const hostile: OutlineNode = leaf({
 			level: 1,
 			text: "H\u0085forged",

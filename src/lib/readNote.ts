@@ -31,7 +31,7 @@ import type { FileHandle } from "node:fs/promises";
 import { lstat } from "node:fs/promises";
 
 import type { PathRejectionReason, SafePath } from "../types.js";
-import { errorMessage, isVanishedErrno, vaultError } from "./error.js";
+import { errorMessage, getErrnoCode, isVanishedErrno, vaultError } from "./error.js";
 import { isHiddenPath, isIndexCachePath } from "./hiddenPath.js";
 import { MAX_FILE_BYTES } from "./limits.js";
 import { type ParsedFile, ParseError, type ParseFileOptions, parseFile } from "./parser.js";
@@ -143,13 +143,43 @@ export async function readSource(safePath: SafePath, includeHidden = false): Pro
 			if (isVanishedErrno(cause)) {
 				throw pathNotFound(`Path does not exist: ${safePath.relative}`);
 			}
-			if (isFsErrorCode(cause, "ELOOP")) {
-				throw new PathValidationError(
-					vaultError("PATH_OUTSIDE_VAULT", `Path leaf became a symlink: ${safePath.relative}`, {
-						param: "file",
-						reason: "SYMLINK_SEGMENT" satisfies PathRejectionReason,
-					}),
-				);
+			const code = getErrnoCode(cause);
+			if (code === "ELOOP") {
+				throw symlinkSegment(safePath);
+			}
+			// Win32 libuv strips O_NOFOLLOW and opens directories via backup
+			// semantics, so a dir-symlink/junction swap surfaces as either
+			// EACCES or EISDIR (OS-version/reparse-type dependent). Post-error
+			// lstat disambiguates: symlink → SYMLINK_SEGMENT (preserve rows);
+			// non-regular non-symlink → PATH_NOT_FOUND (prune real dir swap);
+			// regular → propagate cause (ACL deny / share-lock / race-back).
+			if (process.platform === "win32" && (code === "EACCES" || code === "EISDIR")) {
+				let postStat: Awaited<ReturnType<typeof lstat>>;
+				try {
+					postStat = await lstat(safePath.absolute);
+				} catch (lstatErr) {
+					if (isVanishedErrno(lstatErr)) {
+						throw pathNotFound(`Path does not exist: ${safePath.relative}`);
+					}
+					throw cause;
+				}
+				if (postStat.isSymbolicLink()) {
+					throw symlinkSegment(safePath);
+				}
+				if (!postStat.isFile()) {
+					throw pathNotFound(`Path is not a regular file: ${safePath.relative}`);
+				}
+				// Regular file post-lstat on Win32 — propagate cause without
+				// falling through to the POSIX-only EISDIR check below (that
+				// would defeat the row-preservation we just earned via
+				// disambiguation).
+				throw cause;
+			}
+			// POSIX EISDIR is unambiguous: open(O_RDONLY) of a regular file
+			// cannot return EISDIR per errno semantics — target must be a
+			// directory.
+			if (code === "EISDIR") {
+				throw pathNotFound(`Path is not a regular file: ${safePath.relative}`);
 			}
 			throw cause;
 		}
@@ -205,10 +235,15 @@ export async function readNote(
 	return { source, parsed, sizeBytes };
 }
 
-function isFsErrorCode(err: unknown, code: string): boolean {
-	return typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === code;
-}
-
 function pathNotFound(message: string): PathValidationError {
 	return new PathValidationError(vaultError("PATH_NOT_FOUND", message, { param: "file" }));
+}
+
+function symlinkSegment(safePath: SafePath): PathValidationError {
+	return new PathValidationError(
+		vaultError("PATH_OUTSIDE_VAULT", `Path leaf became a symlink: ${safePath.relative}`, {
+			param: "file",
+			reason: "SYMLINK_SEGMENT" satisfies PathRejectionReason,
+		}),
+	);
 }

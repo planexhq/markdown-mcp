@@ -248,11 +248,11 @@ export class IndexHandle implements VaultFileIndex {
 
 	// Persisted-flag getters (`scan_complete`, `inflight_include_hidden`,
 	// `include_hidden`, `ever_complete`) all read disk per call — under
-	// same-policy multi-process operation (round 30) a peer's mid-life
-	// finalize is invisible to any in-memory cache, producing
-	// self-contradictory snapshots (e.g. cached `ever_complete=false`
-	// alongside the peer's freshly-written `last_scan_finished_at`).
-	// Setters write disk directly; getters issue a fresh SELECT each call.
+	// same-policy multi-process operation a peer's mid-life finalize is
+	// invisible to any in-memory cache, producing self-contradictory
+	// snapshots (e.g. cached `ever_complete=false` alongside the peer's
+	// freshly-written `last_scan_finished_at`). Setters write disk
+	// directly; getters issue a fresh SELECT each call.
 
 	// Per-file failures the watcher can still recover. Both scanner and
 	// the watcher's `reindexCallback` add via {@link addPendingRetry};
@@ -463,10 +463,10 @@ export class IndexHandle implements VaultFileIndex {
 	 * machine only treats the latter as "warm" — see
 	 * `chooseStartupState`.
 	 *
-	 * Reads disk per call: under same-policy multi-process operation
-	 * (round 30) a peer's finalize is invisible to other peers'
-	 * in-memory state, producing a self-contradictory `get_server_info`
-	 * snapshot (`ever_complete=false` alongside the peer's
+	 * Reads disk per call: under same-policy multi-process operation a
+	 * peer's finalize is invisible to other peers' in-memory state,
+	 * producing a self-contradictory `get_server_info` snapshot
+	 * (`ever_complete=false` alongside the peer's
 	 * `last_scan_finished_at`). Cost: ~µs via prepared statement.
 	 */
 	getEverComplete(): boolean {

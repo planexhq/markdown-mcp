@@ -90,8 +90,7 @@ describe("last_scan_finished_at — getStatus integration", () => {
 
 test("migration idempotency: running migration twice does not duplicate last_scan_finished_at", () => {
 	// First run already happened inside `openSqlite`; do it again
-	// explicitly to simulate a same-policy peer migration race
-	// (round 36 / round 42).
+	// explicitly to simulate a same-policy peer migration race.
 	runMigrationV1(opened.db);
 	runMigrationV1(opened.db);
 	const cols = opened.db.prepare("PRAGMA table_info(index_meta)").all() as Array<{ name: string }>;

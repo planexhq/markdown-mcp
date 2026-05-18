@@ -22,6 +22,7 @@ import { errorMessage } from "./error.js";
 import { isHiddenPath, isIndexCachePath, isNonNfc } from "./hiddenPath.js";
 import type { IndexHandle } from "./index/IndexHandle.js";
 import type { IndexOutcome } from "./index/scanner.js";
+import { toPosix } from "./pathPosix.js";
 import { classifyRelpathPolicy, type VaultRoot } from "./validatePath.js";
 import { isMarkdownPath } from "./vaultExtensions.js";
 import type { WriteCoordinator } from "./writeCoordinator.js";
@@ -154,16 +155,6 @@ export function startWatcher(opts: WatcherOptions): Watcher {
 			await fsWatcher.close();
 		},
 	};
-}
-
-/**
- * Win32-only `\` → `/` conversion. POSIX filenames may contain literal
- * `\`, so converting before `classifyRelpathPolicy` would let
- * `foo\bar.md` bypass `BACKSLASH_RE` and collide with `foo/bar.md`. On
- * POSIX `path.relative` already emits `/`; on win32 it emits `\`.
- */
-function toPosix(rel: string): string {
-	return process.platform === "win32" ? rel.split("\\").join("/") : rel;
 }
 
 export function toVaultRelative(vaultRoot: VaultRoot, absPath: string): string | null {

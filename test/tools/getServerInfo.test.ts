@@ -43,7 +43,7 @@ describe("get_server_info — success envelope shape", () => {
 		expect(sc.vault.include_hidden).toBe(false);
 		expect(sc.vault.root_hash).toBe(DEFAULT_CONTEXT.rootHash);
 		expect(sc.vault.extensions).toEqual(["md"]);
-		// `case_insensitive_fs` default is true under the round-40 fallback
+		// `case_insensitive_fs` defaults to true when the probe is skipped
 		// (test runner doesn't probe; safer default).
 		expect(typeof sc.vault.case_insensitive_fs).toBe("boolean");
 	});

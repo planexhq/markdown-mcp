@@ -178,3 +178,20 @@ export async function waitForExit(child: ChildProcess): Promise<number | null> {
 	const [code] = (await once(child, "exit")) as [number | null];
 	return code;
 }
+
+/**
+ * Cross-platform graceful-shutdown signal. POSIX: SIGTERM, routed
+ * through the same teardown as stdin-EOF. Windows: `child.kill()`
+ * ignores the signal name and force-terminates via `TerminateProcess`,
+ * so we close stdin instead — the EOF path Claude Desktop uses to shut
+ * the server down on Windows.
+ */
+export function gracefulShutdown(child: ChildProcess): void {
+	if (process.platform === "win32") {
+		// `?.` is defensive — every caller spawns with stdio: "pipe", so
+		// in practice stdin is always defined.
+		child.stdin?.end();
+	} else {
+		child.kill("SIGTERM");
+	}
+}

@@ -203,15 +203,20 @@ describe("get_vault_tree — URI encoding for reserved chars", () => {
 	// resource template `note://{+path}` then truncates the URI at the
 	// first `#` or `?`. Per-segment `encodeURIComponent` percent-encodes
 	// the offending chars while keeping `/` literal as the path separator.
+	//
+	// `?` is reserved on NTFS so the `q?key.md` fixture only exists on
+	// POSIX; the `#` case round-trips through `createTempVault` on every
+	// platform we support and gates the cross-platform assertion.
 	let uriVault: { path: string; cleanup: () => Promise<void> };
 	let uriConn: TestClient;
 
 	beforeAll(async () => {
-		uriVault = await createTempVault({
+		const structure: Record<string, string> = {
 			"plain.md": "# Plain\n",
 			"v#1.md": "# Sharp\n",
-			"q?key.md": "# Question\n",
-		});
+		};
+		if (process.platform !== "win32") structure["q?key.md"] = "# Question\n";
+		uriVault = await createTempVault(structure);
 		uriConn = await spawnTestServer(uriVault.path);
 		await waitForWarm(uriConn.client);
 	}, 30_000);
@@ -221,7 +226,7 @@ describe("get_vault_tree — URI encoding for reserved chars", () => {
 		await uriVault.cleanup();
 	});
 
-	test("# and ? in filenames percent-encode in resource_link URIs", async () => {
+	test("# in filenames percent-encodes in resource_link URIs", async () => {
 		const result = await uriConn.client.callTool({ name: "get_vault_tree", arguments: { depth: 5 } });
 		expect(result.isError).toBeFalsy();
 		const content = result.content as Array<{ type: string; uri?: string }>;
@@ -230,10 +235,20 @@ describe("get_vault_tree — URI encoding for reserved chars", () => {
 			.map((l) => l.uri)
 			.sort();
 		expect(uris).toContain("note://v%231.md");
-		expect(uris).toContain("note://q%3Fkey.md");
 		// Counter: ASCII-safe filename round-trips unchanged (encodeURIComponent
 		// is idempotent on unreserved chars).
 		expect(uris).toContain("note://plain.md");
+	});
+
+	test.skipIf(process.platform === "win32")("? in filenames percent-encodes in resource_link URIs", async () => {
+		const result = await uriConn.client.callTool({ name: "get_vault_tree", arguments: { depth: 5 } });
+		expect(result.isError).toBeFalsy();
+		const content = result.content as Array<{ type: string; uri?: string }>;
+		const uris = content
+			.filter((b) => b.type === "resource_link")
+			.map((l) => l.uri)
+			.sort();
+		expect(uris).toContain("note://q%3Fkey.md");
 	});
 });
 
@@ -568,9 +583,10 @@ describe("get_vault_tree — readdir errno discipline", () => {
 	// ENOENT/ENOTDIR stay silent (genuinely-vanished subtrees); other
 	// errno log to stderr so an operator can correlate "tree truncated"
 	// with the underlying failure. Mirrors scanner.ts:walkVault.
-	test("EACCES on a subtree logs to stderr (operator can correlate)", async () => {
+	test.skipIf(process.platform === "win32")("EACCES on a subtree logs to stderr (operator can correlate)", async () => {
 		// chmod 000 on a directory makes readdir EACCES for the test user.
-		// Skip on non-POSIX systems where chmod semantics differ.
+		// Skip on non-POSIX systems where chmod semantics differ (Windows
+		// uses ACLs via `icacls`; `chmod 0o000` is a no-op on NTFS).
 		const v = await createTempVault({
 			"top.md": "# top\n",
 			locked: { "inside.md": "# inside\n" },

@@ -161,7 +161,7 @@ describe("readNote — non-regular files", () => {
 		}
 	});
 
-	test("FIFO does not block server; surfaces PATH_NOT_FOUND", async () => {
+	test.skipIf(process.platform === "win32")("FIFO does not block server; surfaces PATH_NOT_FOUND", async () => {
 		const fifoPath = join(vault.path, "pipe.md");
 		await execp(`mkfifo ${JSON.stringify(fifoPath)}`);
 		const safe = await validatePath("pipe.md", vaultRoot);

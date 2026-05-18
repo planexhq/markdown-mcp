@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { TEST_ENV } from "../src/index.js";
 import { ownLockPath } from "./helpers/indexDir.js";
-import { spawnAndWaitForStderr, waitForExit } from "./helpers/mcp-client.js";
+import { gracefulShutdown, spawnAndWaitForStderr, waitForExit } from "./helpers/mcp-client.js";
 import { createTempVault, type VaultStructure } from "./helpers/vault.js";
 
 const FIXTURE: VaultStructure = {
@@ -32,7 +32,7 @@ afterEach(async () => {
 });
 
 describe("signal during acquire", () => {
-	test("SIGTERM inside acquireServerLock's onSlotCreated pause unlinks the lockfile", async () => {
+	test("graceful shutdown inside acquireServerLock's onSlotCreated pause unlinks the lockfile", async () => {
 		const server = await spawnAndWaitForStderr(vault.path, {
 			extraEnv: { [TEST_ENV.RECONCILE_DELAY_MS]: String(RECONCILE_DELAY_MS) },
 			waitFor: `${TEST_ENV.RECONCILE_DELAY_MS}=${RECONCILE_DELAY_MS}`,
@@ -44,7 +44,7 @@ describe("signal during acquire", () => {
 		// own-slot is on disk and we're inside the callback.
 		await expect(stat(lockPath)).resolves.toBeTruthy();
 
-		server.child.kill("SIGTERM");
+		gracefulShutdown(server.child);
 		await waitForExit(server.child);
 
 		await expect(stat(lockPath)).rejects.toThrow(/ENOENT/);

@@ -237,96 +237,110 @@ describe("stdin-EOF during in-flight request", () => {
 		expect(parsed.result?.content?.[0]?.text).toBeDefined();
 	}, 30_000);
 
-	test("SIGTERM mid-request: late client request is dropped, not raced to exit", async () => {
-		const { child, getStdout, getStderr } = await spawnAndInitialize(vault.path, "sigterm-race-test");
+	// Windows has no programmatic graceful-shutdown signal: child.kill()
+	// ignores the signal name and forcefully terminates via
+	// TerminateProcess (per Node docs). The "shutdown signal mid-request,
+	// late request dropped" race this test exercises therefore can't be
+	// reproduced from a parent process on Windows. The same code path is
+	// hit by stdin-EOF (covered in the first two tests of this file), but
+	// stdin closure also closes the data channel, so the late-request leg
+	// of this assertion is structurally impossible on Windows.
+	test.skipIf(process.platform === "win32")(
+		"SIGTERM mid-request: late client request is dropped, not raced to exit",
+		async () => {
+			const { child, getStdout, getStderr } = await spawnAndInitialize(vault.path, "sigterm-race-test");
 
-		// Pause the parent's stdout reader so the upcoming response
-		// backpressures inside the server's `transport.send`. This pins
-		// the first request mid-flight and lets us deterministically
-		// interleave a SIGTERM + late request before drain resolves.
-		child.stdout?.pause();
+			// Pause the parent's stdout reader so the upcoming response
+			// backpressures inside the server's `transport.send`. This pins
+			// the first request mid-flight and lets us deterministically
+			// interleave a SIGTERM + late request before drain resolves.
+			child.stdout?.pause();
 
-		child.stdin?.write(
-			`${JSON.stringify({
-				jsonrpc: "2.0",
-				id: 2,
-				method: "tools/call",
-				params: {
-					name: "get_fragment",
-					arguments: { file: "huge.md", anchor: { kind: "file" } },
-				},
-			})}\n`,
-		);
+			child.stdin?.write(
+				`${JSON.stringify({
+					jsonrpc: "2.0",
+					id: 2,
+					method: "tools/call",
+					params: {
+						name: "get_fragment",
+						arguments: { file: "huge.md", anchor: { kind: "file" } },
+					},
+				})}\n`,
+			);
 
-		await new Promise((r) => setTimeout(r, 200));
+			await new Promise((r) => setTimeout(r, 200));
 
-		// SIGTERM → tearDownAndExit replaces transport.onmessage with a
-		// no-op AND awaits drain (which is blocked by the backpressured
-		// first send).
-		child.kill("SIGTERM");
+			// SIGTERM → tearDownAndExit replaces transport.onmessage with a
+			// no-op AND awaits drain (which is blocked by the backpressured
+			// first send).
+			child.kill("SIGTERM");
 
-		// Wait until the child's SIGTERM handler has actually run.
-		// `console.error(reason)` in tearDownAndExit fires immediately
-		// before the onmessage override (no await between them), so by
-		// the time we observe the log line on stderr the override has
-		// landed. A fixed sleep wasn't deterministic enough under load.
-		await waitForSubstring(child.stderr, getStderr, "received SIGTERM", "SIGTERM ack timeout");
+			// Wait until the child's SIGTERM handler has actually run.
+			// `console.error(reason)` in tearDownAndExit fires immediately
+			// before the onmessage override (no await between them), so by
+			// the time we observe the log line on stderr the override has
+			// landed. A fixed sleep wasn't deterministic enough under load.
+			await waitForSubstring(child.stderr, getStderr, "received SIGTERM", "SIGTERM ack timeout");
 
-		// Late request — must be dropped at the replaced onmessage.
-		// Without the fix the SDK would dispatch it, the handler would
-		// run, and its `transport.send` would race `process.exit()`.
-		child.stdin?.write(
-			`${JSON.stringify({
-				jsonrpc: "2.0",
-				id: 3,
-				method: "tools/call",
-				params: { name: "get_server_info", arguments: {} },
-			})}\n`,
-		);
+			// Late request — must be dropped at the replaced onmessage.
+			// Without the fix the SDK would dispatch it, the handler would
+			// run, and its `transport.send` would race `process.exit()`.
+			child.stdin?.write(
+				`${JSON.stringify({
+					jsonrpc: "2.0",
+					id: 3,
+					method: "tools/call",
+					params: { name: "get_server_info", arguments: {} },
+				})}\n`,
+			);
 
-		await new Promise((r) => setTimeout(r, 200));
+			await new Promise((r) => setTimeout(r, 200));
 
-		// Resume — the OS pipe drains, the first send resolves,
-		// drain resolves, server proceeds to clean exit.
-		child.stdout?.resume();
+			// Resume — the OS pipe drains, the first send resolves,
+			// drain resolves, server proceeds to clean exit.
+			child.stdout?.resume();
 
-		const exitCode = await Promise.race([
-			waitForExit(child),
-			new Promise<number>((_, reject) =>
-				setTimeout(
-					() =>
-						reject(
-							new Error(`child did not exit within 15s. stderr:\n${getStderr()}\nstdout length: ${getStdout().length}`),
-						),
-					15_000,
+			const exitCode = await Promise.race([
+				waitForExit(child),
+				new Promise<number>((_, reject) =>
+					setTimeout(
+						() =>
+							reject(
+								new Error(
+									`child did not exit within 15s. stderr:\n${getStderr()}\nstdout length: ${getStdout().length}`,
+								),
+							),
+						15_000,
+					),
 				),
-			),
-		]);
-		expect(exitCode).toBe(0);
+			]);
+			expect(exitCode).toBe(0);
 
-		const lines = getStdout()
-			.split("\n")
-			.filter((line) => line.length > 0);
+			const lines = getStdout()
+				.split("\n")
+				.filter((line) => line.length > 0);
 
-		// First request (id:2) was in flight when SIGTERM landed — its
-		// response must arrive intact via the drain.
-		const id2Line = lines.find((line) => line.includes('"id":2'));
-		expect(id2Line).toBeDefined();
-		const id2Parsed = JSON.parse(id2Line ?? "");
-		expect(id2Parsed.id).toBe(2);
+			// First request (id:2) was in flight when SIGTERM landed — its
+			// response must arrive intact via the drain.
+			const id2Line = lines.find((line) => line.includes('"id":2'));
+			expect(id2Line).toBeDefined();
+			const id2Parsed = JSON.parse(id2Line ?? "");
+			expect(id2Parsed.id).toBe(2);
 
-		// Late request (id:3) must be silently dropped — no response
-		// line in stdout. (If it were dispatched, the response would
-		// either land here OR race process.exit and truncate — both
-		// are wrong; the fix drops it at the onmessage layer.)
-		const id3Line = lines.find((line) => line.includes('"id":3'));
-		expect(id3Line).toBeUndefined();
+			// Late request (id:3) must be silently dropped — no response
+			// line in stdout. (If it were dispatched, the response would
+			// either land here OR race process.exit and truncate — both
+			// are wrong; the fix drops it at the onmessage layer.)
+			const id3Line = lines.find((line) => line.includes('"id":3'));
+			expect(id3Line).toBeUndefined();
 
-		// Every emitted line must be a complete JSON object — guards
-		// against truncation regardless of whether id:3 happened to
-		// race in some flaky way.
-		for (const line of lines) {
-			expect(() => JSON.parse(line)).not.toThrow();
-		}
-	}, 30_000);
+			// Every emitted line must be a complete JSON object — guards
+			// against truncation regardless of whether id:3 happened to
+			// race in some flaky way.
+			for (const line of lines) {
+				expect(() => JSON.parse(line)).not.toThrow();
+			}
+		},
+		30_000,
+	);
 });

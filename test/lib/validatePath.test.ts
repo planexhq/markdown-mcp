@@ -8,8 +8,8 @@
  * case-mismatch ENOENT) is W2/W4.
  */
 
-import { symlink, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { join, parse } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import {
@@ -21,6 +21,7 @@ import {
 	type VaultRoot,
 	validatePath,
 	validateVaultRoot,
+	WIN_ROOT_NEEDING_SEP,
 } from "../../src/lib/validatePath.js";
 import type { ErrorCode, PathRejectionReason, VaultError } from "../../src/types.js";
 import { buildDeepPath, createSymlink, createTempVault, DEFAULT_VAULT_STRUCTURE, UUID_V4 } from "../helpers/vault.js";
@@ -159,6 +160,25 @@ describe("validatePath — rejection group (W1 exit criterion)", () => {
 		}
 	});
 
+	// Win32-only: a trailing backslash is the native separator form (shell
+	// tab-completion appends it). `stripTrailingPathSep` recognizes `\` as a
+	// separator on Windows (via the imported `sep`) so the symlink root is
+	// still caught; a `/`-only strip would miss it entirely.
+	test.runIf(process.platform === "win32")(
+		"validateVaultRoot rejects symlinked root with trailing backslash (win32)",
+		async () => {
+			const real = await createTempVault({ "x.md": "# x\n" });
+			const linkVault = await createTempVault({});
+			try {
+				const linkPath = `${linkVault.path}/symlinked-vault`;
+				await createSymlink(real.path, linkPath);
+				await expectPathRejection(() => validateVaultRoot(`${linkPath}\\`), "PATH_OUTSIDE_VAULT", "VAULT_ROOT_SYMLINK");
+			} finally {
+				await Promise.all([linkVault.cleanup(), real.cleanup()]);
+			}
+		},
+	);
+
 	test("validateVaultRoot rejects non-directory file with reason=VAULT_ROOT_NOT_DIRECTORY", async () => {
 		const payload = await expectPathRejection(
 			() => validateVaultRoot(`${vault.path}/foo.md`),
@@ -172,6 +192,242 @@ describe("validatePath — rejection group (W1 exit criterion)", () => {
 		await expect(validateVaultRoot("/this/path/almost/certainly/does/not/exist/8675309")).rejects.toThrow(
 			PathValidationError,
 		);
+	});
+
+	test("validateVaultRoot('<existing>/missing/..') fails instead of collapsing to CWD", async () => {
+		// `path.resolve` would strip `missing/..` lexically and silently
+		// accept the surviving directory; preserving the segments lets
+		// `lstat` fail with ENOENT on the non-existent component.
+		const isolated = await createTempVault({});
+		try {
+			await expectPathRejection(
+				() => validateVaultRoot(`${isolated.path}/missing/..`),
+				"PATH_OUTSIDE_VAULT",
+				"VAULT_ROOT_INACCESSIBLE",
+			);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("validateVaultRoot('<symlink>/..') resolves through the link, not to its lexical parent", async () => {
+		// Pre-fix `resolve("inner/link/..")` collapsed to `inner` (the
+		// symlink's lexical parent). Post-fix `lstat` traverses the
+		// symlink to its target, then applies `..` to land at the
+		// target's parent — a different directory.
+		const outerVault = await createTempVault({
+			"target/x.md": "# x\n",
+			"inner/placeholder.md": "# p\n",
+		});
+		try {
+			const innerDir = `${outerVault.path}/inner`;
+			const targetDir = `${outerVault.path}/target`;
+			const linkPath = `${innerDir}/link`;
+			await createSymlink(targetDir, linkPath);
+
+			const vaultRoot = await validateVaultRoot(`${linkPath}/..`);
+			const fsReachedParent = await realpath(outerVault.path);
+			const lexicalParent = await realpath(innerDir);
+			expect(vaultRoot.absolute).toBe(fsReachedParent);
+			expect(vaultRoot.absolute).not.toBe(lexicalParent);
+		} finally {
+			await outerVault.cleanup();
+		}
+	});
+
+	// Win32 treats bare `C:` (drive-relative, "current directory on drive
+	// C") and `C:\` (drive root) as different paths. Pre-fix
+	// `stripTrailingPathSep` coerced both to `C:\` via an unconditional
+	// regex restore, silently booting the server on the wrong target. The
+	// fix gates the restore on "loop actually stripped a separator."
+	test.runIf(process.platform === "win32")(
+		"validateVaultRoot('C:') preserves drive-relative semantics on Win32",
+		async () => {
+			const drive = parse(process.cwd()).root.charAt(0);
+			// Drive root == CWD collapses the two semantics; nothing to assert.
+			if (process.cwd() === `${drive}:\\`) return;
+
+			const vaultRoot = await validateVaultRoot(`${drive}:`);
+			expect(vaultRoot.absolute).toBe(await realpath(process.cwd()));
+			expect(vaultRoot.absolute).not.toBe(`${drive}:\\`);
+		},
+	);
+
+	// Regression guard for the round-51 strip case the regex was originally
+	// added for. Loop strips trailing `\`; restore brings it back so
+	// `lstat` doesn't fail on the bare `C:` form.
+	test.runIf(process.platform === "win32")(
+		"validateVaultRoot('C:\\\\') still resolves to drive root on Win32",
+		async () => {
+			const drive = parse(process.cwd()).root.charAt(0);
+			const driveRoot = `${drive}:\\`;
+			const vaultRoot = await validateVaultRoot(driveRoot);
+			expect(vaultRoot.absolute).toBe(await realpath(driveRoot));
+		},
+	);
+
+	// Extended-length verbatim namespace requires the trailing separator;
+	// stripping it produces `\\?\C:` which Windows treats as invalid.
+	test.runIf(process.platform === "win32")(
+		"validateVaultRoot('\\\\?\\\\C:\\\\') preserves verbatim drive root on Win32",
+		async () => {
+			const drive = parse(process.cwd()).root.charAt(0);
+			const verbatim = `\\\\?\\${drive}:\\`;
+			const vaultRoot = await validateVaultRoot(verbatim);
+			expect(vaultRoot.absolute).toBeTruthy();
+			expect(vaultRoot.absolute).not.toBe(`\\\\?\\${drive}:`);
+		},
+	);
+
+	// DOS device namespace `\\.\C:\` is the FS root; the trailerless
+	// `\\.\C:` opens the raw block device — semantically a different target.
+	test.runIf(process.platform === "win32")(
+		"validateVaultRoot('\\\\.\\\\C:\\\\') preserves DOS device drive root on Win32",
+		async () => {
+			const drive = parse(process.cwd()).root.charAt(0);
+			const device = `\\\\.\\${drive}:\\`;
+			const vaultRoot = await validateVaultRoot(device);
+			expect(vaultRoot.absolute).toBeTruthy();
+			expect(vaultRoot.absolute).not.toBe(`\\\\.\\${drive}:`);
+		},
+	);
+
+	test("validateVaultRoot('<vault>/<file>/..') rejects — `..` cannot exit a non-directory", async () => {
+		// `realpath` succeeds on a regular file, so the walk's `..` branch
+		// would `dirname` it to the file's parent; POSIX fails such a path
+		// with ENOTDIR. The directory guard restores that.
+		const isolated = await createTempVault({ "note.md": "# n\n" });
+		try {
+			await expectPathRejection(
+				() => validateVaultRoot(`${isolated.path}/note.md/..`),
+				"PATH_OUTSIDE_VAULT",
+				"VAULT_ROOT_INACCESSIBLE",
+			);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	test("validateVaultRoot('<symlink-to-file>/..') rejects instead of landing in the link target's parent", async () => {
+		// `realpath` follows the symlink to its file target; without the
+		// directory guard `dirname` would then walk to the target's parent —
+		// a directory unrelated to the path the operator supplied.
+		const isolated = await createTempVault({ "note.md": "# n\n" });
+		try {
+			await createSymlink(`${isolated.path}/note.md`, `${isolated.path}/link`);
+			await expectPathRejection(
+				() => validateVaultRoot(`${isolated.path}/link/..`),
+				"PATH_OUTSIDE_VAULT",
+				"VAULT_ROOT_INACCESSIBLE",
+			);
+		} finally {
+			await isolated.cleanup();
+		}
+	});
+
+	// Trailerless `\\?\C:` is a malformed root — the `\\?\` namespace requires
+	// the drive-root form `\\?\C:\`. Pre-fix `stripDeviceNamespacePrefix`
+	// rewrote it to bare `C:` (drive-relative → CWD); the separator-gated
+	// regex now leaves it untouched so it is rejected, not silently retargeted.
+	test.runIf(process.platform === "win32")(
+		"validateVaultRoot rejects a trailerless \\\\?\\C: device-namespace root (win32)",
+		async () => {
+			const drive = parse(process.cwd()).root.charAt(0);
+			await expectPathRejection(
+				() => validateVaultRoot(`\\\\?\\${drive}:`),
+				"PATH_OUTSIDE_VAULT",
+				"VAULT_ROOT_INACCESSIBLE",
+			);
+		},
+	);
+
+	// A Win32 drive-relative root (`C:src`) names a path under the CWD on that
+	// drive, not under the drive root. Pre-fix `walkVaultRoot` seeded `cur`
+	// with the bare `C:` root, so `join("C:","src")` jumped to `C:\src`; the
+	// fix resolves the drive-relative root before walking.
+	test.runIf(process.platform === "win32")(
+		"validateVaultRoot resolves a drive-relative root against the drive CWD (win32)",
+		async () => {
+			const drive = parse(process.cwd()).root.charAt(0);
+			const vaultRoot = await validateVaultRoot(`${drive}:src`);
+			expect(vaultRoot.absolute).toBe(await realpath(join(process.cwd(), "src")));
+		},
+	);
+
+	// `path.parse` truncates a verbatim-UNC root to `\\?\UNC\`, so the segment
+	// walk can't reconstruct the server\share root. Verbatim UNC vault roots
+	// are rejected with a pointer to the plain `\\server\share\` form (which
+	// parses correctly). Platform-agnostic — the guard is a pure string check.
+	test("validateVaultRoot rejects a verbatim-UNC vault root", async () => {
+		const payload = await expectPathRejection(
+			() => validateVaultRoot("\\\\?\\UNC\\server\\share\\vault"),
+			"PATH_OUTSIDE_VAULT",
+			"VAULT_ROOT_INACCESSIBLE",
+		);
+		expect(payload.message).toContain("Verbatim UNC");
+	});
+
+	// POSIX treats `\` as an ordinary filename character, so the segment walk
+	// must split a vault root on `/` alone here — splitting on `\` too would
+	// shatter a real directory named `a\b` into two non-existent segments and
+	// reject (or mis-target) a valid root. Win32-skipped: NTFS forbids `\` in
+	// a name, so the directory cannot be created there.
+	test.runIf(process.platform !== "win32")(
+		"validateVaultRoot accepts a POSIX vault root whose directory name contains a backslash",
+		async () => {
+			const isolated = await createTempVault({ "note.md": "# n\n" });
+			try {
+				const backslashDir = join(isolated.path, "a\\b");
+				await mkdir(backslashDir);
+				const vaultRoot = await validateVaultRoot(backslashDir);
+				expect(vaultRoot.absolute).toBe(await realpath(backslashDir));
+			} finally {
+				await isolated.cleanup();
+			}
+		},
+	);
+
+	// An empty root must be rejected, not seeded at ".": `walkVaultRoot` would
+	// otherwise return "." and the server would silently index the process
+	// CWD. `parseCli` already rejects an empty `--vault`, so this covers
+	// direct callers of the exported `validateVaultRoot`.
+	test("validateVaultRoot rejects an empty vault root instead of defaulting to CWD", async () => {
+		await expectPathRejection(() => validateVaultRoot(""), "PATH_OUTSIDE_VAULT", "VAULT_ROOT_INACCESSIBLE");
+	});
+});
+
+// Volume GUID paths name the volume device object without the trailing `\`
+// and the root directory WITH it (per MS docs: Naming Files, Paths, and
+// Namespaces). The regex consumer in `stripTrailingPathSep` only fires on
+// Win32, but the regex itself is a pure string check — testing here keeps
+// the assertion hermetic. Loss of regex coverage would silently drop the
+// trailer for any operator mounting an unlettered volume.
+describe("WIN_ROOT_NEEDING_SEP — Windows root forms requiring trailing separator", () => {
+	const GUID = "12345678-1234-1234-1234-123456789012";
+
+	test.each([
+		`C:`,
+		`Z:`,
+		`\\\\?\\C:`,
+		`\\\\.\\C:`,
+		`\\\\?\\Volume{${GUID}}`,
+		`\\\\.\\Volume{${GUID}}`,
+		`\\\\?\\UNC\\server\\share`,
+		`\\\\server\\share`,
+	])("matches %s (requires trailing separator)", (input) => {
+		expect(WIN_ROOT_NEEDING_SEP.test(input)).toBe(true);
+	});
+
+	test.each([
+		`C:\\note.md`, // not a root — has trailing content
+		`\\\\?\\C:\\note.md`,
+		`\\\\?\\Volume{${GUID}}\\note.md`,
+		`\\\\.\\Volume{${GUID}}\\note.md`,
+		`/usr/local`,
+		`a/b.md`,
+		``,
+	])("does not match %s (not a root needing restore)", (input) => {
+		expect(WIN_ROOT_NEEDING_SEP.test(input)).toBe(false);
 	});
 });
 
@@ -201,6 +457,46 @@ describe("classifyRelpathPolicy — sync subset of validatePath", () => {
 		{ input: "foo\u009Fbar.md", reason: "CONTROL_CHAR" }, // APC (C1)
 		{ input: "foo\u2028next: forged.md", reason: "CONTROL_CHAR" }, // LINE SEPARATOR
 		{ input: "foo\u2029bar.md", reason: "CONTROL_CHAR" }, // PARAGRAPH SEPARATOR
+		// COLON — NTFS alternate data streams. Bare ADS, ADS-with-extension,
+		// and colon in any subpath segment all reject.
+		{ input: "note.md:secret.md", reason: "COLON" },
+		{ input: "notes:stream", reason: "COLON" },
+		{ input: "folder/note.md:stream", reason: "COLON" },
+		// RESERVED_DEVICE_NAME — case-insensitive base-name match per MS docs:
+		// CON, PRN, AUX, NUL, COM1-9 (incl. 8859-1 superscripts ¹²³), LPT1-9
+		// (incl. ¹²³). COM0/LPT0 are NOT enumerated by MS, so we don't reject.
+		// The 8859-1 superscripts (U+00B9/B2/B3) are reserved but the Unicode
+		// superscript block (U+2070+) is NOT — the regex must distinguish.
+		{ input: "CON", reason: "RESERVED_DEVICE_NAME" },
+		{ input: "CON.md", reason: "RESERVED_DEVICE_NAME" },
+		{ input: "con.md", reason: "RESERVED_DEVICE_NAME" },
+		{ input: "PRN.txt", reason: "RESERVED_DEVICE_NAME" },
+		{ input: "AUX.md", reason: "RESERVED_DEVICE_NAME" },
+		{ input: "NUL", reason: "RESERVED_DEVICE_NAME" },
+		{ input: "COM9.md", reason: "RESERVED_DEVICE_NAME" },
+		{ input: "LPT1.md", reason: "RESERVED_DEVICE_NAME" },
+		{ input: "folder/CON.md", reason: "RESERVED_DEVICE_NAME" },
+		// 8859-1 superscripts ¹²³ — reserved per MS docs.
+		{ input: "COM\u00B9.md", reason: "RESERVED_DEVICE_NAME" }, // COM¹
+		{ input: "COM\u00B2.md", reason: "RESERVED_DEVICE_NAME" }, // COM²
+		{ input: "COM\u00B3.md", reason: "RESERVED_DEVICE_NAME" }, // COM³
+		{ input: "LPT\u00B9.md", reason: "RESERVED_DEVICE_NAME" }, // LPT¹
+		{ input: "LPT\u00B2.md", reason: "RESERVED_DEVICE_NAME" }, // LPT²
+		{ input: "LPT\u00B3.md", reason: "RESERVED_DEVICE_NAME" }, // LPT³
+		{ input: "CONFIGS.md", reason: null }, // CON prefix but boundary fails
+		{ input: "MYCON.md", reason: null }, // CON not at start
+		{ input: "COM10.md", reason: null }, // COM10 is not a reserved device
+		{ input: "COMA.md", reason: null }, // COM[…] needs a digit-class char
+		{ input: ".con.md", reason: null }, // leading dot — `.con` not reserved
+		{ input: "COM0.md", reason: null }, // COM0 NOT enumerated by MS docs
+		{ input: "LPT0.md", reason: null }, // LPT0 NOT enumerated by MS docs
+		{ input: "COM\u2074.md", reason: null }, // U+2074 Unicode-superscript-4 NOT 8859-1, NOT reserved
+		// TRAILING_DOT_OR_SPACE — NTFS strips these during normalization, so
+		// the path aliases another file the FS already exposes via `readdir`.
+		{ input: "notes.md.", reason: "TRAILING_DOT_OR_SPACE" },
+		{ input: "notes.md ", reason: "TRAILING_DOT_OR_SPACE" },
+		{ input: "folder/sub.", reason: "TRAILING_DOT_OR_SPACE" },
+		{ input: "folder./note.md", reason: "TRAILING_DOT_OR_SPACE" }, // mid-path segment
 	];
 
 	for (const { input, reason } of POLICY_CASES) {
@@ -228,6 +524,42 @@ describe("classifyRelpathPolicy — sync subset of validatePath", () => {
 			if (reason === null) continue;
 			await expectPathRejection(() => validatePath(input, root), "PATH_OUTSIDE_VAULT", reason);
 		}
+	});
+
+	test.runIf(process.platform === "win32")(
+		"Win32: drive-prefixed absolute path returns ABSOLUTE_PATH (isAbsolute precedes COLON)",
+		() => {
+			// `node:path.isAbsolute` is platform-aware: on Win32 it accepts
+			// drive-prefixed paths. Returning ABSOLUTE_PATH directs agents
+			// at the actionable fix ("pass a vault-relative path") instead
+			// of misrouting to the COLON branch's ADS-fix messaging.
+			expect(classifyRelpathPolicy("C:/vault/note.md")).toBe("ABSOLUTE_PATH");
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"POSIX: Windows-syntax drive-prefixed path still returns COLON (isAbsolute is false on POSIX)",
+		() => {
+			// `node:path.isAbsolute("C:/...")` returns false on POSIX, so
+			// the COLON guard catches it — acceptable since a POSIX user
+			// typing `C:/...` is in a misconfigured environment regardless.
+			expect(classifyRelpathPolicy("C:/vault/note.md")).toBe("COLON");
+		},
+	);
+
+	test("RESERVED_DEVICE_NAME message advertises COM1-9 / LPT1-9, matching the regex", async () => {
+		// Policy at validatePath.ts:82 admits COM0.md / LPT0.md by design
+		// (MS doesn't enumerate them); the user-facing hint must agree
+		// so an agent's self-correction probe doesn't contradict policy.
+		const payload = await expectPathRejection(
+			() => validatePath("CON.md", root),
+			"PATH_OUTSIDE_VAULT",
+			"RESERVED_DEVICE_NAME",
+		);
+		expect(payload.message).toContain("COM1-9");
+		expect(payload.message).toContain("LPT1-9");
+		expect(payload.message).not.toContain("COM0-9");
+		expect(payload.message).not.toContain("LPT0-9");
 	});
 });
 
@@ -267,11 +599,48 @@ describe("openNoFollow — closes validation→open TOCTOU window", () => {
 			const safe = await validatePath("victim.md", isolatedRoot);
 			await unlink(safe.absolute);
 			await symlink(`${isolated.path}/target.md`, safe.absolute);
-			await expect(openNoFollow(safe.absolute)).rejects.toMatchObject({ code: "ELOOP" });
+			const err = await openNoFollow(safe.absolute).catch((e) => e);
+			// POSIX: `O_NOFOLLOW` rejects the open with errno ELOOP.
+			// Windows: libuv strips `O_NOFOLLOW`, so the pre-open lstat in
+			// `openNoFollow` catches the symlink and throws
+			// `PathValidationError(reason: SYMLINK_SEGMENT)`. Either shape
+			// satisfies the underlying invariant — the swap is refused.
+			if (err instanceof PathValidationError) {
+				expect(err.payload.code).toBe("PATH_OUTSIDE_VAULT");
+				expect(err.payload.reason).toBe("SYMLINK_SEGMENT");
+			} else {
+				expect(err).toMatchObject({ code: "ELOOP" });
+			}
 		} finally {
 			await isolated.cleanup();
 		}
 	});
+
+	// Win32 regression: the win32 leaf check keys on symlink-ness, not inode
+	// identity — an atomic save (write-temp + rename) gives the file a new
+	// inode, and an inode compare would reject that benign in-vault file as
+	// a swap. `openNoFollow` must still open it.
+	test.runIf(process.platform === "win32")(
+		"openNoFollow accepts a file replaced by an atomic save (win32)",
+		async () => {
+			const isolated = await createTempVault({ "note.md": "# v1\n" });
+			try {
+				const isolatedRoot = await validateVaultRoot(isolated.path);
+				const safe = await validatePath("note.md", isolatedRoot);
+				const tmp = `${isolated.path}/note.md.tmp`;
+				await writeFile(tmp, "# v2\n");
+				await rename(tmp, safe.absolute); // atomic save → new inode
+				const fh = await openNoFollow(safe.absolute);
+				try {
+					expect((await fh.stat()).isFile()).toBe(true);
+				} finally {
+					await fh.close();
+				}
+			} finally {
+				await isolated.cleanup();
+			}
+		},
+	);
 });
 
 describe("validatePath — edge cases", () => {

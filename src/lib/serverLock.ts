@@ -27,18 +27,35 @@
  * post-wx write). Cold path is 2 syscalls (`open` + `readdir`).
  */
 
-import { constants as fsConstants, type Stats } from "node:fs";
+import { type BigIntStats, constants as fsConstants, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { lstat, open, readdir, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { getErrnoCode } from "./error.js";
+import { getErrnoCode, isVanishedErrno } from "./error.js";
 import { DEFAULT_EXTENSIONS, getVaultExtensions } from "./vaultExtensions.js";
 
 /** Backoff before retrying an unparseable foreign-slot read; absorbs the wx-write race. */
 const UNPARSEABLE_RETRY_DELAY_MS = 25;
+
+/**
+ * Maximum rotation retries — gates two consumers that both absorb a
+ * peer's `acquireOwnSlot` rm→wx rotation on AV/SMB-latent storage:
+ *   - `readAndParseWithRetry`'s dev/ino mismatch budget. A single
+ *     25 ms retry collapses to `"absent"` when the peer's rm-then-wx
+ *     is slower than that, and silent skip lets an opposite-policy
+ *     peer share the WAL → corruption.
+ *   - `inspectForeignSlot`'s post-read freshProbe absent loop. The
+ *     same under-budget hazard applies for the same storage class;
+ *     reusing this constant keeps the rotation-window guarantee in
+ *     one place.
+ * Four rotation attempts × 25 ms = 100 ms total budget. The content-
+ * unparseable budget (1 retry) stays separate so genuine corruption
+ * isn't masked.
+ */
+const MAX_MISMATCH_RETRIES = 4;
 
 /**
  * Bounded foreign-slot read. Legitimate lockfiles are ~30–80 bytes
@@ -185,11 +202,23 @@ const LOCK_NAME_RE = /^server-(\d+)\.lock$/;
 /** Legacy single-file lockfile path; cleaned up at startup. */
 export const LEGACY_LOCK_FILE_NAME = "server.lock";
 
-/** POSIX `pid_t` is signed int32; above this `process.kill` throws `ERR_OUT_OF_RANGE`. */
+/** POSIX `pid_t` is signed int32; above this Node's `process.kill` rejects. */
 const POSIX_PID_MAX = 0x7fff_ffff;
+/** Win32 PIDs are `DWORD` (unsigned int32); values above this can't exist. */
+const WIN32_PID_MAX = 0xffff_ffff;
 
-function isValidPosixPid(n: number): boolean {
-	return Number.isInteger(n) && n > 0 && n <= POSIX_PID_MAX;
+/**
+ * Filename + body-parse gate for foreign lockfiles. Win32 accepts the
+ * full `DWORD` range (legitimate high PIDs still flow through
+ * `inspectForeignSlot`'s fail-closed PID-probe path); values above
+ * {@link WIN32_PID_MAX} can't be real PIDs so a planted bogus filename
+ * reads as "no peer" instead of blocking startup. POSIX caps at
+ * {@link POSIX_PID_MAX} (round-42's silent-skip for impossible PIDs).
+ */
+function isAcceptableLockSlotPid(n: number): boolean {
+	if (!Number.isInteger(n) || n <= 0) return false;
+	if (process.platform === "win32") return n <= WIN32_PID_MAX;
+	return n <= POSIX_PID_MAX;
 }
 
 export function lockFileNameForPid(pid: number): string {
@@ -223,7 +252,7 @@ function parseLockFile(text: string): LockFileRecord | null {
 		if (typeof obj.includeHidden !== "boolean") return null;
 		const record: LockFileRecord = { includeHidden: obj.includeHidden };
 		if (typeof obj.hostname === "string") record.hostname = obj.hostname;
-		if (typeof obj.pid === "number" && isValidPosixPid(obj.pid)) {
+		if (typeof obj.pid === "number" && isAcceptableLockSlotPid(obj.pid)) {
 			record.pid = obj.pid;
 		}
 		if (Array.isArray(obj.vaultExtensions) && obj.vaultExtensions.every((s) => typeof s === "string")) {
@@ -303,9 +332,39 @@ function logTiebreakerWin(otherPath: string, otherPid: number, conflictAttr: str
 	);
 }
 
+/**
+ * Unparseable foreign content with a known PID: a live PID is either a
+ * live local peer or a PID-collision foreign peer; both warrant refusal.
+ * Dead PIDs on shared mounts can't be safely distinguished from a live
+ * foreign-host owner with the same numeric PID, so preserve the slot for
+ * operator inspection.
+ */
+function escalateUnparseableForeign(otherPath: string, otherPid: number, contextSuffix: string = ""): void {
+	if (isProcessAlive(otherPid)) {
+		throw new ServerLockUnknownPeerError(otherPid, otherPath);
+	}
+	console.error(
+		`markdown-mcp serverLock: unparseable foreign slot at ${otherPath} (PID ${otherPid})${contextSuffix} ${ESRCH_PRESERVE_SUFFIX}`,
+	);
+}
+
+/**
+ * Cross-host lockfiles share a single log shape: PIDs can't cross hosts,
+ * so liveness is un-probeable; we don't unlink (might be a live foreign
+ * owner) and don't escalate (might collide with an unrelated local PID).
+ * `contextSuffix` distinguishes the rotation case ("vanished during
+ * rotation") from the stable-file case.
+ */
+function logForeignHostLeftInPlace(otherPath: string, foreignHostname: string, contextSuffix: string = ""): void {
+	console.error(
+		`markdown-mcp serverLock: foreign-host lockfile at ${otherPath} (hostname=${foreignHostname})${contextSuffix}; ` +
+			`cross-host mounts are not supported, leaving in place.`,
+	);
+}
+
 type EntryKind = "symlink" | "directory" | "fifo" | "block-device" | "char-device" | "socket" | "non-regular";
 
-function kindOf(st: Stats): EntryKind {
+function kindOf(st: Stats | BigIntStats): EntryKind {
 	if (st.isSymbolicLink()) return "symlink";
 	if (st.isDirectory()) return "directory";
 	if (st.isFIFO()) return "fifo";
@@ -422,7 +481,22 @@ async function acquireOwnSlot(ourPath: string, payload: string): Promise<void> {
 		}
 		// Same-host or legacy no-hostname is a prior-us remnant —
 		// `isProcessAlive(process.pid)` is false by the line-161 invariant.
-		await rm(ourPath, { force: true });
+		try {
+			await rm(ourPath, { force: true });
+		} catch (err) {
+			// Hostile swap may have landed between repostProbe and rm: `rm`
+			// without `recursive: true` rejects a directory with EISDIR
+			// (Node-docs behavior). Re-route through the same defense the
+			// upstream probes use so the race surfaces as a typed domain
+			// error instead of a raw fs SystemError. Windows is more
+			// timing-prone here than POSIX (coarser timer resolution +
+			// slower mkdir), but the race is platform-agnostic.
+			const recheck = await statEntry(ourPath);
+			if (recheck.kind === "non-regular") {
+				throw new ServerLockFileNotRegularError(ourPath, kindOf(recheck.stats));
+			}
+			if (recheck.kind !== "absent") throw err;
+		}
 	}
 	// kind === "absent" reached only if something unlinked our slot
 	// between our EEXIST and our lstat — race-tolerant retry.
@@ -457,7 +531,7 @@ async function reconcileIndexDir(
 		const otherPath = join(indexDir, name);
 		if (otherPath === ourPath) continue;
 		const otherPid = Number.parseInt(m[1] ?? "0", 10);
-		if (!isValidPosixPid(otherPid)) continue;
+		if (!isAcceptableLockSlotPid(otherPid)) continue;
 		await inspectForeignSlot(otherPath, otherPid, ourPolicy, ourExts, ourMtimeMs);
 	}
 }
@@ -533,26 +607,92 @@ async function inspectForeignSlot(
 		);
 		return;
 	}
-	const otherMtimeMs = probe.stats.mtimeMs;
-
 	// Read the lockfile BEFORE probing PID liveness. PIDs are per-host on
 	// POSIX, so a foreign-host server's PID is rarely alive locally; an
 	// ESRCH-then-unlink ordered before the hostname read would clobber
 	// foreign-host slots whenever their PIDs aren't in use locally — the
 	// common case for cross-host mounts.
-	const otherRecord = await readForeignRecord(otherPath, otherPid);
+	let otherRecord = await readForeignRecord(otherPath, otherPid);
 	if (otherRecord === "absent") return;
 	if (otherRecord === "unparseable") {
-		// Alive-PID is a live local peer OR a PID-collision foreign peer
-		// — both warrant refusal.
-		if (!isProcessAlive(otherPid)) {
+		escalateUnparseableForeign(otherPath, otherPid);
+		return;
+	}
+
+	// Re-stat so the tiebreaker uses the mtime of the file `readForeignRecord`
+	// actually parsed: its retry chain can survive a peer's rm+wx rotation
+	// and return the rotated successor, so the initial `probe` may reflect
+	// the predecessor. Comparing our wx-write against the stale mtime would
+	// let a younger peer wrongly force us out.
+	let freshProbe = await statEntry(otherPath);
+	if (freshProbe.kind === "absent") {
+		// Round-32's "hostname check precedes PID-liveness" rule: foreign-host
+		// PIDs are normally ESRCH locally on shared NFS/SMB mounts, so the
+		// dead-PID fast-path below would silently absorb the foreign-host
+		// rotation case and lose the operator log emitted by the post-reread
+		// cross-host branch. `readForeignRecord` already gave us a parsed
+		// record whose hostname we can consult.
+		const earlyForeignHostname = foreignHostnameOf(otherRecord);
+		if (earlyForeignHostname !== null) {
+			logForeignHostLeftInPlace(otherPath, earlyForeignHostname, " vanished during rotation");
+			return;
+		}
+		// Same-host (or legacy no-hostname): dead PID can't be mid-rotation;
+		// skip the 100 ms wait. The exhaustion path below reaches the same
+		// outcome via `escalateUnparseableForeign`'s alive/dead dispatch.
+		if (!isProcessAlive(otherPid)) return;
+		// Otherwise a PID-recycling peer's `acquireOwnSlot` rm→wx may be
+		// mid-rotation. Reuse the rotation budget (see {@link MAX_MISMATCH_RETRIES}).
+		for (let i = 0; i < MAX_MISMATCH_RETRIES; i++) {
+			await sleep(UNPARSEABLE_RETRY_DELAY_MS);
+			freshProbe = await statEntry(otherPath);
+			if (freshProbe.kind !== "absent") break;
+		}
+		if (freshProbe.kind === "absent") {
+			// Persistent absent + budget exhausted: predecessor either
+			// finished exiting (PID now dead) OR a slow-rotation owner
+			// exists at the recycled PID (alive). Fail closed via the alive/
+			// dead dispatch — silent return would let an opposite-policy
+			// peer share the WAL once its wx finally completes.
+			escalateUnparseableForeign(otherPath, otherPid, " after persistent absent reprobes");
+			return;
+		}
+		if (freshProbe.kind === "non-regular") {
 			console.error(
-				`markdown-mcp serverLock: unparseable foreign slot at ${otherPath} (PID ${otherPid}) ${ESRCH_PRESERVE_SUFFIX}`,
+				`markdown-mcp serverLock: foreign slot at ${otherPath} (PID ${otherPid}) became ${kindOf(freshProbe.stats)} after rotation; skipping.`,
 			);
 			return;
 		}
+		const reread = await readForeignRecord(otherPath, otherPid);
+		if (reread === "absent") return;
+		if (reread === "unparseable") {
+			escalateUnparseableForeign(otherPath, otherPid, " after rotation");
+			return;
+		}
+		otherRecord = reread;
+		// `readAndParseWithRetry` can sleep across a second rotation while
+		// completing the reread, leaving `freshProbe.stats` stale relative
+		// to the file we parsed. Refresh so the tiebreaker compares against
+		// the parsed record's actual mtime.
+		freshProbe = await statEntry(otherPath);
+	}
+	if (freshProbe.kind === "absent") {
+		// Parsed peer + no fresh mtime → can't tiebreak; fail closed instead
+		// of silent return (would let opposite-policy peer share the WAL).
+		escalateUnparseableForeign(otherPath, otherPid, " after reread freshProbe vanished");
+		return;
+	}
+	if (freshProbe.kind === "non-regular") {
+		// Post-parse TOCTOU swap loses the parsed policy/extension signal;
+		// silent return would let an opposite-policy peer share the WAL.
+		// Round-43 precedent (`acquireOwnSlot` re-stat-before-rm).
+		console.error(
+			`markdown-mcp serverLock: foreign slot at ${otherPath} (PID ${otherPid}) swapped to ${kindOf(freshProbe.stats)} ` +
+				`after successful parse; refusing to coexist.`,
+		);
 		throw new ServerLockUnknownPeerError(otherPid, otherPath);
 	}
+	const otherMtimeMs = freshProbe.stats.mtimeMs;
 
 	// Cross-host mounts aren't supported (SQLite WAL is already
 	// single-host); `process.kill(pid, 0)` can't validate a foreign-host
@@ -561,10 +701,7 @@ async function inspectForeignSlot(
 	// unrelated local PID). Operators see the log line.
 	const foreignHostname = foreignHostnameOf(otherRecord);
 	if (foreignHostname !== null) {
-		console.error(
-			`markdown-mcp serverLock: foreign-host lockfile at ${otherPath} (hostname=${foreignHostname}); ` +
-				`cross-host mounts are not supported, leaving in place.`,
-		);
+		logForeignHostLeftInPlace(otherPath, foreignHostname);
 		return;
 	}
 
@@ -606,26 +743,47 @@ async function inspectForeignSlot(
  * the backoff routes through `"absent"` (skip slot, don't `rm` —
  * `"unparseable"` + dead-PID would destroy a deliberate operator-placed
  * pointer). The initial open is hardened separately in `readAndParse`.
+ *
+ * Two independent retry budgets — neither steals slots from the other:
+ *   - Content-unparseable (wx visibility race): 1 retry / 2 reads max.
+ *     Genuine content corruption shouldn't be masked further.
+ *   - Dev/ino mismatch: up to {@link MAX_MISMATCH_RETRIES} retries (1
+ *     initial + 4 retries = 5 reads max). Slow AV/SMB rm+wx peer
+ *     rotation can exceed a single 25 ms window.
+ *
+ * Worst-case combined budget: 1 unparseable + 5 mismatch = 6 reads /
+ * 5 sleeps / 125 ms. Bounded.
+ *
+ * Once a mismatch has been observed, a subsequent absent reprobe is
+ * treated as rotation-in-progress (returns `"unparseable"`) so
+ * `inspectForeignSlot` escalates via the live-peer path.
  */
 async function readAndParseWithRetry(
 	path: string,
 	contextLog: string,
 ): Promise<LockFileRecord | "absent" | "unparseable"> {
-	const first = await readAndParse(path);
-	if (first !== "unparseable") return first;
-	console.error(
-		`markdown-mcp serverLock: unparseable ${contextLog} at ${path}; retrying after ${UNPARSEABLE_RETRY_DELAY_MS} ms.`,
-	);
-	await sleep(UNPARSEABLE_RETRY_DELAY_MS);
-	const reprobe = await statEntry(path);
-	if (reprobe.kind === "absent") return "absent";
-	if (reprobe.kind === "non-regular") {
+	let mismatchSeen = 0;
+	let unparseableSeen = 0;
+	for (;;) {
+		const result = await readAndParse(path);
+		if (result === "absent") return mismatchSeen > 0 ? "unparseable" : "absent";
+		if (result !== "unparseable" && result !== "unparseable_mismatch") return result;
+		if (result === "unparseable_mismatch") mismatchSeen += 1;
+		else unparseableSeen += 1;
+		if (mismatchSeen > MAX_MISMATCH_RETRIES || unparseableSeen > 1) return "unparseable";
 		console.error(
-			`markdown-mcp serverLock: ${contextLog} at ${path} became ${kindOf(reprobe.stats)} during retry; skipping.`,
+			`markdown-mcp serverLock: ${result} ${contextLog} at ${path}; retrying after ${UNPARSEABLE_RETRY_DELAY_MS} ms.`,
 		);
-		return "absent";
+		await sleep(UNPARSEABLE_RETRY_DELAY_MS);
+		const reprobe = await statEntry(path);
+		if (reprobe.kind === "absent") return mismatchSeen > 0 ? "unparseable" : "absent";
+		if (reprobe.kind === "non-regular") {
+			console.error(
+				`markdown-mcp serverLock: ${contextLog} at ${path} became ${kindOf(reprobe.stats)} during retry; skipping.`,
+			);
+			return "absent";
+		}
 	}
-	return readAndParse(path);
 }
 
 async function readForeignRecord(
@@ -643,7 +801,21 @@ async function readForeignRecord(
  * can't be exercised through the public API.
  */
 export async function readAndParseForTesting(otherPath: string): Promise<LockFileRecord | "absent" | "unparseable"> {
-	return readAndParse(otherPath);
+	const result = await readAndParse(otherPath);
+	return result === "unparseable_mismatch" ? "unparseable" : result;
+}
+
+/**
+ * @internal Test-only re-export of {@link readAndParseWithRetry}. The
+ * mismatch-fail-closed contract lives in this retry orchestrator and
+ * can't be exercised through the public API without spinning up a full
+ * foreign-slot scenario.
+ */
+export async function readAndParseWithRetryForTesting(
+	otherPath: string,
+	contextLog: string,
+): Promise<LockFileRecord | "absent" | "unparseable"> {
+	return readAndParseWithRetry(otherPath, contextLog);
 }
 
 /**
@@ -656,25 +828,128 @@ export async function readAndParseForTesting(otherPath: string): Promise<LockFil
  * reprobe non-regular branch. Post-open `fstat` catches the FIFO-with-
  * writer case where `O_NONBLOCK` returns a usable handle delivering
  * writer-controlled bytes.
+ *
+ * Windows: pre-open `lstat` + post-open dev/ino compare substitutes for
+ * the stripped `O_NOFOLLOW` (see `openNoFollow` for the symmetric defense).
+ * A dev/ino mismatch (peer's rm+wx during the open window) returns the
+ * internal `"unparseable_mismatch"` sentinel so {@link readAndParseWithRetry}
+ * can apply a longer retry budget AND fail closed if the path subsequently
+ * vanishes during rotation — silent skip would let an opposite-policy peer
+ * share the SQLite WAL. A post-open `lstat` then mirrors
+ * `openNoFollow`'s `!leafStat.isSymbolicLink()` + dev/ino-match check —
+ * closes the rename-then-symlink-back-to-same-inode contract gap (dev/ino
+ * vs preLstat alone misses it because the symlink target IS the original
+ * inode, so `handle.stat()` matches preLstat despite the path being a
+ * symlink).
  */
-async function readAndParse(otherPath: string): Promise<LockFileRecord | "absent" | "unparseable"> {
+async function readAndParse(
+	otherPath: string,
+): Promise<LockFileRecord | "absent" | "unparseable" | "unparseable_mismatch"> {
+	// `bigint: true` so the dev/ino compare keeps full 64-bit precision —
+	// see `openNoFollow` in `validatePath.ts` for the rationale.
+	let preLstat: BigIntStats | null = null;
+	if (process.platform === "win32") {
+		try {
+			preLstat = await lstat(otherPath, { bigint: true });
+		} catch (err) {
+			const code = getErrnoCode(err);
+			if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+			throw err;
+		}
+		// Windows `fs.open(O_RDONLY)` fails before returning a handle for ANY
+		// non-regular target (symlink → EACCES/ELOOP, directory → EISDIR,
+		// FIFO/device → varying errno); the post-open `handle.stat()` skip
+		// path below never runs. Catch all non-regular kinds here so the
+		// foreign slot is skipped gracefully (mirrors POSIX behavior where
+		// `open` on a directory succeeds and `handle.stat().isFile()` rejects).
+		if (!preLstat.isFile()) {
+			console.error(
+				`markdown-mcp serverLock: foreign slot at ${otherPath} non-regular at open (lstat: ${kindOf(preLstat)}); skipping.`,
+			);
+			return "absent";
+		}
+	}
 	let handle: FileHandle | null = null;
 	try {
 		handle = await open(otherPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
 	} catch (err) {
 		const code = getErrnoCode(err);
-		if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+		if (code === "ENOENT" || code === "ENOTDIR") {
+			// preLstat saw the file → vanish is peer rotation, not absence.
+			// Trigger dev/ino retry instead of silent "absent" (would let
+			// opposite-policy peer share the WAL when wx lands).
+			if (preLstat !== null) {
+				console.error(
+					`markdown-mcp serverLock: foreign slot at ${otherPath} vanished between preLstat and open (${code}); treating as unparseable_mismatch to trigger retry.`,
+				);
+				return "unparseable_mismatch";
+			}
+			return "absent";
+		}
+		// ELOOP (symlink at leaf, blocked by O_NOFOLLOW) and ENXIO (FIFO with
+		// no writer, surfaced by O_NONBLOCK) cannot come from a regular file.
 		if (code === "ELOOP" || code === "ENXIO") {
 			console.error(`markdown-mcp serverLock: foreign slot at ${otherPath} non-regular at open (${code}); skipping.`);
 			return "absent";
 		}
+		// EISDIR/EACCES are ambiguous on Win32 (libuv junction/dir-symlink
+		// quirk vs ACL deny / share-lock on a regular file). Post-error
+		// lstat fails closed when inconclusive.
+		if (code === "EISDIR" || code === "EACCES") {
+			let postStat: Stats;
+			try {
+				postStat = await lstat(otherPath);
+			} catch (lstatErr) {
+				if (isVanishedErrno(lstatErr)) {
+					return "absent";
+				}
+				throw err;
+			}
+			if (!postStat.isFile()) {
+				console.error(`markdown-mcp serverLock: foreign slot at ${otherPath} non-regular at open (${code}); skipping.`);
+				return "absent";
+			}
+		}
 		throw err;
 	}
 	try {
-		const st = await handle.stat();
+		const st = await handle.stat({ bigint: true });
 		if (!st.isFile()) {
 			console.error(`markdown-mcp serverLock: foreign slot at ${otherPath} not a regular file post-open; skipping.`);
 			return "absent";
+		}
+		if (preLstat !== null && (st.ino !== preLstat.ino || st.dev !== preLstat.dev)) {
+			// File got recreated between preLstat and open() — most commonly
+			// a peer's `acquireOwnSlot` rm+wx after PID reuse.
+			// Returning "absent" would silently miss the new owner's lockfile
+			// and let an opposite-policy peer share the WAL. The dedicated
+			// `unparseable_mismatch` sentinel triggers the longer retry budget
+			// in `readAndParseWithRetry` AND forces an absent reprobe to
+			// escalate (rotation-in-progress, not a genuine vanish).
+			console.error(
+				`markdown-mcp serverLock: foreign slot at ${otherPath} swapped during open (dev/ino mismatch); treating as unparseable_mismatch to trigger retry.`,
+			);
+			return "unparseable_mismatch";
+		}
+		// POSIX exempt: kernel-honored O_NOFOLLOW surfaces ELOOP at the
+		// open, so the path-stability gap (see function doc) only exists
+		// on Win32 where libuv strips the flag.
+		if (process.platform === "win32") {
+			let postLstat: BigIntStats;
+			try {
+				postLstat = await lstat(otherPath, { bigint: true });
+			} catch (err) {
+				if (isVanishedErrno(err)) return "unparseable_mismatch";
+				throw err;
+			}
+			if (st.ino !== postLstat.ino || st.dev !== postLstat.dev || !postLstat.isFile()) {
+				console.error(
+					`markdown-mcp serverLock: foreign slot at ${otherPath} unstable post-open ` +
+						`(kind=${kindOf(postLstat)}, handle ${st.ino}/${st.dev} vs path ${postLstat.ino}/${postLstat.dev}); ` +
+						`treating as unparseable_mismatch.`,
+				);
+				return "unparseable_mismatch";
+			}
 		}
 		const buf = Buffer.alloc(MAX_LOCKFILE_BYTES + 1);
 		const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
