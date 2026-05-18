@@ -599,6 +599,7 @@ export interface ServerIdentity {
 	version: string;
 	mcp_protocol_version: string;
 	started_at: string;
+	prose_only: boolean;
 }
 
 export interface VaultIdentity {

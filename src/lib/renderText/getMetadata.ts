@@ -23,26 +23,47 @@ const TRAILING_NEWLINE_RE = /\n$/;
 // base — doesn't escape any of the three. Many chat/terminal UIs render
 // them as line breaks; a frontmatter value `title: "x<U+2028>next:
 // forged"` would otherwise forge a dedicated `next:` line in
-// `content[0].text`. The path-side `sanitizePathForProse` already
-// covers this class via `CONTROL_CHAR_CLASS_PROSE`; metadata was the
-// last gap. Replace with a single space rather than a `\xHH` / `\uHHHH`
-// literal: yaml's plain-vs-quoted style is content-dependent, so a
-// backslash escape that's safe in plain (literal text) becomes ACTIVE
-// in double-quoted (`\x85` is the YAML 1.2 escape for U+0085, round-
-// tripping back to the hostile char). The structured channel preserves
-// verbatim values — lossiness lives in the prose channel by design.
+// `content[0].text`. A `\xHH` / `\uHHHH` escape would be ACTIVE in
+// double-quoted scalars (`\x85` IS the YAML 1.2 escape for U+0085 —
+// round-trips back to the hostile char). Angle-bracket markers carry
+// no YAML semantics in any style, are reversible by pattern match, and
+// preserve distinct codepoints so `key<U+0085>A` and `key<U+2028>A`
+// stay separate keys (load-bearing under `--prose-only`, where the
+// structured channel is dropped and the strip-walker's
+// `out[safeYamlString(k)] = …` would overwrite collided keys).
+//
+// Injectivity: a literal `<U+…>` substring in the input must not
+// collide with the substituted marker for the corresponding codepoint.
+// Pre-escape `<U+` → `\<U+` (`\<` is YAML-inert in both plain and
+// double-quoted styles, so it survives `yaml.stringify` verbatim).
+// Decoders reverse the two passes IN ORDER: strip the `\` escape
+// FIRST, then map remaining `<U+HHHH>` back to codepoints.
 //
 // Split test vs. replace forms mirror `sanitizePathForProse` — a `/g`
 // regex's `lastIndex` is stateful across `.test()` calls, so reusing
 // one form for both would let a later `test` start scanning past a
-// leading hostile char and miss it. Test form first to skip the
-// allocation on the common no-hostile-char path.
-const YAML_LINE_BREAK_TEST_RE = /[\u0085\u2028\u2029]/;
-const YAML_LINE_BREAK_REPLACE_RE = /[\u0085\u2028\u2029]/g;
+// leading hostile char and miss it.
+const YAML_LINE_BREAK_CHARS = ["\u0085", "\u2028", "\u2029"] as const;
+const YAML_LINE_BREAK_CLASS = YAML_LINE_BREAK_CHARS.join("");
+const YAML_LINE_BREAK_TEST_RE = new RegExp(`[${YAML_LINE_BREAK_CLASS}]`);
+const YAML_LINE_BREAK_REPLACE_RE = new RegExp(`[${YAML_LINE_BREAK_CLASS}]`, "g");
+const YAML_MARKER_PREFIX = "<U+";
+const YAML_MARKER_PREFIX_ESCAPE = `\\${YAML_MARKER_PREFIX}`;
+const YAML_LINE_BREAK_MARKERS: Record<string, string> = Object.fromEntries(
+	YAML_LINE_BREAK_CHARS.map((c) => [
+		c,
+		`${YAML_MARKER_PREFIX}${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}>`,
+	]),
+);
 
 function safeYamlString(s: string): string {
-	if (!YAML_LINE_BREAK_TEST_RE.test(s)) return s;
-	return s.replace(YAML_LINE_BREAK_REPLACE_RE, " ");
+	const hasMarker = s.includes(YAML_MARKER_PREFIX);
+	const hasHostile = YAML_LINE_BREAK_TEST_RE.test(s);
+	if (!hasMarker && !hasHostile) return s;
+	let out = s;
+	if (hasMarker) out = out.replaceAll(YAML_MARKER_PREFIX, YAML_MARKER_PREFIX_ESCAPE);
+	if (hasHostile) out = out.replace(YAML_LINE_BREAK_REPLACE_RE, (c) => YAML_LINE_BREAK_MARKERS[c] ?? c);
+	return out;
 }
 
 function stripYamlHostileChars(v: unknown): unknown {

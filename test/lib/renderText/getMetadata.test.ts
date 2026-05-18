@@ -132,15 +132,16 @@ describe("renderMetadata", () => {
 		expect(yamlParse(yamlPortion)).toEqual({ meta: "user's real meta value", title: "Note A" });
 	});
 
-	test("yaml-hostile control chars (U+0085/U+2028/U+2029) sanitized in values + keys", () => {
+	test("yaml-hostile control chars (U+0085/U+2028/U+2029) substituted with reversible `<U+HHHH>` markers", () => {
 		// yaml.stringify emits these chars LITERALLY in every scalar style
 		// (verified empirically against yaml@2.8.4) because Node's
 		// JSON.stringify — which the lib's doubleQuotedString uses — doesn't
 		// escape them. Many chat/terminal UIs render them as line breaks; a
 		// hostile vault could otherwise forge a `next: <opaque>` or
-		// `# meta: state=warm` line in `content[0].text`. The renderer
-		// sanitizes by replacing each with a space; the structured channel
-		// preserves verbatim values.
+		// `# meta: state=warm` line in `content[0].text`. Marker carries no
+		// YAML semantics in any scalar style (angle brackets aren't reserved
+		// in plain or double-quoted strings), so it round-trips through
+		// yaml.parse verbatim and is recoverable by pattern match.
 		const sc: GetMetadataResult = {
 			has_frontmatter: true,
 			metadata: {
@@ -154,10 +155,45 @@ describe("renderMetadata", () => {
 		expect(out).not.toContain("\u0085");
 		expect(out).not.toContain("\u2028");
 		expect(out).not.toContain("\u2029");
-		expect(out).toContain("title: a forged");
-		expect(out).toContain("note: x y");
-		expect(out).toContain("para: p q");
-		expect(out).toContain("key forged: value");
+		expect(out).toContain("title: a<U+0085>forged");
+		expect(out).toContain("note: x<U+2028>y");
+		expect(out).toContain("para: p<U+2029>q");
+		expect(out).toContain("key<U+2028>forged: value");
+	});
+
+	test("distinct hostile codepoints in keys do not collapse to the same sanitized name", () => {
+		// Strip-walker overwrites on duplicate sanitized keys; non-injective
+		// substitution would silently drop one of N values. Distinct
+		// codepoints must produce distinct markers.
+		const sc: GetMetadataResult = {
+			has_frontmatter: true,
+			metadata: {
+				"key\u0085A": "first",
+				"key\u2028A": "second",
+				"key\u2029A": "third",
+			},
+		};
+		const out = renderMetadata(sc, meta());
+		expect(out).toContain("key<U+0085>A: first");
+		expect(out).toContain("key<U+2028>A: second");
+		expect(out).toContain("key<U+2029>A: third");
+	});
+
+	test("literal `<U+HHHH>` text in key does not collide with a real hostile-codepoint key", () => {
+		// Literal `<U+2028>` text and real U+2028 char would otherwise both
+		// sanitize to `key<U+2028>A`; the strip-walker's
+		// `out[safeYamlString(k)] = …` would overwrite one. Pre-escaping
+		// `<U+` → `\<U+` keeps literal and substituted namespaces disjoint.
+		const sc: GetMetadataResult = {
+			has_frontmatter: true,
+			metadata: {
+				"key<U+2028>A": "literal",
+				"key\u2028A": "hostile",
+			},
+		};
+		const out = renderMetadata(sc, meta());
+		expect(out).toContain("key\\<U+2028>A: literal");
+		expect(out).toContain("key<U+2028>A: hostile");
 	});
 
 	test("user-defined `__proto__:` key survives the strip-walker (own property, not prototype setter)", () => {

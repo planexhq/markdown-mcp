@@ -31,6 +31,7 @@ import { type IndexOutcome, reindexOne, type ScanResult, scanVault } from "./lib
 import { closeSqlite, detectPreW4Schema, openSqliteWithRecovery } from "./lib/index/sqlite.js";
 import type { InflightTracker } from "./lib/inflightTracker.js";
 import { type MerkleTickHandle, startMerkleTick } from "./lib/merkle.js";
+import { setProseOnly } from "./lib/proseOnly.js";
 import { acquireServerLock, ServerLockError, type ServerLockHandle } from "./lib/serverLock.js";
 import { chooseStartupState, computePolicyMismatch } from "./lib/startup.js";
 import {
@@ -49,6 +50,7 @@ interface CliArgs {
 	vault: string;
 	polling: boolean;
 	includeHidden: boolean;
+	proseOnly: boolean;
 }
 
 function parseCli(argv: string[]): CliArgs {
@@ -58,6 +60,7 @@ function parseCli(argv: string[]): CliArgs {
 			vault: { type: "string" },
 			polling: { type: "boolean" },
 			"include-hidden": { type: "boolean" },
+			"prose-only": { type: "boolean" },
 			help: { type: "boolean", short: "h" },
 		},
 		strict: true,
@@ -79,6 +82,7 @@ function parseCli(argv: string[]): CliArgs {
 		vault: values.vault,
 		polling: values.polling === true,
 		includeHidden: values["include-hidden"] === true,
+		proseOnly: values["prose-only"] === true,
 	};
 }
 
@@ -87,7 +91,7 @@ const USAGE = `markdown-mcp ${PACKAGE_VERSION}
 A read-only MCP server giving AI agents structured access to a local markdown vault.
 
 Usage:
-  markdown-mcp --vault <path> [--polling] [--include-hidden]
+  markdown-mcp --vault <path> [--polling] [--include-hidden] [--prose-only]
 
 Options:
   --vault <path>     Absolute or relative path to the vault directory (required).
@@ -98,6 +102,12 @@ Options:
   --include-hidden   Include dot-prefixed files and directories on every
                      surface (tree, search, fragment, links, note://). Default
                      excludes them. All-or-nothing per server.
+  --prose-only       Omit 'structuredContent' from every tool response;
+                     'content[0].text' (LLM-readable prose) becomes the only
+                     channel. For clients that don't decode structured output
+                     and operators wanting smaller MCP frames. Errors render
+                     a structured prose body so candidates / progress /
+                     retry_after_ms stay surfaced. note:// is unaffected.
   -h, --help         Show this message.
 
 The server speaks MCP over stdio. Connect from a compatible host
@@ -249,6 +259,8 @@ async function main(): Promise<void> {
 	// user directory) and case-fold on case-insensitive FS (where the
 	// variant aliases to the cache and must be rejected).
 	setFsCaseInsensitive(await detectCaseInsensitiveFs(vaultRoot.absolute));
+
+	setProseOnly(args.proseOnly);
 
 	const dbPath = join(vaultRoot.absolute, DB_RELATIVE_PATH);
 	const dbDir = dirname(dbPath);
@@ -598,7 +610,9 @@ async function main(): Promise<void> {
 				return { filesIndexed: 0, filesSkipped: 0, aborted: false } satisfies ScanResult;
 			});
 
-		const instance = createServer(vaultRoot, index, { includeHidden: args.includeHidden });
+		const instance = createServer(vaultRoot, index, {
+			includeHidden: args.includeHidden,
+		});
 		server = instance.server;
 		inflight = instance.inflight;
 		// `stdinProxy` is the post-lock-acquire pipe target (see top of
