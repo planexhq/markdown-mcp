@@ -39,6 +39,9 @@ describe("get_server_info — success envelope shape", () => {
 			version: "1.0.1",
 			mcp_protocol_version: "2025-06-18",
 			started_at: "2026-05-15T12:00:00.000Z",
+			// `prose_only` reads the `isProseOnly()` module global, not the
+			// context — `true` path covered in `test/index.proseOnly.test.ts`.
+			prose_only: false,
 		});
 		expect(sc.vault.include_hidden).toBe(false);
 		expect(sc.vault.root_hash).toBe(DEFAULT_CONTEXT.rootHash);

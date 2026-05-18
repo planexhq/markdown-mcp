@@ -17,6 +17,8 @@ import { randomUUID } from "node:crypto";
 import type { ErrorCode, HeadingCandidate, IndexStatus, MetaEnvelope, VaultError } from "../types.js";
 import { MAX_FILE_BYTES } from "./limits.js";
 import type { ParseError } from "./parser.js";
+import { isProseOnly } from "./proseOnly.js";
+import { renderError } from "./renderText/error.js";
 
 /**
  * Generate a fresh server-side request ID. Always UUID v4 per D13.
@@ -157,18 +159,42 @@ export function newMetaForHandler(index: IndexStatusSource | undefined, override
 }
 
 /**
+ * Drop `structuredContent` from an envelope under `--prose-only`. The
+ * TS return type still claims its presence because the flag is a
+ * process-level switch never toggled mid-call — same approach as the
+ * SDK's `_meta` extras. Single named home for the unsoundness so the
+ * cast doesn't proliferate across envelope builders.
+ */
+function omitStructuredContent<E extends { structuredContent: unknown }>(envelope: E): E {
+	const { structuredContent: _, ...rest } = envelope;
+	return rest as unknown as E;
+}
+
+/**
  * Wrap a `VaultError` in a CallToolResult envelope ready to return from
  * an MCP tool handler. The `_meta` envelope's `request_id` is forced to
  * match the error's `request_id` so log correlation is consistent.
+ *
+ * Under `--prose-only`, `content[0].text` carries a structured-prose
+ * form built by {@link renderError} so load-bearing fields
+ * (`candidates`, `progress`, `retry_after_ms`, …) stay surfaced
+ * instead of being dropped along with `structuredContent`.
  */
 export function toolErrorEnvelope(err: VaultError, meta: MetaEnvelope): ToolErrorEnvelope {
-	const text = err.suggestion ? `${err.message}\n${err.suggestion}` : err.message;
-	return {
+	const correlatedMeta: MetaEnvelope = { ...meta, request_id: err.request_id };
+	const proseOnly = isProseOnly();
+	const text = proseOnly
+		? renderError(err, correlatedMeta)
+		: err.suggestion
+			? `${err.message}\n${err.suggestion}`
+			: err.message;
+	const envelope: ToolErrorEnvelope = {
 		isError: true,
 		content: [{ type: "text", text }],
 		structuredContent: err,
-		_meta: { ...meta, request_id: err.request_id },
+		_meta: correlatedMeta,
 	};
+	return proseOnly ? omitStructuredContent(envelope) : envelope;
 }
 
 /**
@@ -239,19 +265,16 @@ export interface ToolSuccessEnvelope<T> {
 }
 
 /**
- * Wrap a typed payload + meta envelope as a successful tool result.
+ * Build a `CallToolResult` from a typed payload + meta envelope.
  *
- * `content[0].text` carries an LLM-readable prose rendering of the
- * payload when `options.renderText` is supplied; without it, the legacy
- * `JSON.stringify` form is emitted as a safe fallback so any tool that
- * forgets to pass one stays well-formed. `structuredContent` is the
- * canonical machine-readable channel and is always populated verbatim
- * — clients with `structuredContent` support should prefer it; the
- * prose channel exists to cut tokens for LLM consumers (Claude Code,
- * Codex) that read `content[0].text` directly.
+ * Under `--prose-only`, `structuredContent` is omitted at runtime via
+ * {@link omitStructuredContent}; `options.extraBlocks` survive because
+ * they're prose-channel content per MCP spec.
  *
- * `options.extraBlocks` are appended after the text block — used by
- * `get_vault_tree` to emit `resource_link` blocks for markdown items.
+ * `renderText` is wrapped in try/catch with a `JSON.stringify` fallback
+ * — load-bearing under `--prose-only` since a renderer throw + dropped
+ * structured channel would otherwise yield an empty response. Failures
+ * log to stderr with `request_id` for triage.
  */
 export function successEnvelope<T extends object>(
 	structuredContent: T,
@@ -261,15 +284,26 @@ export function successEnvelope<T extends object>(
 		extraBlocks?: ReadonlyArray<ExtraContentBlock>;
 	},
 ): ToolSuccessEnvelope<T> {
-	const text = options?.renderText
-		? options.renderText(structuredContent, meta)
-		: JSON.stringify(structuredContent, null, 2);
+	let text: string;
+	if (options?.renderText) {
+		try {
+			text = options.renderText(structuredContent, meta);
+		} catch (err) {
+			console.error(
+				`markdown-mcp: prose renderer failed (request_id=${meta.request_id}); falling back to JSON: ${errorMessage(err)}`,
+			);
+			text = JSON.stringify(structuredContent, null, 2);
+		}
+	} else {
+		text = JSON.stringify(structuredContent, null, 2);
+	}
 	const content: ToolSuccessEnvelope<T>["content"] = [{ type: "text", text }, ...(options?.extraBlocks ?? [])];
-	return {
+	const envelope: ToolSuccessEnvelope<T> = {
 		content,
 		structuredContent: structuredContent as T & Record<string, unknown>,
 		_meta: meta,
 	};
+	return isProseOnly() ? omitStructuredContent(envelope) : envelope;
 }
 
 /**

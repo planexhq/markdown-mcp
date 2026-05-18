@@ -28,6 +28,27 @@ export interface TestClient {
 }
 
 /**
+ * Pull `content[0].text` from a tool response with type guards. Used by
+ * tests that need to assert against the prose channel directly (notably
+ * `--prose-only` runs where `structuredContent` is omitted, and any
+ * assertion that compares the rendered prose against expected substrings).
+ */
+export function firstText(content: unknown): string {
+	const arr = content as Array<{ type: string; text?: string }> | undefined;
+	const first = arr?.[0];
+	if (!first || first.type !== "text" || typeof first.text !== "string") {
+		throw new Error(`expected content[0] to be a text block, got: ${JSON.stringify(arr)}`);
+	}
+	return first.text;
+}
+
+/** Lines starting with `label: ` — line-forgery assertions check the
+ * count to detect `\n`-forged labels in user-controlled error fields. */
+export function labeledLines(text: string, label: string): string[] {
+	return text.split("\n").filter((line) => line.startsWith(`${label}: `));
+}
+
+/**
  * Poll until the index reaches `warm`, or ~10s elapses. Tests run their
  * `beforeAll` setup against a fully populated index so vault-wide tools
  * (`search`, `get_links`, `get_vault_tree`) don't return partial counts

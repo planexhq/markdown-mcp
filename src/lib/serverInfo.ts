@@ -19,6 +19,7 @@ import { FUZZY_ALGORITHM_ID } from "./fuzzy.js";
 import { isFsCaseInsensitiveResolved } from "./hiddenPath.js";
 import type { IndexHandle } from "./index/IndexHandle.js";
 import { SCHEMA_VERSION } from "./index/sqlite.js";
+import { isProseOnly } from "./proseOnly.js";
 import { QUERY_ALGORITHM_ID } from "./search/sanitize.js";
 import { BM25_SNIPPET_ALGORITHM_ID, FILTER_PREVIEW_ALGORITHM_ID } from "./search/snippet.js";
 import { getTokenizerId } from "./tokenizer.js";
@@ -80,6 +81,10 @@ export function buildServerInfo(args: BuildServerInfoArgs): GetServerInfoResult 
 			version: args.serverVersion,
 			mcp_protocol_version: args.getMcpProtocolVersion(),
 			started_at: args.startedAt,
+			// Reads the module global directly — single source of truth
+			// with `successEnvelope`/`toolErrorEnvelope`'s suppression
+			// path. Same precedent as `case_insensitive_fs` below.
+			prose_only: isProseOnly(),
 		},
 		vault: {
 			root_hash: args.rootHash,
