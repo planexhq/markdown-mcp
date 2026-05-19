@@ -7,7 +7,7 @@
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { getVaultExtensions, isMarkdownPath } from "../../src/lib/vaultExtensions.js";
+import { getVaultExtensions, isResolvableLinkTarget } from "../../src/lib/vaultExtensions.js";
 
 afterEach(() => {
 	vi.unstubAllEnvs();
@@ -36,29 +36,29 @@ describe("getVaultExtensions", () => {
 	});
 });
 
-describe("isMarkdownPath", () => {
+describe("isResolvableLinkTarget", () => {
 	test("default config: .md accepted, .txt rejected", () => {
-		expect(isMarkdownPath("note.md")).toBe(true);
-		expect(isMarkdownPath("secret.txt")).toBe(false);
+		expect(isResolvableLinkTarget("note.md")).toBe(true);
+		expect(isResolvableLinkTarget("secret.txt")).toBe(false);
 	});
 
 	test("case-insensitive extension match", () => {
-		expect(isMarkdownPath("NOTE.MD")).toBe(true);
+		expect(isResolvableLinkTarget("NOTE.MD")).toBe(true);
 	});
 
 	test("paths without an extension are rejected (no Makefile-style notes)", () => {
-		expect(isMarkdownPath("Makefile")).toBe(false);
-		expect(isMarkdownPath("README")).toBe(false);
+		expect(isResolvableLinkTarget("Makefile")).toBe(false);
+		expect(isResolvableLinkTarget("README")).toBe(false);
 	});
 
 	test("nested path uses the FILE extension, not directory dots", () => {
-		expect(isMarkdownPath("topic.v1/note.md")).toBe(true);
-		expect(isMarkdownPath("topic.v1/asset.png")).toBe(false);
+		expect(isResolvableLinkTarget("topic.v1/note.md")).toBe(true);
+		expect(isResolvableLinkTarget("topic.v1/asset.png")).toBe(false);
 	});
 
 	test("env override: .markdown accepted when configured", () => {
 		vi.stubEnv("VAULT_EXTENSIONS", "md,markdown");
-		expect(isMarkdownPath("note.markdown")).toBe(true);
-		expect(isMarkdownPath("note.mdx")).toBe(false);
+		expect(isResolvableLinkTarget("note.markdown")).toBe(true);
+		expect(isResolvableLinkTarget("note.mdx")).toBe(false);
 	});
 });

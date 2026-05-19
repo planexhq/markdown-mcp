@@ -13,7 +13,7 @@ import { exec } from "node:child_process";
 import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { ToolErrorEnvelope } from "../../src/lib/error.js";
 import { MAX_FILE_BYTES } from "../../src/lib/limits.js";
@@ -71,7 +71,7 @@ describe("readNote — FileTooLargeError", () => {
 });
 
 describe("readNote — encoding errors", () => {
-	test("invalid UTF-8 bytes throw ParseError reason='encoding_failed'", async () => {
+	test("invalid UTF-8 bytes throw ParseError reason='encoding_failed' (markdown)", async () => {
 		// 0xFF / 0xFE are invalid as a leading UTF-8 byte sequence.
 		await writeFile(join(vault.path, "bad-utf8.md"), Buffer.from([0xff, 0xfe, 0x00, 0x21]));
 		const safe = await validatePath("bad-utf8.md", vaultRoot);
@@ -80,7 +80,33 @@ describe("readNote — encoding errors", () => {
 			throw new Error("expected ParseError");
 		} catch (e) {
 			expect(e).toBeInstanceOf(ParseError);
-			if (e instanceof ParseError) expect(e.reason).toBe("encoding_failed");
+			if (e instanceof ParseError) {
+				expect(e.reason).toBe("encoding_failed");
+				expect(e.format).toBe("markdown");
+			}
+		}
+	});
+
+	test("invalid UTF-8 in .yaml routes to format='yaml' (D45)", async () => {
+		// Without the dispatch, readSource would throw with the default
+		// `markdown` format and surface `MARKDOWN_PARSE_ERROR` from a YAML
+		// file — breaking the D45 format-specific error contract.
+		vi.stubEnv("VAULT_EXTENSIONS", "md,yaml,yml");
+		try {
+			await writeFile(join(vault.path, "bad-utf8.yaml"), Buffer.from([0xff, 0xfe, 0x00, 0x21]));
+			const safe = await validatePath("bad-utf8.yaml", vaultRoot);
+			try {
+				await readNote(safe);
+				throw new Error("expected ParseError");
+			} catch (e) {
+				expect(e).toBeInstanceOf(ParseError);
+				if (e instanceof ParseError) {
+					expect(e.reason).toBe("encoding_failed");
+					expect(e.format).toBe("yaml");
+				}
+			}
+		} finally {
+			vi.unstubAllEnvs();
 		}
 	});
 });

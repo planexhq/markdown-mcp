@@ -25,7 +25,7 @@ import { getErrnoCode } from "./error.js";
 import { isHiddenPath, isIndexCachePath } from "./hiddenPath.js";
 import { fileBodyStartOffset, type HeadingMeta, headingPathsEqual, type ParsedFile } from "./parser.js";
 import { PathValidationError, type VaultRoot, validatePath } from "./validatePath.js";
-import { isAssetPath, isMarkdownPath } from "./vaultExtensions.js";
+import { isAssetPath, isResolvableLinkTarget } from "./vaultExtensions.js";
 import {
 	extractWikilinks,
 	parseTarget,
@@ -92,7 +92,7 @@ export async function expandEmbed(
 	if (targetFile === undefined) {
 		return { expanded: false, expansion_error: "unresolved_file" };
 	}
-	if (!isMarkdownPath(targetFile)) {
+	if (!isResolvableLinkTarget(targetFile)) {
 		return { expanded: false, expansion_error: "non_markdown_target" };
 	}
 	// `![[Note#Missing]]`: file resolved but heading didn't. Distinct from a

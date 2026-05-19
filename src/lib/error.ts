@@ -327,19 +327,24 @@ export function fileTooLargeEnvelope(
 }
 
 /**
- * `MARKDOWN_PARSE_ERROR` payload from a `ParseError` instance — shared
- * between Tool surface (`routeError.ts`) and Resource surface
- * (`server.ts` `note://`) so both report identical `{reason, line?,
- * column?}` for the same parser failure. `messagePrefix` lets the
- * Resource side prepend `"note:// parse failed: "` to disambiguate.
+ * Parser error payload from a `ParseError` instance — shared between
+ * Tool surface (`routeError.ts`) and Resource surface (`server.ts`
+ * `note://`) so both report identical `{reason, line?, column?}` for the
+ * same parser failure. `messagePrefix` lets the Resource side prepend
+ * `"note:// parse failed: "` to disambiguate.
+ *
+ * D45 — dispatches on `err.format` to pick `MARKDOWN_PARSE_ERROR` vs
+ * `YAML_PARSE_ERROR`. Payload shape is identical between the two codes;
+ * only the discriminator differs.
  */
-export function markdownParseErrorPayload(
+export function parseErrorPayload(
 	err: ParseError,
 	param: string,
 	options: { messagePrefix?: string; requestId?: string } = {},
 ): VaultError {
 	const message = options.messagePrefix !== undefined ? `${options.messagePrefix}${err.message}` : err.message;
-	return vaultError("MARKDOWN_PARSE_ERROR", message, {
+	const code: ErrorCode = err.format === "yaml" ? "YAML_PARSE_ERROR" : "MARKDOWN_PARSE_ERROR";
+	return vaultError(code, message, {
 		param,
 		reason: err.reason,
 		...(options.requestId !== undefined ? { request_id: options.requestId } : {}),
@@ -348,12 +353,8 @@ export function markdownParseErrorPayload(
 	});
 }
 
-export function markdownParseErrorEnvelope(
-	err: ParseError,
-	param: string,
-	meta: MetaEnvelope = newMeta(),
-): ToolErrorEnvelope {
-	return toolErrorEnvelope(markdownParseErrorPayload(err, param, { requestId: meta.request_id }), meta);
+export function parseErrorEnvelope(err: ParseError, param: string, meta: MetaEnvelope = newMeta()): ToolErrorEnvelope {
+	return toolErrorEnvelope(parseErrorPayload(err, param, { requestId: meta.request_id }), meta);
 }
 
 /**

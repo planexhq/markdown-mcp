@@ -192,4 +192,81 @@ describe("computePolicyMismatch", () => {
 			}),
 		).toBe(false);
 	});
+
+	// ─── D47 — VAULT_EXTENSIONS mismatch ───────────────────────────────
+
+	test("D47 — vaultExtensionsPolicy='md' vs argVaultExtensions='md,yaml,yml' → mismatch", () => {
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				vaultExtensionsPolicy: "md",
+				argVaultExtensions: "md,yaml,yml",
+			}),
+		).toBe(true);
+	});
+
+	test("D47 — pre-column legacy DB (NULL extensions) opened with VAULT_EXTENSIONS=md,yaml,yml → mismatch", () => {
+		// Pre-D47 caches default to NULL `vault_extensions`. Coerced to `"md"`
+		// (the pre-D47 default) — non-default `argVaultExtensions` fires.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				vaultExtensionsPolicy: null,
+				argVaultExtensions: "md,yaml,yml",
+			}),
+		).toBe(true);
+	});
+
+	test("D47 — pre-column legacy DB (NULL extensions) opened with default 'md' → no mismatch", () => {
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				vaultExtensionsPolicy: null,
+				argVaultExtensions: "md",
+			}),
+		).toBe(false);
+	});
+
+	test("D47 — extensions match exactly → no mismatch even when arg sorted", () => {
+		// Production callers canonicalize via `[...getVaultExtensions()].sort().join(",")`
+		// before comparing, so the persisted value is already sorted.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				vaultExtensionsPolicy: "md,yaml,yml",
+				argVaultExtensions: "md,yaml,yml",
+			}),
+		).toBe(false);
+	});
+
+	test("D47 — removing yaml from VAULT_EXTENSIONS also triggers mismatch (symmetric)", () => {
+		// 'md,yaml,yml' → 'md' must prune YAML rows from search via cold rescan.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				vaultExtensionsPolicy: "md,yaml,yml",
+				argVaultExtensions: "md",
+			}),
+		).toBe(true);
+	});
 });

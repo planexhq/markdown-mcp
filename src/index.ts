@@ -41,6 +41,7 @@ import {
 	type VaultRoot,
 	validateVaultRoot,
 } from "./lib/validatePath.js";
+import { getSortedVaultExtensions } from "./lib/vaultExtensions.js";
 import { PACKAGE_VERSION } from "./lib/version.js";
 import { startWatcher, type Watcher } from "./lib/watcher.js";
 import { WriteCoordinator } from "./lib/writeCoordinator.js";
@@ -496,7 +497,16 @@ async function main(): Promise<void> {
 		// Non-null view for downstream code; `openedDb` (`T | null`) stays as
 		// the holder `shutdown()` reads.
 		const opened = openedDb;
-		const index = createIndexHandle(opened.db, { includeHidden: args.includeHidden });
+		// D47 — canonicalize the running VAULT_EXTENSIONS once (sorted
+		// lowercase comma-joined). Passed to `createIndexHandle` so
+		// `markScanFinalized` persists this exact string and to
+		// `computePolicyMismatch` so the disk-vs-running comparison uses
+		// byte-equal canonical forms.
+		const vaultExtensionsSnapshot = getSortedVaultExtensions().join(",");
+		const index = createIndexHandle(opened.db, {
+			includeHidden: args.includeHidden,
+			vaultExtensions: vaultExtensionsSnapshot,
+		});
 
 		index.sweepIndexCacheRows();
 
@@ -515,16 +525,19 @@ async function main(): Promise<void> {
 		// serves stale hidden rows). `computePolicyMismatch` collapses two
 		// signals into one boolean: last-clean mismatch AND interrupted-
 		// scan mismatch. See {@link computePolicyMismatch}.
+		const scanComplete = index.getScanComplete();
 		const policyMismatch = computePolicyMismatch({
 			preexisted: opened.preexisted,
-			scanComplete: index.getScanComplete(),
+			scanComplete,
 			includeHiddenPolicy: index.getIncludeHiddenPolicy(),
 			inflightIncludeHidden: index.getInflightIncludeHidden(),
 			argIncludeHidden: args.includeHidden,
+			vaultExtensionsPolicy: index.getVaultExtensionsPolicy(),
+			argVaultExtensions: vaultExtensionsSnapshot,
 		});
 		const decision = chooseStartupState({
 			preexisted: opened.preexisted,
-			scanComplete: index.getScanComplete(),
+			scanComplete,
 			everComplete: index.getEverComplete(),
 			fileCount: index.countFiles(),
 			policyMismatch,

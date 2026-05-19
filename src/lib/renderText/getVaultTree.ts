@@ -8,7 +8,7 @@
  */
 
 import type { GetVaultTreeResult, MetaEnvelope, VaultTreeItem } from "../../types.js";
-import { isMarkdownPath } from "../vaultExtensions.js";
+import { isParseablePath } from "../vaultExtensions.js";
 import { formatCursor, formatFileHeading, formatMeta, joinLines } from "./_shared.js";
 
 export function renderTree(sc: GetVaultTreeResult, meta: MetaEnvelope): string {
@@ -37,7 +37,7 @@ function renderItem(item: VaultTreeItem): string {
 		return `[dir]   ${dirPath}  (rank ${item.dfs_rank}, ${children} ${childLabel})`;
 	}
 	const path = formatFileHeading(item.path);
-	if (!isMarkdownPath(item.path)) {
+	if (!isParseablePath(item.path)) {
 		return `[file]  ${path}  (rank ${item.dfs_rank}, asset)`;
 	}
 	const suffix = formatFileSuffix(item);

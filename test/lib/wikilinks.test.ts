@@ -500,6 +500,36 @@ describe("wikilinks — Phase 1.5 path-suffix lookup", () => {
 			vi.unstubAllEnvs();
 		}
 	});
+
+	test("D46 — extensionless [[notes/auth]] does NOT silently resolve to .yaml in mixed vaults", () => {
+		// Wikilinks INTO YAML are deferred per D46. With VAULT_EXTENSIONS=md,yaml,yml
+		// and no matching .md, `findFileWithVaultExt` must skip the YAML
+		// extensions; the link stays unresolved rather than retargeting to
+		// `notes/auth.yaml`.
+		vi.stubEnv("VAULT_EXTENSIONS", "md,yaml,yml");
+		try {
+			const idx = new FakeVaultIndex({ files: ["notes/auth.yaml", "caller.md"] });
+			const r = resolveWikilink("notes/auth", "caller.md", idx);
+			expect(r.resolved).toBe(false);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	test("D46 — explicit [[notes/auth.yaml]] does NOT resolve as a markdown wikilink", () => {
+		// Phase 1 enters via the slash branch even though `isResolvableLinkTarget`
+		// rejects YAML; the early `isAssetPath` gate keeps the YAML target
+		// unresolved (Obsidian-style asset semantics) instead of silently
+		// landing a `target_file: "notes/auth.yaml"` row in `wikilinks`.
+		vi.stubEnv("VAULT_EXTENSIONS", "md,yaml,yml");
+		try {
+			const idx = new FakeVaultIndex({ files: ["notes/auth.yaml", "caller.md"] });
+			const r = resolveWikilink("notes/auth.yaml", "caller.md", idx);
+			expect(r.resolved).toBe(false);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
 });
 
 describe("wikilinks — Phase 1 extension-bearing path-less fall-through", () => {

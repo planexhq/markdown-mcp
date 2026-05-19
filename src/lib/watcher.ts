@@ -23,7 +23,7 @@ import { isHiddenPath, isIndexCachePath, isNonNfc } from "./hiddenPath.js";
 import type { IndexHandle } from "./index/IndexHandle.js";
 import type { IndexOutcome } from "./index/scanner.js";
 import { classifyRelpathPolicy, type VaultRoot } from "./validatePath.js";
-import { isMarkdownPath } from "./vaultExtensions.js";
+import { isParseablePath } from "./vaultExtensions.js";
 import type { WriteCoordinator } from "./writeCoordinator.js";
 
 const STABILITY_THRESHOLD_MS = 100;
@@ -200,6 +200,6 @@ function shouldIgnore(
 	if (isNonNfc(posixRel)) return true;
 	if (isIndexCachePath(posixRel)) return true;
 	if (!includeHidden && isHiddenPath(posixRel)) return true;
-	if (stats?.isFile() && !isMarkdownPath(posixRel)) return true;
+	if (stats?.isFile() && !isParseablePath(posixRel)) return true;
 	return false;
 }

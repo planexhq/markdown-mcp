@@ -23,7 +23,7 @@ import { isProseOnly } from "./proseOnly.js";
 import { QUERY_ALGORITHM_ID } from "./search/sanitize.js";
 import { BM25_SNIPPET_ALGORITHM_ID, FILTER_PREVIEW_ALGORITHM_ID } from "./search/snippet.js";
 import { getTokenizerId } from "./tokenizer.js";
-import { getVaultExtensions } from "./vaultExtensions.js";
+import { getSortedVaultExtensions } from "./vaultExtensions.js";
 
 /**
  * Tool names the server registers. Single source of truth for the
@@ -92,7 +92,9 @@ export function buildServerInfo(args: BuildServerInfoArgs): GetServerInfoResult 
 			// Sort so two agents comparing snapshots of the same vault see
 			// byte-identical `extensions` arrays — Set iteration order is
 			// insertion-order, which depends on the env-var parse path.
-			extensions: [...getVaultExtensions()].sort(),
+			// Copy because the wire type is mutable `string[]`; the cached
+			// readonly array stays shared with the lockfile + startup callers.
+			extensions: [...getSortedVaultExtensions()],
 			case_insensitive_fs: isFsCaseInsensitiveResolved(),
 		},
 		index: args.index ? buildIndexIdentity(args.index, args.indexSnapshot) : null,

@@ -21,7 +21,7 @@ import {
 	SUPPORTED_PROTOCOL_VERSIONS,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { errorMessage, internalErrorEnvelope, markdownParseErrorPayload, vaultError } from "./lib/error.js";
+import { errorMessage, internalErrorEnvelope, parseErrorPayload, vaultError } from "./lib/error.js";
 import type { IndexHandle } from "./lib/index/IndexHandle.js";
 import { createInflightTracker, type InflightTracker } from "./lib/inflightTracker.js";
 import { MIN_PROTOCOL_VERSION } from "./lib/limits.js";
@@ -29,6 +29,7 @@ import { ParseError } from "./lib/parser.js";
 import { FileTooLargeError, readSource } from "./lib/readNote.js";
 import { hashVaultRoot } from "./lib/serverInfo.js";
 import { PathValidationError, type VaultRoot, validatePath } from "./lib/validatePath.js";
+import { getParserKind } from "./lib/vaultExtensions.js";
 import { PACKAGE_VERSION } from "./lib/version.js";
 import {
 	GetFileOutlineSchema,
@@ -296,8 +297,9 @@ function registerNoteResource(server: McpServer, vaultRoot: VaultRoot, includeHi
 		{
 			title: "Note",
 			description:
-				"Full markdown of one vault file (frontmatter included). Vault-relative path; same validatePath rules as tools.",
-			mimeType: "text/markdown",
+				"Full source of one vault file (frontmatter included for markdown; literal on-disk bytes for YAML). Vault-relative path; same validatePath rules as tools. mimeType is `text/markdown` for markdown files and `application/yaml` for `.yaml`/`.yml` (D46).",
+			// Matching resources span markdown + YAML; the MCP spec sets
+			// template-level `mimeType` only for single-type templates.
 		},
 		async (uri, variables) => {
 			// SDK URL-normalizes `request.params.uri` BEFORE this handler runs
@@ -334,10 +336,15 @@ function registerNoteResource(server: McpServer, vaultRoot: VaultRoot, includeHi
 				// `readSource` (not `readNote`) returns the literal on-disk
 				// file including frontmatter, the brief's contract for
 				// `note://`. Skipping the parser also lets a parse-only
-				// failure like AST cap not block a readable file.
+				// failure like AST cap not block a readable file. D44 note:
+				// for OpenAPI YAML, `parseFile` produces a synthesized
+				// `ParsedFile.source` distinct from the on-disk bytes —
+				// `note://` deliberately surfaces the literal bytes so
+				// agents reading the resource get the spec verbatim.
 				const { source } = await readSource(safePath, includeHidden);
+				const mimeType = getParserKind(safePath.relative) === "yaml" ? "application/yaml" : "text/markdown";
 				return {
-					contents: [{ uri: uri.toString(), mimeType: "text/markdown", text: source }],
+					contents: [{ uri: uri.toString(), mimeType, text: source }],
 				};
 			} catch (err) {
 				throw resourceErrorToMcp(err);
@@ -383,7 +390,7 @@ function resourceErrorToMcp(err: unknown): McpError {
 		return new McpError(ErrorCode.InternalError, payload.message, payload);
 	}
 	if (err instanceof ParseError) {
-		const payload = markdownParseErrorPayload(err, "uri", { messagePrefix: "note:// parse failed: " });
+		const payload = parseErrorPayload(err, "uri", { messagePrefix: "note:// parse failed: " });
 		return new McpError(ErrorCode.InvalidParams, payload.message, payload);
 	}
 	const payload = vaultError("INTERNAL_ERROR", `note:// read failed: ${errorMessage(err)}`, { param: "uri" });

@@ -9,9 +9,9 @@ import type { IndexState } from "../types.js";
 export const POLICY_MISMATCH_LOG_FRAGMENT = "--include-hidden policy changed since last run";
 
 /**
- * Inputs to {@link computePolicyMismatch}. Two distinct signals collapse
- * into one boolean: either indicates the persisted index population
- * doesn't match the running `--include-hidden` flag.
+ * Inputs to {@link computePolicyMismatch}. Multiple signals collapse into
+ * one boolean: any indicates the persisted index population doesn't match
+ * this run's flag set.
  */
 export interface PolicyMismatchInputs {
 	preexisted: boolean;
@@ -23,25 +23,40 @@ export interface PolicyMismatchInputs {
 	 * in progress / last scan finalized cleanly. */
 	inflightIncludeHidden: boolean | null;
 	argIncludeHidden: boolean;
+	/**
+	 * D47 (optional, defaults to `null`) — persisted `VAULT_EXTENSIONS`
+	 * snapshot (sorted lowercase comma-joined) from the last cleanly-
+	 * finalized scan, or `null` for pre-D47 caches. Optional so pre-D47
+	 * test fixtures that don't exercise the extension-mismatch axis can
+	 * keep their existing call shape; production callers always supply
+	 * both this and `argVaultExtensions`.
+	 */
+	vaultExtensionsPolicy?: string | null;
+	/** D47 (optional, defaults to `"md"`) — `VAULT_EXTENSIONS` snapshot
+	 * for THIS run, canonicalized the same way (sorted lowercase
+	 * comma-joined). Defaulting to `"md"` matches the pre-D47 cache
+	 * default so an omitted field never triggers a spurious mismatch. */
+	argVaultExtensions?: string;
 }
 
 /**
- * `true` when either signal indicates the persisted index doesn't match
- * the running `--include-hidden` flag and a cold rescan is required:
+ * `true` when any signal indicates the persisted index doesn't match
+ * this run's flags and a cold rescan is required:
  *
- * 1. **Last-clean mismatch**: the persisted last-clean policy differs
- *    from `args.includeHidden`. Catches the simple toggle case. NULL
- *    `includeHiddenPolicy` coerces to `false` (the legacy default) so
- *    upgrades from a pre-column cache opened with the flag flip are
- *    caught.
- * 2. **Interrupted-scan mismatch**: a scan was interrupted
- *    (`scan_complete=false`) under a policy that differs from
- *    `args.includeHidden`. The persisted last-clean policy can match
- *    `args.includeHidden` (revert-during-flip case) and still leave the
- *    DB contaminated by an unfinalized scan; without this signal,
- *    `chooseStartupState` would return warm via the
- *    `(preexisted && everComplete)` branch and serve the contaminated
- *    snapshot until reconcile drained.
+ * 1. **Last-clean `--include-hidden` mismatch**: persisted policy differs
+ *    from `args.includeHidden`. NULL coerces to `false` (legacy default)
+ *    so upgrades opened with the flag flip are caught.
+ * 2. **Interrupted-scan `--include-hidden` mismatch**: a scan was
+ *    interrupted (`scan_complete=false`) under a policy differing from
+ *    `args.includeHidden`. Without this signal, `chooseStartupState`
+ *    would return warm via `(preexisted && everComplete)` and serve a
+ *    contaminated snapshot.
+ * 3. **D47 — `VAULT_EXTENSIONS` mismatch**: the persisted extension list
+ *    differs from this run's. Symmetric in both directions: adding `yaml`
+ *    needs to index previously-skipped files; removing `yaml` needs to
+ *    prune existing YAML rows from search. NULL coerces to `"md"` (the
+ *    pre-D47 default extension), so an upgrader opening a default-built
+ *    cache with `VAULT_EXTENSIONS=md,yaml,yml` is caught.
  *
  * `preexisted=false` short-circuits to false; a fresh DB forces cold via
  * the rest of `chooseStartupState`.
@@ -50,6 +65,9 @@ export function computePolicyMismatch(inputs: PolicyMismatchInputs): boolean {
 	if (!inputs.preexisted) return false;
 	const persisted = inputs.includeHiddenPolicy ?? false;
 	if (persisted !== inputs.argIncludeHidden) return true;
+	const persistedExt = inputs.vaultExtensionsPolicy ?? "md";
+	const argExt = inputs.argVaultExtensions ?? "md";
+	if (persistedExt !== argExt) return true;
 	if (inputs.scanComplete) return false;
 	if (inputs.inflightIncludeHidden === null) return false;
 	return inputs.inflightIncludeHidden !== inputs.argIncludeHidden;

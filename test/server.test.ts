@@ -730,7 +730,9 @@ describe("resources/list + resources/templates/list", () => {
 		const templates = await connection.client.listResourceTemplates();
 		const note = templates.resourceTemplates.find((t) => t.uriTemplate === "note://{+path}");
 		expect(note).toBeDefined();
-		expect(note?.mimeType).toBe("text/markdown");
+		// Per-instance mimeType is authoritative for mixed-type resources
+		// (markdown + YAML).
+		expect(note?.mimeType).toBeUndefined();
 	});
 });
 

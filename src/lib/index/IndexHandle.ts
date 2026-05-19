@@ -178,17 +178,27 @@ export interface FileStats {
 }
 
 /**
- * `includeHidden` is captured here so {@link IndexHandle.markScanFinalized}
- * persists it atomically with `scan_complete=true` — that invariant is
- * what lets a startup mismatch check distinguish "last clean snapshot's
- * policy" from "currently-running process flag."
+ * `includeHidden` and `vaultExtensions` are captured here so
+ * {@link IndexHandle.markScanFinalized} persists them atomically with
+ * `scan_complete=true` — that invariant is what lets a startup mismatch
+ * check distinguish "last clean snapshot's policy" from
+ * "currently-running process flag."
+ *
+ * `vaultExtensions` (D47, optional) is the canonical sorted lowercase
+ * comma-joined form (e.g. `"md,yaml,yml"`). Production callers
+ * (`src/index.ts`) produce it once at startup via
+ * `[...getVaultExtensions()].sort().join(",")`; tests that bypass that
+ * code path omit the field and accept the default `"md"` (matches the
+ * pre-D47 cache default — `chooseStartupState` treats NULL or `"md"` as
+ * "no mismatch" for default-extension vaults).
  */
 export interface CreateIndexHandleOptions {
 	includeHidden: boolean;
+	vaultExtensions?: string;
 }
 
 export function createIndexHandle(db: DatabaseType, options: CreateIndexHandleOptions): IndexHandle {
-	return new IndexHandle(db, options.includeHidden);
+	return new IndexHandle(db, options.includeHidden, options.vaultExtensions ?? "md");
 }
 
 interface FileCacheSnapshot {
@@ -227,6 +237,7 @@ export class IndexHandle implements VaultFileIndex {
 	private readonly stmtGetInflightIncludeHidden: Statement;
 	private readonly stmtSetInflightIncludeHidden: Statement;
 	private readonly stmtGetEverComplete: Statement;
+	private readonly stmtGetVaultExtensions: Statement;
 	private readonly stmtFinalize: Statement;
 	// D37: single round-trip for `getStatus()`'s two SELECTs
 	// (files_indexed + last_scan_finished_at). Used by `getStatus()` and
@@ -284,10 +295,12 @@ export class IndexHandle implements VaultFileIndex {
 
 	// See {@link CreateIndexHandleOptions}.
 	private readonly includeHidden: boolean;
+	private readonly vaultExtensions: string;
 
-	constructor(db: DatabaseType, includeHidden: boolean) {
+	constructor(db: DatabaseType, includeHidden: boolean, vaultExtensions: string) {
 		this.db = db;
 		this.includeHidden = includeHidden;
+		this.vaultExtensions = vaultExtensions;
 		this.stmtBumpSnapshot = db.prepare("UPDATE snapshot SET value = MAX(value + 1, :now) WHERE id = 1 RETURNING value");
 		this.stmtGetSnapshot = db.prepare("SELECT value FROM snapshot WHERE id = 1");
 		// `frontmatter` has one row per file (line 367 — canonical "indexed
@@ -379,13 +392,17 @@ export class IndexHandle implements VaultFileIndex {
 			"UPDATE index_meta SET inflight_include_hidden = :value WHERE id = 1",
 		);
 		this.stmtGetEverComplete = db.prepare("SELECT ever_complete FROM index_meta WHERE id = 1");
+		this.stmtGetVaultExtensions = db.prepare("SELECT vault_extensions FROM index_meta WHERE id = 1");
 		// Single statement so the finalize columns commit atomically.
 		// `inflight_include_hidden = NULL` clears the in-flight marker in
 		// the same UPDATE — a SIGTERM mid-finalize cannot leave the clear
-		// half-done.
+		// half-done. D47 adds `vault_extensions` to the atomic set so the
+		// persisted snapshot's extension policy always matches its
+		// `include_hidden`.
 		this.stmtFinalize = db.prepare(
 			"UPDATE index_meta SET scan_complete = 1, ever_complete = 1, include_hidden = :include_hidden, " +
-				"inflight_include_hidden = NULL, last_scan_finished_at = :last_scan_finished_at WHERE id = 1",
+				"inflight_include_hidden = NULL, last_scan_finished_at = :last_scan_finished_at, " +
+				"vault_extensions = :vault_extensions WHERE id = 1",
 		);
 		// Inline subqueries so the round-trip is one prepared-statement
 		// invocation. `frontmatter` count matches `countFiles()`'s query;
@@ -488,6 +505,21 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	/**
+	 * D47 — persisted `VAULT_EXTENSIONS` snapshot (sorted, lowercase,
+	 * comma-joined) from the last cleanly-finalized scan. `null` signals
+	 * a fresh DB or pre-D47 upgrade; the next {@link markScanFinalized}
+	 * writes the running policy. Compared against the current
+	 * `getVaultExtensions()` snapshot at startup to detect flips that
+	 * invalidate row population (e.g. `md` → `md,yaml,yml` adds files
+	 * never indexed; `md,yaml` → `md` adds rows that must be pruned).
+	 */
+	getVaultExtensionsPolicy(): string | null {
+		const row = this.stmtGetVaultExtensions.get() as { vault_extensions: string | null } | undefined;
+		if (row === undefined || row.vault_extensions === null) return null;
+		return row.vault_extensions;
+	}
+
+	/**
 	 * Tri-state read of the IN-FLIGHT scan policy. NULL = no scan in
 	 * progress or last scan finalized cleanly; true/false = a scan is/was
 	 * interrupted under that policy. Startup uses this to detect a
@@ -539,6 +571,7 @@ export class IndexHandle implements VaultFileIndex {
 		this.stmtFinalize.run({
 			include_hidden: this.includeHidden ? 1 : 0,
 			last_scan_finished_at: finishedAt,
+			vault_extensions: this.vaultExtensions,
 		});
 		this.setStatus("warm");
 		this.scanIncomplete = false;
