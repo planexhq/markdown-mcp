@@ -1,11 +1,11 @@
 /**
  * Vault scanner — walks the tree, parses each note via `readNote`
  * (so `O_NOFOLLOW` + size cap apply uniformly), derives row inputs per
- * D31 emit-rules, and commits via `IndexHandle.replaceFile` with
+ * the emit-rules below, and commits via `IndexHandle.replaceFile` with
  * bounded concurrency (default 4). Symlinks + hidden paths +
  * non-markdown files are skipped.
  *
- * D31 emit-rules: `headings.length > 0` → one heading row per heading
+ * Emit-rules: `headings.length > 0` → one heading row per heading
  * plus an optional preamble row (only if non-whitespace); else a
  * single `file` row covering the post-frontmatter body. `preamble`
  * and `file` rows are mutually exclusive per file.
@@ -24,6 +24,7 @@ import { isUnderFailedSubtree } from "../failedSubtrees.js";
 import { ISO_LIKELY_RE, isCalendarDate, parseIsoDatetimeToCanonical, toCanonicalUtcIso } from "../filter.js";
 import { isHiddenName, isHiddenPath, isIndexCachePath, isNonNfc } from "../hiddenPath.js";
 import { type ParsedFile, ParseError } from "../parser.js";
+import { PARSER_SHAPE_VERSION } from "../parsers/version.js";
 import { readNote } from "../readNote.js";
 import { estimateTokens } from "../tokenizer.js";
 import { classifyRelpathPolicy, PathValidationError, type VaultRoot, validatePath } from "../validatePath.js";
@@ -109,6 +110,12 @@ export async function scanVault(args: ScanArgs): Promise<ScanResult> {
 	// startup compares against the running `args.includeHidden` to detect
 	// a partial scan under a possibly-different policy.
 	index.setInflightIncludeHidden(includeHidden);
+	// Record the parser-output-shape of this scan. Symmetric to the
+	// include-hidden marker: a SIGTERM mid-rescan under a different shape
+	// leaves the column set, and the next startup compares it against the
+	// in-code constant so a downgrade-after-interrupt doesn't restore a
+	// warm snapshot containing mixed-shape fragments.
+	index.setInflightParserShape(PARSER_SHAPE_VERSION);
 	index.setStatus(startingState === "warm" ? "reconciling" : "warming");
 	index.setScanInProgress(true);
 	// Reset the failed-subtrees gate for this scan. End-of-scan resets
@@ -704,7 +711,7 @@ function buildFragmentRows(parsed: ParsedFile): FragmentRowInput[] {
 	const stem = fileStem(parsed.relpath);
 
 	if (parsed.headings.length === 0) {
-		// Per D31: emit exactly one `file` row even for frontmatter-only
+		// Emit exactly one `file` row even for frontmatter-only
 		// notes (empty/whitespace body). Without this, filter-only search
 		// by tag/date can't surface metadata-only notes.
 		const start = parsed.frontmatterEndOffset;
@@ -775,16 +782,16 @@ function buildFragmentRows(parsed: ParsedFile): FragmentRowInput[] {
 }
 
 /**
- * Per-section wikilink extraction. Mirrors `buildFragmentRows`'s D31
+ * Per-section wikilink extraction. Mirrors `buildFragmentRows`'s
  * emit rules: heading sections emit links, preamble emits links iff
  * non-whitespace, file row emits links for the entire post-frontmatter
  * body when there are no headings.
  *
- * `link_ordinal` is naturally 1-based per section (D34) — `extractWikilinks`
+ * `link_ordinal` is naturally 1-based per section — `extractWikilinks`
  * scopes its counter per call, and we call it once per source section.
  */
 function buildWikilinkRows(parsed: ParsedFile): WikilinkRowInput[] {
-	// D46 — wikilinks INTO YAML are deferred to v1.x; wikilinks FROM YAML
+	// Wikilinks INTO YAML are deferred to v1.x; wikilinks FROM YAML
 	// are also out of scope for v1. YAML files (opaque or OpenAPI-synthesized)
 	// emit zero wikilink rows. Without this gate, `[[X]]` text accidentally
 	// appearing inside a YAML scalar value would be extracted as a wikilink
@@ -828,9 +835,9 @@ function buildWikilinkRows(parsed: ParsedFile): WikilinkRowInput[] {
 	}
 
 	// Insert preamble before headings so SQLite rowids end up in document
-	// order — `listOutgoingLinks` uses `ORDER BY id ASC` per D36, which
-	// only matches source position when each file's wikilinks were
-	// inserted preamble-first.
+	// order — `listOutgoingLinks` uses `ORDER BY id ASC`, which only
+	// matches source position when each file's wikilinks were inserted
+	// preamble-first.
 	if (parsed.preamble) {
 		const start = parsed.preamble.offsetRange.start;
 		const end = parsed.preamble.offsetRange.end;
@@ -878,7 +885,7 @@ function serializeFields(fm: Record<string, unknown>): string {
 
 /**
  * Walk a frontmatter value, canonicalizing any ISO-shaped string or Date
- * to UTC ISO. Recursive so nested dotted-path fields (D30 Note 3a, e.g.,
+ * to UTC ISO. Recursive so nested dotted-path fields (e.g.,
  * `fields["meta.published"]`) pick up the same canonicalization.
  *
  * Null-on-invalid stays scoped to top-level reserved keys: a nested
@@ -968,7 +975,7 @@ function fileStem(relpath: string): string {
  * producing both FTS column strings for `[start, end)`: prose `body` (code
  * spans elided) and code-only text (newline-separated).
  *
- * Eliding code from `body` honors D18's `bm25(_, 2.0, 0.5, 3.0)` code
+ * Eliding code from `body` honors the `bm25(_, 2.0, 0.5, 3.0)` code
  * downweight — if a code-only term were indexed in `body` too, the 2.0
  * body weight would stack on top of 0.5 code and defeat the downweight.
  *

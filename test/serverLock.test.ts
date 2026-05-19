@@ -34,6 +34,7 @@ import {
 	ServerLockFileNotRegularError,
 	ServerLockHostCollisionError,
 	ServerLockOwnSlotUnparseableError,
+	ServerLockParserShapeConflictError,
 	ServerLockUnknownPeerError,
 } from "../src/lib/serverLock.js";
 import { findDeadPid } from "./helpers/findDeadPid.js";
@@ -161,9 +162,9 @@ describe("server lockfile — stale-PID cleanup", () => {
 		await mkdir(indexDir(vault.path), { recursive: true });
 		await writeFile(garbagePath, "this is not valid json");
 
-		await expect(acquireServerLock({ indexDir: indexDir(vault.path), includeHidden: false })).rejects.toBeInstanceOf(
-			ServerLockUnknownPeerError,
-		);
+		await expect(
+			acquireServerLock({ indexDir: indexDir(vault.path), includeHidden: false, parserShapeVersion: 0 }),
+		).rejects.toBeInstanceOf(ServerLockUnknownPeerError);
 
 		// Foreign lockfile is preserved (we never touch foreign content we
 		// don't recognize as either parseable or stale).
@@ -187,7 +188,11 @@ describe("server lockfile — stale-PID cleanup", () => {
 			writeFile(slotPath, `${JSON.stringify({ includeHidden: false, hostname: hostname() })}\n`).catch(() => {});
 		}, 5);
 
-		const handle = await acquireServerLock({ indexDir: indexDir(vault.path), includeHidden: false });
+		const handle = await acquireServerLock({
+			indexDir: indexDir(vault.path),
+			includeHidden: false,
+			parserShapeVersion: 0,
+		});
 		try {
 			// Race recovered; same-policy coexistence — no throw.
 			expect(handle).toBeTruthy();
@@ -213,9 +218,9 @@ describe("server lockfile — bounded foreign read", () => {
 		const oversizedPayload = "x".repeat(8192);
 		await writeFile(oversizedPath, oversizedPayload);
 
-		await expect(acquireServerLock({ indexDir: indexDir(vault.path), includeHidden: false })).rejects.toBeInstanceOf(
-			ServerLockUnknownPeerError,
-		);
+		await expect(
+			acquireServerLock({ indexDir: indexDir(vault.path), includeHidden: false, parserShapeVersion: 0 }),
+		).rejects.toBeInstanceOf(ServerLockUnknownPeerError);
 
 		// Foreign slot left in place (we never unlink unparseable live-peer files).
 		await expect(stat(oversizedPath)).resolves.toBeTruthy();
@@ -236,7 +241,11 @@ describe("server lockfile — foreign-host slot preserved when local PID is dead
 		await mkdir(indexDir(vault.path), { recursive: true });
 		await writeFile(foreignPath, `${JSON.stringify({ includeHidden: false, hostname: "foreign-host-xyz" })}\n`);
 
-		const handle = await acquireServerLock({ indexDir: indexDir(vault.path), includeHidden: true });
+		const handle = await acquireServerLock({
+			indexDir: indexDir(vault.path),
+			includeHidden: true,
+			parserShapeVersion: 0,
+		});
 		try {
 			// Foreign-host signal short-circuits ahead of the liveness probe.
 			await expect(stat(foreignPath)).resolves.toBeTruthy();
@@ -255,7 +264,11 @@ describe("server lockfile — foreign-host slot preserved when local PID is dead
 		await mkdir(indexDir(vault.path), { recursive: true });
 		await writeFile(legacyPath, `${JSON.stringify({ includeHidden: false })}\n`);
 
-		const handle = await acquireServerLock({ indexDir: indexDir(vault.path), includeHidden: true });
+		const handle = await acquireServerLock({
+			indexDir: indexDir(vault.path),
+			includeHidden: true,
+			parserShapeVersion: 0,
+		});
 		try {
 			await expect(stat(legacyPath)).rejects.toThrow(/ENOENT/);
 		} finally {
@@ -279,6 +292,7 @@ describe("server lockfile — hostname check", () => {
 		const handle = await acquireServerLock({
 			indexDir: indexDir(vault.path),
 			includeHidden: true,
+			parserShapeVersion: 0,
 		});
 		try {
 			// Foreign-host slot is preserved (we never unlink slots we can't validate).
@@ -317,7 +331,7 @@ describe("server lockfile — own-slot PID-reuse recovery", () => {
 		// without cleanup).
 		await writeFile(ourPath, `${JSON.stringify({ includeHidden: true })}\n`);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			const after = await readFile(ourPath, "utf8");
 			// Recovery overwrote with our policy (false), proving takeover.
@@ -339,9 +353,9 @@ describe("server lockfile — symlink defense", () => {
 		await writeFile(targetPath, sentinel);
 		await symlink(targetPath, ourPath);
 
-		await expect(acquireServerLock({ indexDir: indexPath, includeHidden: false })).rejects.toBeInstanceOf(
-			ServerLockFileNotRegularError,
-		);
+		await expect(
+			acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 }),
+		).rejects.toBeInstanceOf(ServerLockFileNotRegularError);
 
 		// Target untouched.
 		expect(await readFile(targetPath, "utf8")).toBe(sentinel);
@@ -360,7 +374,7 @@ describe("server lockfile — symlink defense", () => {
 		await writeFile(targetPath, sentinel);
 		await symlink(targetPath, foreignPath);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			expect(await readFile(targetPath, "utf8")).toBe(sentinel);
 			// Foreign symlink left in place (we never touch foreign non-regular
@@ -382,7 +396,7 @@ describe("server lockfile — legacy server.lock cleanup", () => {
 		const legacyPath = join(indexPath, LEGACY_LOCK_FILE_NAME);
 		await writeFile(legacyPath, "arbitrary legacy content");
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			await expect(readFile(legacyPath, "utf8")).rejects.toThrow(/ENOENT/);
 			// Per-PID file present.
@@ -401,7 +415,7 @@ describe("server lockfile — legacy server.lock cleanup", () => {
 		await writeFile(targetPath, sentinel);
 		await symlink(targetPath, legacyPath);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			// Target preserved (cleanup refuses to follow the symlink).
 			expect(await readFile(targetPath, "utf8")).toBe(sentinel);
@@ -449,7 +463,7 @@ describe("server lockfile — legacy lockfile mixed-version interop", () => {
 		const deadPid = findDeadPid();
 		await writeFile(legacyPath, `${JSON.stringify({ pid: deadPid, includeHidden: false })}\n`);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: true });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: true, parserShapeVersion: 0 });
 		try {
 			// Legacy file preserved (operator must rm manually).
 			await expect(stat(legacyPath)).resolves.toBeTruthy();
@@ -468,7 +482,7 @@ describe("server lockfile — legacy lockfile mixed-version interop", () => {
 		// process.ppid is the vitest runner — reliably alive.
 		await writeFile(legacyPath, `${JSON.stringify({ pid: process.ppid, includeHidden: false })}\n`);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			// Legacy file preserved — the still-running legacy owner's
 			// shutdown handler will clean it up.
@@ -485,9 +499,9 @@ describe("server lockfile — legacy lockfile mixed-version interop", () => {
 		const legacyPath = join(indexPath, LEGACY_LOCK_FILE_NAME);
 		await writeFile(legacyPath, `${JSON.stringify({ pid: process.ppid, includeHidden: false })}\n`);
 
-		await expect(acquireServerLock({ indexDir: indexPath, includeHidden: true })).rejects.toBeInstanceOf(
-			ServerLockConflictError,
-		);
+		await expect(
+			acquireServerLock({ indexDir: indexPath, includeHidden: true, parserShapeVersion: 0 }),
+		).rejects.toBeInstanceOf(ServerLockConflictError);
 		// Legacy file preserved (we don't unlink a live owner's slot).
 		await expect(stat(legacyPath)).resolves.toBeTruthy();
 		await unlink(legacyPath).catch(() => {});
@@ -508,7 +522,7 @@ describe("server lockfile — legacy wx-race absorption", () => {
 		}, 12);
 
 		try {
-			const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+			const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 			try {
 				await expect(stat(legacyPath)).resolves.toBeTruthy();
 			} finally {
@@ -526,7 +540,7 @@ describe("server lockfile — legacy wx-race absorption", () => {
 		const legacyPath = join(indexPath, LEGACY_LOCK_FILE_NAME);
 		await writeFile(legacyPath, "");
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			await expect(stat(legacyPath)).rejects.toThrow(/ENOENT/);
 		} finally {
@@ -579,9 +593,9 @@ describe("server lockfile — own-slot foreign-host collision", () => {
 		const ownSlot = join(indexPath, lockFileNameForPid(process.pid));
 		await writeFile(ownSlot, `${JSON.stringify({ includeHidden: false, hostname: "foreign-host-XYZ" })}\n`);
 
-		await expect(acquireServerLock({ indexDir: indexPath, includeHidden: false })).rejects.toBeInstanceOf(
-			ServerLockHostCollisionError,
-		);
+		await expect(
+			acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 }),
+		).rejects.toBeInstanceOf(ServerLockHostCollisionError);
 
 		// Foreign-host lockfile must NOT be unlinked.
 		const surviving = await readFile(ownSlot, "utf8");
@@ -595,7 +609,7 @@ describe("server lockfile — own-slot foreign-host collision", () => {
 		const ownSlot = join(indexPath, lockFileNameForPid(process.pid));
 		await writeFile(ownSlot, `${JSON.stringify({ includeHidden: false, hostname: hostname() })}\n`);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			// Our fresh payload replaced the prior-us remnant.
 			const fresh = await readFile(ownSlot, "utf8");
@@ -613,7 +627,7 @@ describe("server lockfile — own-slot foreign-host collision", () => {
 		// servers were single-host by design) and unlink.
 		await writeFile(ownSlot, `${JSON.stringify({ includeHidden: false })}\n`);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			const fresh = await readFile(ownSlot, "utf8");
 			expect(fresh).toContain(`"hostname":"${hostname()}"`);
@@ -635,9 +649,9 @@ describe("server lockfile — own-slot unparseable", () => {
 		const ownSlot = join(indexPath, lockFileNameForPid(process.pid));
 		await writeFile(ownSlot, content);
 
-		await expect(acquireServerLock({ indexDir: indexPath, includeHidden: false })).rejects.toBeInstanceOf(
-			ServerLockOwnSlotUnparseableError,
-		);
+		await expect(
+			acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 }),
+		).rejects.toBeInstanceOf(ServerLockOwnSlotUnparseableError);
 
 		await expect(stat(ownSlot)).resolves.toBeTruthy();
 		await unlink(ownSlot);
@@ -669,7 +683,7 @@ describe("server lockfile — foreign-slot unparseable + ESRCH preserves", () =>
 		const foreignSlot = join(indexPath, lockFileNameForPid(deadPid));
 		await writeFile(foreignSlot, "");
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			await expect(stat(ownLockPath(vault.path, process.pid))).resolves.toBeTruthy();
 			await expect(stat(foreignSlot)).resolves.toBeTruthy();
@@ -690,9 +704,9 @@ describe("server lockfile — extension conflict", () => {
 			`${JSON.stringify({ includeHidden: false, hostname: hostname(), vaultExtensions: ["md", "mdx"] })}\n`,
 		);
 
-		await expect(acquireServerLock({ indexDir: indexPath, includeHidden: false })).rejects.toBeInstanceOf(
-			ServerLockExtensionConflictError,
-		);
+		await expect(
+			acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 }),
+		).rejects.toBeInstanceOf(ServerLockExtensionConflictError);
 
 		// Foreign slot preserved (we don't unlink live peers).
 		await expect(stat(liveSlot)).resolves.toBeTruthy();
@@ -708,7 +722,7 @@ describe("server lockfile — extension conflict", () => {
 			`${JSON.stringify({ includeHidden: false, hostname: hostname(), vaultExtensions: ["md"] })}\n`,
 		);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			await expect(stat(liveSlot)).resolves.toBeTruthy();
 		} finally {
@@ -726,7 +740,7 @@ describe("server lockfile — extension conflict", () => {
 		const liveSlot = join(indexPath, lockFileNameForPid(process.ppid));
 		await writeFile(liveSlot, `${JSON.stringify({ includeHidden: false, hostname: hostname() })}\n`);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			await expect(stat(liveSlot)).resolves.toBeTruthy();
 		} finally {
@@ -750,7 +764,7 @@ describe("server lockfile — bogus PID filename gate", () => {
 			`${JSON.stringify({ includeHidden: true, hostname: hostname(), vaultExtensions: ["md"] })}\n`,
 		);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			// Bogus file preserved (don't unlink anything we can't verify).
 			await expect(stat(bogusPath)).resolves.toBeTruthy();
@@ -791,7 +805,7 @@ describe("server lockfile — reprobe non-regular guard", () => {
 		try {
 			// Acquire succeeds because reprobe → non-regular → "absent" →
 			// inspectForeignSlot skips. No throw, no block.
-			const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+			const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 			await handle.release();
 		} finally {
 			clearTimeout(timer);
@@ -828,9 +842,9 @@ describe("server lockfile — reprobe non-regular guard", () => {
 		}, 12);
 
 		try {
-			await expect(acquireServerLock({ indexDir: indexPath, includeHidden: false })).rejects.toBeInstanceOf(
-				ServerLockFileNotRegularError,
-			);
+			await expect(
+				acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 }),
+			).rejects.toBeInstanceOf(ServerLockFileNotRegularError);
 		} finally {
 			clearTimeout(timer);
 			await rm(slotPath, { recursive: true, force: true });
@@ -856,7 +870,7 @@ describe("server lockfile — simultaneous-start tiebreaker", () => {
 		const future = new Date(Date.now() + 60_000);
 		await utimes(foreignPath, future, future);
 
-		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 });
 		try {
 			const ourPath = ownLockPath(vault.path, process.pid);
 			await expect(lstat(ourPath)).resolves.toBeTruthy();
@@ -883,9 +897,9 @@ describe("server lockfile — simultaneous-start tiebreaker", () => {
 		const past = new Date(Date.now() - 60_000);
 		await utimes(foreignPath, past, past);
 
-		await expect(acquireServerLock({ indexDir: indexPath, includeHidden: false })).rejects.toBeInstanceOf(
-			ServerLockConflictError,
-		);
+		await expect(
+			acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 0 }),
+		).rejects.toBeInstanceOf(ServerLockConflictError);
 
 		// Our slot cleaned up by acquireServerLock's catch.
 		const ourPath = ownLockPath(vault.path, process.pid);
@@ -894,5 +908,85 @@ describe("server lockfile — simultaneous-start tiebreaker", () => {
 		// Foreign slot preserved (we don't touch live peers' lockfiles).
 		await expect(lstat(foreignPath)).resolves.toBeTruthy();
 		await unlink(foreignPath).catch(() => {});
+	});
+});
+
+describe("server lockfile — parser-shape conflict", () => {
+	test("lock record persists parserShapeVersion", async () => {
+		const indexPath = indexDir(vault.path);
+		await mkdir(indexPath, { recursive: true });
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 42 });
+		try {
+			const ownSlot = ownLockPath(vault.path, process.pid);
+			const record = await readAndParseForTesting(ownSlot);
+			expect(record).not.toBe("absent");
+			expect(record).not.toBe("unparseable");
+			if (record === "absent" || record === "unparseable") return;
+			expect(record.parserShapeVersion).toBe(42);
+		} finally {
+			await handle.release();
+		}
+	});
+
+	test("mismatched parserShapeVersion on a live peer throws ServerLockParserShapeConflictError", async () => {
+		const indexPath = indexDir(vault.path);
+		await mkdir(indexPath, { recursive: true });
+		const liveSlot = join(indexPath, lockFileNameForPid(process.ppid));
+		await writeFile(
+			liveSlot,
+			`${JSON.stringify({
+				includeHidden: false,
+				hostname: hostname(),
+				vaultExtensions: ["md"],
+				parserShapeVersion: 9,
+			})}\n`,
+		);
+
+		await expect(
+			acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 10 }),
+		).rejects.toBeInstanceOf(ServerLockParserShapeConflictError);
+
+		await expect(stat(liveSlot)).resolves.toBeTruthy();
+		await unlink(liveSlot).catch(() => {});
+	});
+
+	test("legacy lockfile (no parserShapeVersion field) treated as 0; conflicts with a non-zero binary", async () => {
+		const indexPath = indexDir(vault.path);
+		await mkdir(indexPath, { recursive: true });
+		const liveSlot = join(indexPath, lockFileNameForPid(process.ppid));
+		// Pre-stamp lock record without the field.
+		await writeFile(
+			liveSlot,
+			`${JSON.stringify({ includeHidden: false, hostname: hostname(), vaultExtensions: ["md"] })}\n`,
+		);
+
+		await expect(
+			acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 10 }),
+		).rejects.toBeInstanceOf(ServerLockParserShapeConflictError);
+
+		await unlink(liveSlot).catch(() => {});
+	});
+
+	test("matching parserShapeVersion on a live peer coexists", async () => {
+		const indexPath = indexDir(vault.path);
+		await mkdir(indexPath, { recursive: true });
+		const liveSlot = join(indexPath, lockFileNameForPid(process.ppid));
+		await writeFile(
+			liveSlot,
+			`${JSON.stringify({
+				includeHidden: false,
+				hostname: hostname(),
+				vaultExtensions: ["md"],
+				parserShapeVersion: 10,
+			})}\n`,
+		);
+
+		const handle = await acquireServerLock({ indexDir: indexPath, includeHidden: false, parserShapeVersion: 10 });
+		try {
+			await expect(stat(liveSlot)).resolves.toBeTruthy();
+		} finally {
+			await handle.release();
+			await unlink(liveSlot).catch(() => {});
+		}
 	});
 });

@@ -13,6 +13,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { closeSqlite, openSqlite } from "../src/lib/index/sqlite.js";
+import { PARSER_SHAPE_VERSION } from "../src/lib/parsers/version.js";
 import { POLICY_MISMATCH_LOG_FRAGMENT } from "../src/lib/startup.js";
 import { indexDir } from "./helpers/indexDir.js";
 import { spawnAndWaitForStartup, waitForExit } from "./helpers/mcp-client.js";
@@ -46,18 +47,24 @@ interface InjectArgs {
 function injectState(vaultPath: string, args: InjectArgs): void {
 	const db = new Database(dbPath(vaultPath));
 	try {
+		// Stamp `parser_shape_version` to the current in-code constant so
+		// the parser-shape mismatch axis stays quiet — these tests focus
+		// on the `--include-hidden` axis. A separate test file covers
+		// the parser-shape axis.
 		db.prepare(
 			`UPDATE index_meta
 			 SET scan_complete = :scan_complete,
 			     ever_complete = :ever_complete,
 			     include_hidden = :include_hidden,
-			     inflight_include_hidden = :inflight_include_hidden
+			     inflight_include_hidden = :inflight_include_hidden,
+			     parser_shape_version = :parser_shape_version
 			 WHERE id = 1`,
 		).run({
 			scan_complete: args.scanComplete,
 			ever_complete: args.everComplete,
 			include_hidden: args.includeHidden,
 			inflight_include_hidden: args.inflightIncludeHidden,
+			parser_shape_version: PARSER_SHAPE_VERSION,
 		});
 	} finally {
 		db.close();

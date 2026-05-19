@@ -1,10 +1,10 @@
 /**
- * D44 — OpenAPI 3.x synthesizer.
+ * OpenAPI 3.x synthesizer.
  *
  * `structuralPath = "op[<sha14(method + ' ' + path)>]"` is the load-bearing
  * choice: name-based slot IDs survive path reorder, so code-generated specs
  * don't churn `heading_history` on every regeneration. The `frontmatter`
- * field holds the entire top-level object so D30 nested-path filters
+ * field holds the entire top-level object so nested-path filters
  * (`fields["info.version"]`) work without OpenAPI-specific wiring. The
  * synthesized `source` is the prose rendering used by `get_fragment`;
  * `note://` returns the LITERAL on-disk YAML — the divergence is
@@ -20,6 +20,7 @@ import {
 	createSlugDedup,
 	type HeadingMeta,
 	isPlainObject,
+	normalizeHeadingText,
 	type OffsetRange,
 	type ParsedFile,
 	ParseError,
@@ -124,8 +125,8 @@ export function synthesizeOpenApiFile(top: Record<string, unknown>, relpath: str
 		// info preamble + per-operation sections are all indexable as
 		// fragments. `frontmatterEndOffset: 0` lets the scanner's
 		// `buildFragmentRows` slice from offset 0 when (e.g.) there are no
-		// operations — falls into the D31 "headings.length === 0 → one
-		// file row" branch with the synthesized info block as the body.
+		// operations — falls into the "headings.length === 0 → one file
+		// row" branch with the synthesized info block as the body.
 		frontmatterEndOffset: 0,
 		outline,
 		blockIndex: {},
@@ -337,9 +338,9 @@ function buildSynthesizedSource(top: Record<string, unknown>, operations: Operat
 	}
 
 	// Top-level keys outside the dedicated sections reach FTS only through
-	// this catch-all — frontmatter carries them for D30 filters but is
+	// this catch-all — frontmatter carries them for filters but is
 	// excluded from FTS row bodies. The fence routes them through `code`
-	// (D18 weight 0.5). `info` and `paths` flow through `residualForKey`
+	// (BM25 weight 0.5). `info` and `paths` flow through `residualForKey`
 	// so subfields already rendered (preamble + per-op fences) don't
 	// duplicate; `openapi` (version string) and `components` (its own
 	// fence) skip entirely. `null` `leftovers` doubles as the emission
@@ -572,7 +573,7 @@ function stringifyJsonForFence(value: unknown, label: string): FenceContent {
 
 /**
  * Build a single `HeadingMeta` from a precomputed `SynthSection`. The
- * D44 name-based slot scheme (`op[<sha14(method + ' ' + path)>]` for
+ * name-based slot scheme (`op[<sha14(method + ' ' + path)>]` for
  * operations, literal labels like `"components"` for named singletons)
  * is fixed by the section builder; this function just threads the
  * precomputed values into the `HeadingMeta` shape and resolves the
@@ -597,14 +598,18 @@ function buildHeadingMeta(
 	const bodySlice = source.slice(sec.headingLineEnd, sec.rangeEnd);
 	const bodyTokensApprox = estimateTokens(bodySlice);
 
+	// Normalize `pathText` + `headingPath` so they match what
+	// `get_fragment`'s `normalizeHeadingPath` produces from agent input.
+	// `displayText` stays raw — same split the markdown-heading path uses.
+	const pathText = normalizeHeadingText(sec.headingText);
 	return {
 		stable_id: id,
 		structuralPath: sec.structuralSlot,
 		level: 2 as HeadingLevel,
-		pathText: sec.headingText,
+		pathText,
 		displayText: sec.headingText,
 		slug: dedupSlug(sec.baseSlug),
-		headingPath: [sec.headingText],
+		headingPath: [pathText],
 		range: lineRange,
 		selectionRange: headingLineRange,
 		offsetRange,

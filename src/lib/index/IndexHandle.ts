@@ -20,6 +20,7 @@ import { type CompiledFilter, escapeLike, globEscape } from "../filter.js";
 import type { HeadingHistoryRow } from "../fuzzy.js";
 import { INDEX_DIR_NAME, isFsCaseInsensitiveResolved } from "../hiddenPath.js";
 import { transition } from "../index_status.js";
+import { PARSER_SHAPE_VERSION } from "../parsers/version.js";
 import { basenameNoExt, type VaultFileIndex } from "../wikilinks.js";
 
 /** Row shape returned by `stmtGetStatusFields` — shared between `readStatusFields` and `buildStatus`. */
@@ -75,7 +76,7 @@ export interface WikilinkRowInput {
 
 /**
  * File-level token + content-kind aggregates for `get_vault_tree` file
- * items (D35). Computed by the scanner from the parser's per-heading
+ * items. Computed by the scanner from the parser's per-heading
  * data and persisted via the v7 `file_metrics` table; without these,
  * the tree's main budgeting signal would always be zero.
  */
@@ -184,12 +185,12 @@ export interface FileStats {
  * check distinguish "last clean snapshot's policy" from
  * "currently-running process flag."
  *
- * `vaultExtensions` (D47, optional) is the canonical sorted lowercase
+ * `vaultExtensions` (optional) is the canonical sorted lowercase
  * comma-joined form (e.g. `"md,yaml,yml"`). Production callers
  * (`src/index.ts`) produce it once at startup via
  * `[...getVaultExtensions()].sort().join(",")`; tests that bypass that
  * code path omit the field and accept the default `"md"` (matches the
- * pre-D47 cache default — `chooseStartupState` treats NULL or `"md"` as
+ * pre-column cache default — `chooseStartupState` treats NULL or `"md"` as
  * "no mismatch" for default-extension vaults).
  */
 export interface CreateIndexHandleOptions {
@@ -236,10 +237,13 @@ export class IndexHandle implements VaultFileIndex {
 	private readonly stmtGetIncludeHidden: Statement;
 	private readonly stmtGetInflightIncludeHidden: Statement;
 	private readonly stmtSetInflightIncludeHidden: Statement;
+	private readonly stmtGetInflightParserShape: Statement;
+	private readonly stmtSetInflightParserShape: Statement;
 	private readonly stmtGetEverComplete: Statement;
 	private readonly stmtGetVaultExtensions: Statement;
+	private readonly stmtGetParserShapeVersion: Statement;
 	private readonly stmtFinalize: Statement;
-	// D37: single round-trip for `getStatus()`'s two SELECTs
+	// Single round-trip for `getStatus()`'s two SELECTs
 	// (files_indexed + last_scan_finished_at). Used by `getStatus()` and
 	// by `getLastScanFinishedAt()` so there's one source-of-SQL.
 	private readonly stmtGetStatusFields: Statement;
@@ -391,23 +395,31 @@ export class IndexHandle implements VaultFileIndex {
 		this.stmtSetInflightIncludeHidden = db.prepare(
 			"UPDATE index_meta SET inflight_include_hidden = :value WHERE id = 1",
 		);
+		this.stmtGetInflightParserShape = db.prepare("SELECT inflight_parser_shape_version FROM index_meta WHERE id = 1");
+		this.stmtSetInflightParserShape = db.prepare(
+			"UPDATE index_meta SET inflight_parser_shape_version = :value WHERE id = 1",
+		);
 		this.stmtGetEverComplete = db.prepare("SELECT ever_complete FROM index_meta WHERE id = 1");
 		this.stmtGetVaultExtensions = db.prepare("SELECT vault_extensions FROM index_meta WHERE id = 1");
+		this.stmtGetParserShapeVersion = db.prepare("SELECT parser_shape_version FROM index_meta WHERE id = 1");
 		// Single statement so the finalize columns commit atomically.
 		// `inflight_include_hidden = NULL` clears the in-flight marker in
 		// the same UPDATE — a SIGTERM mid-finalize cannot leave the clear
-		// half-done. D47 adds `vault_extensions` to the atomic set so the
+		// half-done. `vault_extensions` is in the atomic set so the
 		// persisted snapshot's extension policy always matches its
-		// `include_hidden`.
+		// `include_hidden`. `parser_shape_version` joins for the
+		// same reason — the persisted stamp always identifies the
+		// parser output shape of the snapshot's contents.
 		this.stmtFinalize = db.prepare(
 			"UPDATE index_meta SET scan_complete = 1, ever_complete = 1, include_hidden = :include_hidden, " +
-				"inflight_include_hidden = NULL, last_scan_finished_at = :last_scan_finished_at, " +
-				"vault_extensions = :vault_extensions WHERE id = 1",
+				"inflight_include_hidden = NULL, inflight_parser_shape_version = NULL, " +
+				"last_scan_finished_at = :last_scan_finished_at, " +
+				"vault_extensions = :vault_extensions, parser_shape_version = :parser_shape_version WHERE id = 1",
 		);
 		// Inline subqueries so the round-trip is one prepared-statement
 		// invocation. `frontmatter` count matches `countFiles()`'s query;
 		// `index_meta` is a single row so the inner SELECT is O(1).
-		// `ever_complete` joined in (D39) so {@link getStatusSnapshot} can
+		// `ever_complete` joined in so {@link getStatusSnapshot} can
 		// surface an atomic combined snapshot — a peer's `markScanFinalized`
 		// writes all three fields in one UPDATE, and reading them via two
 		// separate SELECTs would expose a torn combination that never
@@ -505,9 +517,9 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	/**
-	 * D47 — persisted `VAULT_EXTENSIONS` snapshot (sorted, lowercase,
+	 * Persisted `VAULT_EXTENSIONS` snapshot (sorted, lowercase,
 	 * comma-joined) from the last cleanly-finalized scan. `null` signals
-	 * a fresh DB or pre-D47 upgrade; the next {@link markScanFinalized}
+	 * a fresh DB or pre-column upgrade; the next {@link markScanFinalized}
 	 * writes the running policy. Compared against the current
 	 * `getVaultExtensions()` snapshot at startup to detect flips that
 	 * invalidate row population (e.g. `md` → `md,yaml,yml` adds files
@@ -517,6 +529,21 @@ export class IndexHandle implements VaultFileIndex {
 		const row = this.stmtGetVaultExtensions.get() as { vault_extensions: string | null } | undefined;
 		if (row === undefined || row.vault_extensions === null) return null;
 		return row.vault_extensions;
+	}
+
+	/**
+	 * Persisted parser-output-shape stamp from the last cleanly-
+	 * finalized scan. `null` signals a fresh DB or pre-column upgrade; the
+	 * next {@link markScanFinalized} writes the running
+	 * {@link PARSER_SHAPE_VERSION}. Compared against the in-code constant
+	 * at startup; mismatch forces a cold rescan so previously-indexed
+	 * files pick up new synthesizer output (e.g. AsyncAPI 3.x specs that
+	 * were previously opaque YAML become structured operation fragments).
+	 */
+	getParserShapeVersionPolicy(): number | null {
+		const row = this.stmtGetParserShapeVersion.get() as { parser_shape_version: number | null } | undefined;
+		if (row === undefined || row.parser_shape_version === null) return null;
+		return row.parser_shape_version;
 	}
 
 	/**
@@ -544,6 +571,30 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	/**
+	 * Tri-state read of the IN-FLIGHT scan's {@link PARSER_SHAPE_VERSION}.
+	 * NULL = no scan in progress or last scan finalized cleanly; integer =
+	 * a scan is/was running under that shape. Startup compares this against
+	 * the in-code constant when `scan_complete=0` so a partial rescan
+	 * under a different shape, followed by a revert-restart back to the
+	 * shape the finalized stamp records, surfaces as a mismatch and forces
+	 * cold instead of serving a mixed-shape warm snapshot.
+	 */
+	getInflightParserShape(): number | null {
+		const row = this.stmtGetInflightParserShape.get() as { inflight_parser_shape_version: number | null } | undefined;
+		if (row === undefined || row.inflight_parser_shape_version === null) return null;
+		return row.inflight_parser_shape_version;
+	}
+
+	/**
+	 * Records the parser-output-shape under which the current scan is
+	 * starting. Cleared in {@link markScanFinalized}'s single UPDATE on
+	 * clean finish, atomically with the include-hidden inflight marker.
+	 */
+	setInflightParserShape(value: number): void {
+		this.stmtSetInflightParserShape.run({ value });
+	}
+
+	/**
 	 * Single point of "scan reached full success." Atomically commits
 	 * `scan_complete=1`, `ever_complete=1`,
 	 * `include_hidden=<current policy>`, and `inflight_include_hidden=NULL`
@@ -551,7 +602,7 @@ export class IndexHandle implements VaultFileIndex {
 	 * the last cleanly-finalized snapshot's policy AND the in-flight
 	 * marker is cleared atomically.
 	 *
-	 * Also resets `failedSubtreesPresent` (D40). Merkle-driven finalizes
+	 * Also resets `failedSubtreesPresent`. Merkle-driven finalizes
 	 * did not previously clear this sticky flag, leaving degradation stuck
 	 * `true` until process restart. Both scanner and merkle gate finalize
 	 * on "no failures observed this pass," so clearing here is always
@@ -572,6 +623,7 @@ export class IndexHandle implements VaultFileIndex {
 			include_hidden: this.includeHidden ? 1 : 0,
 			last_scan_finished_at: finishedAt,
 			vault_extensions: this.vaultExtensions,
+			parser_shape_version: PARSER_SHAPE_VERSION,
 		});
 		this.setStatus("warm");
 		this.scanIncomplete = false;
@@ -629,7 +681,7 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	/**
-	 * D39: atomic combined snapshot of `IndexStatus` plus `ever_complete`,
+	 * Atomic combined snapshot of `IndexStatus` plus `ever_complete`,
 	 * read in ONE prepared-statement invocation. Used by `buildServerInfo`
 	 * (`get_server_info`) so a same-policy multi-process peer's atomic
 	 * `markScanFinalized` cannot land between two SELECTs and surface a
@@ -645,7 +697,7 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	/**
-	 * D37: epoch-ms of the most recent {@link markScanFinalized}. NULL when
+	 * Epoch-ms of the most recent {@link markScanFinalized}. NULL when
 	 * never finalized. Surfaced as ISO 8601 via {@link getStatus}; this
 	 * accessor returns the raw ms value for tests that need exact-bounds
 	 * comparisons against `Date.now()`.
@@ -669,7 +721,7 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	/**
-	 * D37: current-scan degradation signals for `_meta.index_status.degraded`
+	 * Current-scan degradation signals for `_meta.index_status.degraded`
 	 * and `get_server_info`. `failedSubtreesPresent` is sticky from end of
 	 * the most recent scan (reset at scanner start), so this reflects the
 	 * CURRENT scan only — historical EACCES is not retained.
@@ -761,7 +813,7 @@ export class IndexHandle implements VaultFileIndex {
 	}
 
 	/**
-	 * D32 retirement-diff per-file commit. Survivors (stable_id present in
+	 * Retirement-diff per-file commit. Survivors (stable_id present in
 	 * the new heading set) skip history; only IDs that disappear from the
 	 * file get a `heading_history` row, which the confidence-gated fuzzy
 	 * resolver later uses to recover cached agent IDs whose slot has moved
@@ -1111,9 +1163,9 @@ LIMIT :pageSize
 			}
 		}
 		if (args.after) applyLinksKeysetCursor(conditions, params, args.after, false);
-		// `ORDER BY id ASC` IS document order (D36): SQLite assigns rowids
+		// `ORDER BY id ASC` IS document order: SQLite assigns rowids
 		// monotonically per insert, scanner inserts wikilinks preamble-first
-		// then headings in source order. The pre-D36 ORDER BY used JSON-lex
+		// then headings in source order. The pre-rename ORDER BY used JSON-lex
 		// of `source_heading_path_json` which had nothing to do with
 		// document position.
 		const sql = `
@@ -1184,7 +1236,7 @@ LIMIT :pageSize
 		const conditions: string[] = [`(${orClauses.join(" OR ")})`];
 		if (args.after) applyLinksKeysetCursor(conditions, params, args.after, true);
 		// `ORDER BY source_file, id` paginates incoming across files
-		// alphabetically and within each file in document order (D36).
+		// alphabetically and within each file in document order.
 		const sql = `
 SELECT id, source_file, source_heading_path_json, source_stable_id, source_anchor_kind, link_ordinal,
        raw_target, is_embed, alias, link_text
@@ -1269,7 +1321,7 @@ const INCOMING_CANDIDATE_CHUNK_SIZE = 200;
 
 /**
  * Lex-compare wikilink rows by the same keyset the per-chunk SQL ORDER
- * BY uses (`source_file ASC, id ASC` per D36). After cross-chunk merging,
+ * BY uses (`source_file ASC, id ASC`). After cross-chunk merging,
  * sort with this comparator and the merged output is byte-for-byte
  * identical to a single-pass query (modulo the page cap).
  */
@@ -1279,7 +1331,7 @@ function compareIncomingKeyset(a: WikilinkRow, b: WikilinkRow): number {
 }
 
 /**
- * Wikilinks keyset cursor on `{source_file?, id}` — D36. SQLite rowids
+ * Wikilinks keyset cursor on `{source_file?, id}`. SQLite rowids
  * are monotonic per insert and scanner inserts wikilinks in document
  * order, so `id` is the document-order key. `includeSourceFile` adds the
  * `source_file` prefix for incoming (paginates across files); outgoing

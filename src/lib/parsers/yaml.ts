@@ -1,9 +1,9 @@
 /**
- * D43 — YAML parser entry point. Routes OpenAPI 3.x specs to
- * `synthesizeOpenApiFile` (D44) and everything else to opaque emission
+ * YAML parser entry point. Routes OpenAPI 3.x specs to
+ * `synthesizeOpenApiFile` and everything else to opaque emission
  * (whole source indexed as one `file`-kind fragment; parsed top-level
- * exposed as `frontmatter` for D30 nested-path filters). Errors flow
- * through `ParseError.yaml(...)` so `parseErrorPayload` (D45) surfaces
+ * exposed as `frontmatter` for nested-path filters). Errors flow
+ * through `ParseError.yaml(...)` so `parseErrorPayload` surfaces
  * them as `YAML_PARSE_ERROR`.
  */
 
@@ -20,6 +20,7 @@ import {
 	ParseError,
 	type ParseFileOptions,
 } from "../parser.js";
+import { detectAsyncApi, synthesizeAsyncApiFile } from "./asyncapi.js";
 import { detectOpenApi, synthesizeOpenApiFile } from "./openapi.js";
 
 export function parseYamlFile(source: string, relpath: string, options: ParseFileOptions = {}): ParsedFile {
@@ -36,11 +37,20 @@ export function parseYamlFile(source: string, relpath: string, options: ParseFil
 		return buildOpaqueFile(source, relpath, frontmatter, hasFrontmatter, /* withBodyPreamble */ false);
 	}
 
-	// D44 — Synthesize OpenAPI 3.x; fall through to opaque emission otherwise
+	// Synthesize OpenAPI 3.x; fall through to opaque emission otherwise
 	// (Swagger 2.x deferred to v1.x; sparse 3.x with no operations + no info
 	// prose returns null so raw YAML stays searchable).
 	if (detectOpenApi(normalized)) {
 		const synthesized = synthesizeOpenApiFile(normalized, relpath);
+		if (synthesized !== null) return synthesized;
+	}
+
+	// Synthesize AsyncAPI 3.x; falls through to opaque emission for 2.x
+	// (nested publish/subscribe under channels is deferred). `top.openapi`
+	// and `top.asyncapi` are mutually exclusive top-level fields, so
+	// detection order is a no-op tie-break.
+	if (detectAsyncApi(normalized)) {
+		const synthesized = synthesizeAsyncApiFile(normalized, relpath);
 		if (synthesized !== null) return synthesized;
 	}
 
@@ -50,7 +60,7 @@ export function parseYamlFile(source: string, relpath: string, options: ParseFil
 /**
  * Build the opaque-YAML `ParsedFile` shape — shared between the
  * `frontmatterOnly` fast path and the non-OpenAPI fallback. Whole source
- * IS the body: `buildFragmentRows` (scanner.ts D31 emission) reads
+ * IS the body: `buildFragmentRows` (scanner.ts) reads
  * `frontmatterEndOffset` to slice the file row's range; offset 0 puts the
  * entire YAML source into the indexable `body`/`code` columns.
  *
