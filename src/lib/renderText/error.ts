@@ -12,7 +12,7 @@ import { formatHeadingPath, formatMeta, joinLines, sanitizePathForProse } from "
 
 // Mirrors VaultError's code-specific optional slots set by the envelope
 // builders in `src/lib/error.ts` (`fileTooLargeEnvelope`,
-// `markdownParseErrorPayload`, etc.) — drift here drops fields silently
+// `parseErrorPayload`, etc.) — drift here drops fields silently
 // since `--prose-only` also suppresses `structuredContent`.
 const SCALAR_ERROR_FIELDS = [
 	"param",

@@ -27,7 +27,7 @@ import { type ParsedFile, ParseError } from "../parser.js";
 import { readNote } from "../readNote.js";
 import { estimateTokens } from "../tokenizer.js";
 import { classifyRelpathPolicy, PathValidationError, type VaultRoot, validatePath } from "../validatePath.js";
-import { isMarkdownPath } from "../vaultExtensions.js";
+import { isParseablePath } from "../vaultExtensions.js";
 import { extractWikilinks } from "../wikilinks.js";
 import { WriteCoordinator } from "../writeCoordinator.js";
 import type {
@@ -342,7 +342,7 @@ async function lstatVanished(rel: string, vaultRoot: VaultRoot): Promise<boolean
  * rejects.
  */
 export async function confirmPrune(rel: string, vaultRoot: VaultRoot, includeHidden: boolean): Promise<boolean> {
-	if (!isMarkdownPath(rel)) return true;
+	if (!isParseablePath(rel)) return true;
 	if (isIndexCachePath(rel)) return true;
 	if (!includeHidden && isHiddenPath(rel)) return true;
 	// Segment-walk via validatePath catches parent-dir symlink swaps and
@@ -484,7 +484,7 @@ async function* walkVault(
 			continue;
 		}
 		if (!entry.isFile()) continue;
-		if (!isMarkdownPath(childRel)) continue;
+		if (!isParseablePath(childRel)) continue;
 		// Cheap path-policy gate (length / %xx / backslash / depth).
 		// Files violating these would be rejected by `validatePath`
 		// from the tool surface — indexing them anyway would expose
@@ -695,7 +695,7 @@ export async function reindexOne(
 	// via re-index — wedging `scan_complete=false`. `vanished` routes
 	// removeFile + clearPendingRetry; the former is a no-op for
 	// never-indexed paths and correct for renamed-to-non-markdown rows.
-	if (!isMarkdownPath(relpath)) return "vanished";
+	if (!isParseablePath(relpath)) return "vanished";
 	return indexOne(vaultRoot, index, relpath, true, includeHidden);
 }
 
@@ -784,6 +784,13 @@ function buildFragmentRows(parsed: ParsedFile): FragmentRowInput[] {
  * scopes its counter per call, and we call it once per source section.
  */
 function buildWikilinkRows(parsed: ParsedFile): WikilinkRowInput[] {
+	// D46 — wikilinks INTO YAML are deferred to v1.x; wikilinks FROM YAML
+	// are also out of scope for v1. YAML files (opaque or OpenAPI-synthesized)
+	// emit zero wikilink rows. Without this gate, `[[X]]` text accidentally
+	// appearing inside a YAML scalar value would be extracted as a wikilink
+	// and persist in the `wikilinks` table, surfacing as a phantom outgoing
+	// link from the YAML's `file` row in `get_links`.
+	if (parsed.kind === "yaml") return [];
 	const out: WikilinkRowInput[] = [];
 
 	const pushExtracted = (

@@ -383,6 +383,11 @@ function buildLinksAndEmbeds(
 	end: number,
 	vaultIndex: VaultFileIndex | undefined,
 ): { outgoing: OutgoingLink[]; embeds: Embed[] } {
+	// D46 — wikilinks FROM YAML are not indexed (`scanner.buildWikilinkRows`
+	// short-circuits at `parsed.kind === "yaml"`); the read-time path must
+	// match or `get_fragment` would surface phantom outgoing/embed rows
+	// from `[[X]]` text appearing inside YAML scalar values.
+	if (parsed.kind === "yaml") return { outgoing: [], embeds: [] };
 	const slice = parsed.source.slice(start, end);
 	const extracted = extractWikilinks({
 		source: slice,

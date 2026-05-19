@@ -18,7 +18,7 @@ import { extname, posix } from "node:path";
 import type { Embed, EmbedKind, OutgoingLink } from "../types.js";
 import { type ExcludedRange, isInsideAny } from "./blockIds.js";
 import { normalizeHeadingText } from "./parser.js";
-import { getVaultExtensions, isAssetPath, isMarkdownPath } from "./vaultExtensions.js";
+import { getVaultExtensions, isAssetPath, isResolvableLinkTarget, YAML_EXTENSIONS } from "./vaultExtensions.js";
 
 // ─── Extraction ────────────────────────────────────────────────────────────
 
@@ -270,7 +270,7 @@ export function resolveSourceRelative(relativeFilePart: string, sourceFile: stri
  * file-content surface rule).
  */
 export function stripMarkdownExt(relpath: string): string {
-	if (!isMarkdownPath(relpath)) return relpath;
+	if (!isResolvableLinkTarget(relpath)) return relpath;
 	return relpath.slice(0, -extname(relpath).length);
 }
 
@@ -368,7 +368,7 @@ function resolveFile(filePart: string, sourceFile: string, vaultIndex: VaultFile
 	if (filePart.startsWith("./") || filePart.startsWith("../")) {
 		const base = resolveSourceRelative(filePart, sourceFile);
 		if (base === null) return { resolved: false, file: "" };
-		if (isMarkdownPath(base)) {
+		if (isResolvableLinkTarget(base)) {
 			const found = vaultIndex.findFileCi(base);
 			if (found !== null) return { resolved: true, file: found };
 		} else if (extname(base) === "") {
@@ -383,7 +383,12 @@ function resolveFile(filePart: string, sourceFile: string, vaultIndex: VaultFile
 	}
 
 	// Phase 1: explicit vault-root relpath (slash or extension present).
-	if (filePart.includes("/") || isMarkdownPath(filePart)) {
+	if (filePart.includes("/") || isResolvableLinkTarget(filePart)) {
+		// D46 — `[[notes/auth.yaml]]` enters via the slash branch even though
+		// `isResolvableLinkTarget` rejects YAML; gate the direct-lookup so a
+		// YAML target is left unresolved (asset path) instead of silently
+		// landing in `wikilinks` as a resolved markdown link.
+		if (isAssetPath(filePart)) return { resolved: false, file: "" };
 		const direct = vaultIndex.findFileCi(filePart);
 		if (direct !== null) return { resolved: true, file: direct };
 		// Extensionless explicit path — try every configured `VAULT_EXTENSIONS`
@@ -412,7 +417,7 @@ function resolveFile(filePart: string, sourceFile: string, vaultIndex: VaultFile
 			// in mixed-extension vaults. Require an exact-extension match
 			// when the link carried one; extensionless inputs
 			// (`[[folder/note]]`) keep matching any configured extension.
-			const explicitExt = isMarkdownPath(filePart) ? extname(filePart).toLowerCase() : null;
+			const explicitExt = isResolvableLinkTarget(filePart) ? extname(filePart).toLowerCase() : null;
 			const bucket = vaultIndex.filesByBasename(baseLower);
 			const matches: string[] = [];
 			for (const cand of bucket) {
@@ -458,12 +463,17 @@ function segmentLength(relpath: string): number {
 }
 
 /**
- * Try `${base}.${ext}` for every configured vault extension; return the
- * first case-insensitive match or `null`. Hardcoding `.md` would leave
- * `[[notes/auth]]` unresolved against `notes/auth.mdx` in mixed-ext vaults.
+ * Try `${base}.${ext}` for every configured vault extension that's a valid
+ * wikilink target (mirrors `isResolvableLinkTarget`: configured AND not
+ * YAML-family). D46 defers wikilinks INTO YAML — without the YAML filter,
+ * `[[notes/auth]]` would silently resolve to `notes/auth.yaml` in vaults
+ * configured with `VAULT_EXTENSIONS=md,yaml,yml` when no markdown match
+ * exists. Hardcoding `.md` instead would miss `notes/auth.mdx` in
+ * mixed-markdown-extension vaults.
  */
 function findFileWithVaultExt(vaultIndex: VaultFileIndex, base: string): string | null {
 	for (const ext of getVaultExtensions()) {
+		if (YAML_EXTENSIONS.has(ext)) continue;
 		const found = vaultIndex.findFileCi(`${base}.${ext}`);
 		if (found !== null) return found;
 	}

@@ -35,7 +35,7 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { getErrnoCode } from "./error.js";
-import { DEFAULT_EXTENSIONS, getVaultExtensions } from "./vaultExtensions.js";
+import { DEFAULT_EXTENSIONS, getSortedVaultExtensions } from "./vaultExtensions.js";
 
 /** Backoff before retrying an unparseable foreign-slot read; absorbs the wx-write race. */
 const UNPARSEABLE_RETRY_DELAY_MS = 25;
@@ -337,7 +337,7 @@ async function statEntry(path: string): Promise<StatResult> {
  */
 export async function acquireServerLock(opts: ServerLockOptions): Promise<ServerLockHandle> {
 	const ourPath = join(opts.indexDir, lockFileNameForPid(process.pid));
-	const ourExts = [...getVaultExtensions()].sort();
+	const ourExts = getSortedVaultExtensions();
 	const payload = `${JSON.stringify({
 		includeHidden: opts.includeHidden,
 		hostname: hostname(),

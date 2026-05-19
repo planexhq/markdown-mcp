@@ -110,10 +110,10 @@ describe("openSqlite", () => {
 		);
 	});
 
-	test("index_meta has scan_complete + ever_complete + include_hidden + inflight_include_hidden + last_scan_finished_at columns", () => {
+	test("index_meta has scan_complete + ever_complete + include_hidden + inflight_include_hidden + last_scan_finished_at + vault_extensions columns", () => {
 		const { db } = open();
 		const cols = (db.prepare("PRAGMA table_info(index_meta)").all() as Array<{ name: string }>).map((c) => c.name);
-		// D37 adds `last_scan_finished_at` via ensureColumn.
+		// D37 adds `last_scan_finished_at`; D47 adds `vault_extensions`.
 		expect(cols.sort()).toEqual([
 			"ever_complete",
 			"id",
@@ -121,6 +121,7 @@ describe("openSqlite", () => {
 			"inflight_include_hidden",
 			"last_scan_finished_at",
 			"scan_complete",
+			"vault_extensions",
 		]);
 	});
 
@@ -149,10 +150,11 @@ describe("openSqlite", () => {
 					"inflight_include_hidden",
 					"last_scan_finished_at",
 					"scan_complete",
+					"vault_extensions",
 				]);
 				const row = opened.db
 					.prepare(
-						"SELECT scan_complete, ever_complete, include_hidden, inflight_include_hidden, last_scan_finished_at FROM index_meta WHERE id = 1",
+						"SELECT scan_complete, ever_complete, include_hidden, inflight_include_hidden, last_scan_finished_at, vault_extensions FROM index_meta WHERE id = 1",
 					)
 					.get() as {
 					scan_complete: number;
@@ -160,6 +162,7 @@ describe("openSqlite", () => {
 					include_hidden: number | null;
 					inflight_include_hidden: number | null;
 					last_scan_finished_at: number | null;
+					vault_extensions: string | null;
 				};
 				expect(row.scan_complete).toBe(1);
 				expect(row.ever_complete).toBe(1);
@@ -168,6 +171,8 @@ describe("openSqlite", () => {
 				// D37: newly-added column starts NULL on legacy DBs until the
 				// first post-upgrade `markScanFinalized` populates it.
 				expect(row.last_scan_finished_at).toBeNull();
+				// D47: same applies to vault_extensions.
+				expect(row.vault_extensions).toBeNull();
 			} finally {
 				closeSqlite(opened.db);
 			}
@@ -215,6 +220,7 @@ describe("runMigrationV1 concurrent same-policy peers", () => {
 						"inflight_include_hidden",
 						"last_scan_finished_at",
 						"scan_complete",
+						"vault_extensions",
 					]);
 				} finally {
 					check.close();

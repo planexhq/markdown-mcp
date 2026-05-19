@@ -59,6 +59,16 @@ export function buildStructuralPath(ancestors: ReadonlyArray<StructuralAncestor>
  * ancestor chain.
  */
 export function stableId(relpath: string, structuralPath: string): string {
-	const hash = createHash("sha1").update(`${relpath}:${structuralPath}`).digest("hex").slice(0, 14);
-	return `h:${hash}`;
+	return `h:${sha1HexN(`${relpath}:${structuralPath}`, 14)}`;
+}
+
+/**
+ * Truncated sha1 hex digest. Shared spine for the three vault hash IDs:
+ * heading `stable_id` (n=14, `h:` prefix, D27), tree-item id (n=14, `t:`
+ * prefix, D25), and OpenAPI operation slot (n=14, embedded in
+ * `structural_path` per D44). `n` is the hex-character length, NOT bytes —
+ * sha1's full output is 40 hex chars / 20 bytes.
+ */
+export function sha1HexN(input: string, n: number): string {
+	return createHash("sha1").update(input).digest("hex").slice(0, n);
 }

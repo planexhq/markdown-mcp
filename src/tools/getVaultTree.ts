@@ -38,9 +38,10 @@ import type { IndexHandle } from "../lib/index/IndexHandle.js";
 import { isIndexWarming } from "../lib/index_status.js";
 import { clampPageSize, MAX_PATH_DEPTH } from "../lib/limits.js";
 import { renderTree } from "../lib/renderText/getVaultTree.js";
+import { sha1HexN } from "../lib/structuralPath.js";
 import { getTokenizerId } from "../lib/tokenizer.js";
 import { PathValidationError, passesPathPolicy, type VaultRoot, validatePath } from "../lib/validatePath.js";
-import { isMarkdownPath } from "../lib/vaultExtensions.js";
+import { getParserKind, isParseablePath } from "../lib/vaultExtensions.js";
 import type { GetVaultTreeInput, GetVaultTreeResult, SafePath, VaultTreeItem } from "../types.js";
 import { routeToolError } from "./routeError.js";
 
@@ -121,7 +122,7 @@ export async function handleGetVaultTree(
 function buildResourceLinks(items: ReadonlyArray<VaultTreeItem>): ExtraContentBlock[] {
 	const blocks: ExtraContentBlock[] = [];
 	for (const item of items) {
-		if (item.type !== "file" || !isMarkdownPath(item.path)) continue;
+		if (item.type !== "file" || !isParseablePath(item.path)) continue;
 		// `note://` reads validate path + stream raw bytes via `readSource`;
 		// index membership is NOT a precondition. Parse-failed, newly-
 		// created (pre-watcher), and EACCES-during-scan markdown files all
@@ -138,7 +139,7 @@ function buildResourceLinks(items: ReadonlyArray<VaultTreeItem>): ExtraContentBl
 			// template's path expansion works as before.
 			uri: `note://${item.path.split("/").map(encodeURIComponent).join("/")}`,
 			name: item.name,
-			mimeType: "text/markdown",
+			mimeType: getParserKind(item.path) === "yaml" ? "application/yaml" : "text/markdown",
 		});
 	}
 	return blocks;
@@ -304,7 +305,7 @@ async function materializeItem(
 	index: IndexHandle | undefined,
 	includeHidden: boolean,
 ): Promise<VaultTreeItem> {
-	const id = `t:${createHash("sha1").update(node.relpath).digest("hex").slice(0, 14)}`;
+	const id = `t:${sha1HexN(node.relpath, 14)}`;
 	const slashIdx = node.relpath.lastIndexOf("/");
 	const name = slashIdx >= 0 ? node.relpath.slice(slashIdx + 1) : node.relpath;
 	const item: VaultTreeItem = {

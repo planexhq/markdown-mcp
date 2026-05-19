@@ -45,7 +45,7 @@ import { type HeadingMeta, headingPathsEqual, normalizeHeadingPath, type ParsedF
 import { assertNotePathPolicy, readNote } from "../lib/readNote.js";
 import { renderLinks } from "../lib/renderText/getLinks.js";
 import { type VaultRoot, validatePath } from "../lib/validatePath.js";
-import { getVaultExtensions } from "../lib/vaultExtensions.js";
+import { getVaultExtensions, YAML_EXTENSIONS } from "../lib/vaultExtensions.js";
 import { resolveWikilink, stripMarkdownExt, type VaultFileIndex } from "../lib/wikilinks.js";
 import type {
 	GetLinksInput,
@@ -660,6 +660,10 @@ function computeIncomingCandidates(targetFile: string): string[] {
 		if (noExt !== suffix && noExt.length > 0) {
 			addPathVariants(out, noExt);
 			for (const ext of getVaultExtensions()) {
+				// D46 — wikilinks INTO YAML are deferred; mirror the
+				// `findFileWithVaultExt` filter so candidates don't include
+				// `notes/auth.yaml` for a markdown target query.
+				if (YAML_EXTENSIONS.has(ext)) continue;
 				const withExt = `${noExt}.${ext}`;
 				if (withExt !== suffix) addPathVariants(out, withExt);
 			}

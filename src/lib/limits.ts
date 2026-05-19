@@ -34,6 +34,13 @@ export const MAX_FILE_BYTES = 10 * 1024 * 1024;
 export const MAX_AST_NODES = 50_000;
 
 /**
+ * Maximum YAML nesting depth (D44). Bounds stack consumption for
+ * pathological inputs independently of the AST node count. Larger inputs
+ * route to `YAML_PARSE_ERROR` with `reason: "ast_node_cap_exceeded"`.
+ */
+export const MAX_YAML_DEPTH = 256;
+
+/**
  * Maximum length of a search `query` string. Inputs beyond this cap
  * return `INVALID_QUERY` with `reason: "too_long"`. Enforced in W3.
  */

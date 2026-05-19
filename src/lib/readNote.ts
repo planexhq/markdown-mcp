@@ -16,8 +16,10 @@
  *   2. `stat` — checks size against `MAX_FILE_BYTES` BEFORE reading bytes
  *      (so a 100 GB file never gets buffered).
  *   3. UTF-8 decode with `fatal: true` — invalid byte sequences surface
- *      as `MARKDOWN_PARSE_ERROR.reason: "encoding_failed"` rather than
- *      replacement characters that would silently corrupt fragments.
+ *      as `MARKDOWN_PARSE_ERROR.reason: "encoding_failed"` for markdown
+ *      files and `YAML_PARSE_ERROR.reason: "encoding_failed"` for YAML
+ *      files (D45 format dispatch) rather than replacement characters
+ *      that would silently corrupt fragments.
  *   4. `parseFile` (in `readNote` only) — propagates {@link ParseError}
  *      for syntax / AST cap. The `note://` resource skips this step so a
  *      parse-only failure doesn't block the literal source it advertises.
@@ -36,7 +38,7 @@ import { isHiddenPath, isIndexCachePath } from "./hiddenPath.js";
 import { MAX_FILE_BYTES } from "./limits.js";
 import { type ParsedFile, ParseError, type ParseFileOptions, parseFile } from "./parser.js";
 import { openNoFollow, PathValidationError } from "./validatePath.js";
-import { isMarkdownPath } from "./vaultExtensions.js";
+import { getParserKind, isParseablePath } from "./vaultExtensions.js";
 
 export interface SourceData {
 	source: string;
@@ -76,7 +78,7 @@ export class FileTooLargeError extends Error {
 }
 
 function assertNotePathString(safePath: SafePath, includeHidden: boolean): void {
-	if (!isMarkdownPath(safePath.relative)) {
+	if (!isParseablePath(safePath.relative)) {
 		throw pathNotFound(`Path is not a markdown note: ${safePath.relative}`);
 	}
 	// Server's own cache dir is rejected regardless of `--include-hidden`.
@@ -182,7 +184,11 @@ export async function readSource(safePath: SafePath, includeHidden = false): Pro
 		try {
 			source = new TextDecoder("utf-8", { fatal: true }).decode(buf);
 		} catch (cause) {
-			throw new ParseError("encoding_failed", `File is not valid UTF-8: ${errorMessage(cause)}`);
+			// `?? "markdown"` is defensive; `assertNotePathString` upstream
+			// guarantees the extension is in `VAULT_EXTENSIONS`, so
+			// `getParserKind` always resolves to a kind in practice.
+			const kind = getParserKind(safePath.relative) ?? "markdown";
+			throw ParseError.forKind(kind, "encoding_failed", `File is not valid UTF-8: ${errorMessage(cause)}`);
 		}
 		return { source, sizeBytes: total };
 	} finally {

@@ -46,8 +46,10 @@ import {
 import { NAMED_ESCAPES } from "./controlChars.js";
 import { errorMessage } from "./error.js";
 import { MAX_AST_NODES } from "./limits.js";
+import { parseYamlFile } from "./parsers/yaml.js";
 import { buildStructuralPath, type StructuralAncestor, stableId } from "./structuralPath.js";
 import { estimateTokens } from "./tokenizer.js";
+import { getParserKind, type ParserKind } from "./vaultExtensions.js";
 
 // ─── Public types ──────────────────────────────────────────────────────────
 
@@ -101,6 +103,15 @@ export interface BlockMeta {
 
 /** Output of `parseFile`. */
 export interface ParsedFile {
+	/**
+	 * D43 — parser-kind discriminator. `"markdown"` for files parsed by
+	 * `parseMarkdownFile` (unified/remark pipeline); `"yaml"` for files
+	 * parsed by `parseYamlFile` (Phase 2; opaque YAML or synthesized
+	 * OpenAPI). Downstream consumers (scanner, tools) read this when
+	 * they need to gate format-specific behavior (e.g., wikilink
+	 * extraction is markdown-only — see D46).
+	 */
+	kind: ParserKind;
 	/** Vault-relative path with forward slashes — same form the stable_id hash consumed. */
 	relpath: string;
 	source: string;
@@ -129,21 +140,62 @@ export interface ParsedFile {
 
 /**
  * Reasons a parse can fail. Routed by the tool handlers to the
- * `MARKDOWN_PARSE_ERROR.reason` enum (Brief — `MARKDOWN_PARSE_ERROR` table
- * + CLAUDE.md "Hard-cap routing").
+ * `MARKDOWN_PARSE_ERROR.reason` / `YAML_PARSE_ERROR.reason` enum (Brief —
+ * `MARKDOWN_PARSE_ERROR` table + CLAUDE.md "Hard-cap routing").
  */
 export type ParseErrorReason = "syntax" | "ast_node_cap_exceeded" | "encoding_failed";
+
+/** D45 — parser-format discriminator on `ParseError`. Routes to the right error code. */
+export type ParseErrorFormat = "markdown" | "yaml";
 
 export class ParseError extends Error {
 	override readonly name = "ParseError";
 	readonly reason: ParseErrorReason;
+	/**
+	 * D45 — `format` selects `MARKDOWN_PARSE_ERROR` vs `YAML_PARSE_ERROR`
+	 * when the error envelope is built. Default `"markdown"` preserves the
+	 * pre-D45 contract for every existing call site that throws without
+	 * specifying a format. `parseYamlFile` (Phase 2) passes `"yaml"`.
+	 */
+	readonly format: ParseErrorFormat;
 	readonly line?: number;
 	readonly column?: number;
-	constructor(reason: ParseErrorReason, message: string, line?: number, column?: number) {
+	constructor(
+		reason: ParseErrorReason,
+		message: string,
+		line?: number,
+		column?: number,
+		format: ParseErrorFormat = "markdown",
+	) {
 		super(message);
 		this.reason = reason;
+		this.format = format;
 		if (line !== undefined) this.line = line;
 		if (column !== undefined) this.column = column;
+	}
+
+	/**
+	 * Convenience factory for YAML-source errors (D45). Drops the positional
+	 * `undefined, undefined, "yaml"` noise at call sites that don't carry
+	 * line/column info.
+	 */
+	static yaml(reason: ParseErrorReason, message: string, opts: { line?: number; column?: number } = {}): ParseError {
+		return new ParseError(reason, message, opts.line, opts.column, "yaml");
+	}
+
+	/**
+	 * Dispatch on `ParserKind` (D43) so callers with a kind in hand don't
+	 * repeat the ternary at every throw site. `ParserKind` is structurally
+	 * identical to `ParseErrorFormat`, so the kind passes through as the
+	 * format arg unchanged.
+	 */
+	static forKind(
+		kind: ParserKind,
+		reason: ParseErrorReason,
+		message: string,
+		opts: { line?: number; column?: number } = {},
+	): ParseError {
+		return new ParseError(reason, message, opts.line, opts.column, kind);
 	}
 }
 
@@ -167,11 +219,37 @@ export interface ParseFileOptions {
 }
 
 /**
- * Parse `source` into a {@link ParsedFile}. `relpath` is the vault-relative
- * path used in the `stable_id` hash input (D27); pass exactly the
- * `SafePath.relative` form so IDs stay stable across calls.
+ * D43 — parser-kind dispatcher. Routes `source` to the right parser based
+ * on `relpath`'s extension. The public signature is unchanged from pre-D43
+ * (all existing call sites — `readNote.ts:204`, scanner, tests — keep
+ * working without edits).
+ *
+ * Routing rules:
+ *   - `getParserKind(relpath) === "markdown"` → {@link parseMarkdownFile}.
+ *   - `getParserKind(relpath) === "yaml"` → {@link parseYamlFile} (D43
+ *     Phase 2 opaque emission; D44 Phase 3 adds OpenAPI synthesis on top).
+ *   - `null` (synthetic test relpaths without an extension) → markdown
+ *     default. Preserves the pre-D43 contract for fixtures that pass
+ *     relpaths like `"scratch"`.
+ *
+ * `relpath` is the vault-relative path used in the `stable_id` hash input
+ * (D27); pass exactly the `SafePath.relative` form so IDs stay stable
+ * across calls.
  */
 export function parseFile(source: string, relpath: string, options: ParseFileOptions = {}): ParsedFile {
+	const kind = getParserKind(relpath);
+	if (kind === "yaml") return parseYamlFile(source, relpath, options);
+	return parseMarkdownFile(source, relpath, options);
+}
+
+/**
+ * Parse `source` as markdown into a {@link ParsedFile}. Internal — callers
+ * outside this module use `parseFile` so D43's dispatcher routes by kind.
+ *
+ * The body is the pre-D43 `parseFile` implementation, unchanged except for
+ * the `kind: "markdown"` stamp on both return paths.
+ */
+function parseMarkdownFile(source: string, relpath: string, options: ParseFileOptions = {}): ParsedFile {
 	if (options.frontmatterOnly) {
 		// Skip remark-parse entirely. `get_metadata` is the only frontmatterOnly
 		// caller and reads only `frontmatter`/`hasFrontmatter`; running the full
@@ -179,6 +257,7 @@ export function parseFile(source: string, relpath: string, options: ParseFileOpt
 		// spurious `ast_node_cap_exceeded` despite us never inspecting the body.
 		const fm = extractFrontmatterFromSource(source);
 		return {
+			kind: "markdown",
 			relpath,
 			source,
 			hasFrontmatter: fm.hasFrontmatter,
@@ -230,6 +309,7 @@ export function parseFile(source: string, relpath: string, options: ParseFileOpt
 	annotateDescendantTokens(outline, headings);
 
 	return {
+		kind: "markdown",
 		relpath,
 		source,
 		hasFrontmatter,
@@ -271,8 +351,12 @@ function extractFrontmatter(tree: Root, source: string): FrontmatterResult {
 	return { hasFrontmatter: true, frontmatter, frontmatterEndOffset: adjusted };
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	// YAML tagged scalars (`!!timestamp` → Date) and class instances are
+	// `typeof "object"` but aren't plain records.
+	const proto = Object.getPrototypeOf(value);
+	return proto === null || proto === Object.prototype;
 }
 
 /**
@@ -299,7 +383,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  *      channels round-trip. Without these, the generic-object branch
  *      strips them — `Object.keys(new Date())` is `[]`.
  */
-function normalizeForJson(v: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
+export function normalizeForJson(v: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
 	if (typeof v === "number") {
 		if (!Number.isFinite(v)) return null;
 		// `yaml.parse("x: -0")` produces JavaScript `-0`; yaml.stringify emits
@@ -308,6 +392,11 @@ function normalizeForJson(v: unknown, seen: WeakSet<object> = new WeakSet()): un
 		// prose and JSON channels diverge on the same key — the same class
 		// guarantee #1 above defends against for `Infinity`/`NaN`.
 		if (Object.is(v, -0)) return 0;
+	}
+	// `JSON.stringify` throws TypeError on BigInt; surface as ParseError here
+	// so callers don't need a separate pre-flight `JSON.stringify` pass.
+	if (typeof v === "bigint") {
+		throw new ParseError("syntax", "YAML frontmatter contains a BigInt value (not JSON-serializable)");
 	}
 	if (v === null || typeof v !== "object") return v;
 	// Tagged YAML scalars — handle BEFORE cycle tracking. A YAML alias
@@ -347,19 +436,15 @@ function normalizeForJson(v: unknown, seen: WeakSet<object> = new WeakSet()): un
 }
 
 /**
- * Parse a YAML body and gate it through JSON.stringify. `parseYAML` admits
- * circular structures (self-referential aliases like `a: &a [*a]`) and
- * BigInts (large ints) — both throw at MCP envelope-encode time, so we
- * route them as MARKDOWN_PARSE_ERROR with a useful line rather than letting
- * an INTERNAL_ERROR leak. Non-object top-level (scalar/array) collapses to
- * `{}` per Brief — frontmatter is always Record<string, unknown>.
+ * Wrap a frontmatter pipeline stage so non-ParseError throws become
+ * `MARKDOWN_PARSE_ERROR("syntax")` with `${label}: ${cause.message}` and a
+ * useful `errorLine`. Existing ParseErrors pass through unchanged so a
+ * downstream stage doesn't clobber an upstream stage's reason/line.
  */
 function wrapParseStage<T>(label: string, errorLine: number, fn: () => T): T {
 	try {
 		return fn();
 	} catch (cause) {
-		// `normalizeForJson`'s cyclic-detection throws `ParseError` already;
-		// don't double-wrap or its `reason`/line gets clobbered.
 		if (cause instanceof ParseError) throw cause;
 		throw new ParseError("syntax", `${label}: ${errorMessage(cause)}`, errorLine);
 	}
@@ -367,7 +452,9 @@ function wrapParseStage<T>(label: string, errorLine: number, fn: () => T): T {
 
 function parseFrontmatterYaml(yamlBody: string, errorLine = 1): Record<string, unknown> {
 	const parsed = wrapParseStage("YAML frontmatter parse failed", errorLine, () => parseYAML(yamlBody));
-	wrapParseStage("YAML frontmatter is not JSON-serializable", errorLine, () => JSON.stringify(parsed));
+	// `normalizeForJson` itself throws `ParseError` on cycles AND on BigInt
+	// values; a separate `JSON.stringify` pre-flight would walk the tree
+	// twice for the same result.
 	const normalized = wrapParseStage("YAML frontmatter normalization failed", errorLine, () => normalizeForJson(parsed));
 	return isPlainObject(normalized) ? normalized : {};
 }
@@ -442,14 +529,7 @@ function buildHeadingMetas(tree: Root, source: string, relpath: string): Heading
 	// dedicated sentinel for the virtual root.
 	const rootCounts = new Map<HeadingLevel, number>();
 	const childCounts = new WeakMap<StackFrame, Map<HeadingLevel, number>>();
-	// Per-document slug dedup state (github-slugger algorithm). `slugSeen`
-	// holds every emitted slug; `slugCounters` carries the last `-N` suffix
-	// per base so a third duplicate doesn't restart at `-1`. Looping until
-	// unique handles the literal-collision edge case where a heading text
-	// already happens to be `Foo-1` (so the second `Foo` must skip past the
-	// literal `foo-1` to `foo-2`).
-	const slugSeen = new Set<string>();
-	const slugCounters = new Map<string, number>();
+	const dedupSlug = createSlugDedup();
 
 	for (const child of tree.children) {
 		if (child.type !== "heading") continue;
@@ -499,7 +579,7 @@ function buildHeadingMetas(tree: Root, source: string, relpath: string): Heading
 			level,
 			pathText,
 			displayText,
-			slug: uniqueSlug(githubSlug(stripped), slugSeen, slugCounters),
+			slug: dedupSlug(githubSlug(stripped)),
 			headingPath,
 			range: {
 				start: heading.position?.start.line ?? 1,
@@ -836,7 +916,7 @@ function annotateHeadingBlockIds(headings: HeadingMeta[], blocks: BlockMeta[]): 
 
 // ─── Outline tree ─────────────────────────────────────────────────────────
 
-function buildOutlineTree(headings: HeadingMeta[]): OutlineNode[] {
+export function buildOutlineTree(headings: ReadonlyArray<HeadingMeta>): OutlineNode[] {
 	const out: OutlineNode[] = [];
 	const nodeStack: OutlineNode[] = [];
 	const levelStack: HeadingLevel[] = [];
@@ -876,7 +956,7 @@ function buildOutlineTree(headings: HeadingMeta[]): OutlineNode[] {
 	return out;
 }
 
-function annotateDescendantTokens(outline: OutlineNode[], headings: HeadingMeta[]): void {
+export function annotateDescendantTokens(outline: OutlineNode[], headings: ReadonlyArray<HeadingMeta>): void {
 	const metaByStableId = new Map<string, HeadingMeta>();
 	for (const h of headings) metaByStableId.set(h.stable_id, h);
 	function recurse(node: OutlineNode): number {
@@ -1066,19 +1146,31 @@ export function fileBodyStartOffset(parsed: ParsedFile): number {
 	);
 }
 
-function uniqueSlug(base: string, seen: Set<string>, counters: Map<string, number>): string {
-	let slug = base;
-	let count = counters.get(base) ?? 0;
-	while (seen.has(slug)) {
-		count++;
-		slug = `${base}-${count}`;
-	}
-	seen.add(slug);
-	counters.set(base, count);
-	return slug;
+/**
+ * Per-document slug deduper (github-slugger algorithm). The returned
+ * function maps each `base` to a slug unique within this document; first
+ * occurrence returns `base`, subsequent ones append `-N`. The `while`
+ * loop handles literal collisions where `${base}-N` itself collides
+ * with an unrelated heading's text-derived slug (e.g. `# Foo`, `# Foo-1`,
+ * `# Foo` → `foo`, `foo-1`, `foo-2`).
+ */
+export function createSlugDedup(): (base: string) => string {
+	const seen = new Set<string>();
+	const counters = new Map<string, number>();
+	return (base) => {
+		let slug = base;
+		let count = counters.get(base) ?? 0;
+		while (seen.has(slug)) {
+			count++;
+			slug = `${base}-${count}`;
+		}
+		seen.add(slug);
+		counters.set(base, count);
+		return slug;
+	};
 }
 
-function countLines(source: string): number {
+export function countLines(source: string): number {
 	// CommonMark §2.3 line endings: each `\n`, bare `\r`, or `\r\n` pair
 	// counts once. Outline ranges (preamble.range, last-heading EOF line)
 	// and pushRange's blockquote walk-back rely on this EOL surface — the

@@ -23,6 +23,7 @@ export type ErrorCode =
 	| "HEADING_AMBIGUOUS"
 	| "PATH_OUTSIDE_VAULT"
 	| "MARKDOWN_PARSE_ERROR"
+	| "YAML_PARSE_ERROR"
 	| "FILTER_SYNTAX_ERROR"
 	| "INVALID_QUERY"
 	| "CURSOR_INVALID"
@@ -575,7 +576,12 @@ export interface GetLinksResult {
 
 export interface NoteResourceContent {
 	uri: string;
-	mimeType: "text/markdown";
+	/**
+	 * `text/markdown` for `.md` / `.markdown` / `.mdx` files;
+	 * `application/yaml` for `.yaml` / `.yml` (D44 / D46). Resource handlers
+	 * pick the right value via `getParserKind(safe.relative)`.
+	 */
+	mimeType: "text/markdown" | "application/yaml";
 	text: string;
 }
 

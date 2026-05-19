@@ -13,8 +13,8 @@ import {
 	errorMessage,
 	fileTooLargeEnvelope,
 	internalErrorEnvelope,
-	markdownParseErrorEnvelope,
 	newMeta,
+	parseErrorEnvelope,
 	type ToolErrorEnvelope,
 	toolErrorEnvelope,
 	vaultError,
@@ -39,7 +39,7 @@ export function routeToolError(err: unknown, toolName: string, meta?: MetaEnvelo
 	const baseMeta = meta ?? newMeta();
 	if (err instanceof PathValidationError) return toolErrorEnvelope(err.payload, baseMeta);
 	if (err instanceof FileTooLargeError) return fileTooLargeEnvelope("file", err.actualBytes, baseMeta);
-	if (err instanceof ParseError) return markdownParseErrorEnvelope(err, "file", baseMeta);
+	if (err instanceof ParseError) return parseErrorEnvelope(err, "file", baseMeta);
 	if (err instanceof FilterSyntaxError) {
 		const payload = vaultError("FILTER_SYNTAX_ERROR", err.message, {
 			param: err.param,

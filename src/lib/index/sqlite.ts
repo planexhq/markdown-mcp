@@ -207,6 +207,15 @@ export function runMigrationV1(db: DatabaseType): void {
 		// as ISO 8601. Nullable: pre-D36 caches and never-finalized indices
 		// read as NULL, which the formatter renders as field-omitted.
 		ensureColumn(db, "index_meta", "last_scan_finished_at", "INTEGER");
+		// D47 — sorted lowercase comma-joined extension list of the last
+		// cleanly-finalized scan. Compared against the running
+		// `VAULT_EXTENSIONS` snapshot at startup; mismatch forces a cold
+		// rescan (parallel to D27's `include_hidden` policy mismatch).
+		// Pre-D47 caches: NULL → mismatch when args differ from default
+		// `md`, so an upgrader switching `VAULT_EXTENSIONS=md,yaml,yml`
+		// gets a forced cold rescan that indexes the previously-skipped
+		// YAML files.
+		ensureColumn(db, "index_meta", "vault_extensions", "TEXT");
 	}).immediate();
 }
 

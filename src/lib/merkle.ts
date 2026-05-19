@@ -24,7 +24,7 @@ import { isHiddenName, isIndexCachePath } from "./hiddenPath.js";
 import type { IndexHandle } from "./index/IndexHandle.js";
 import { confirmAndPrune, confirmPrune, type IndexOutcome } from "./index/scanner.js";
 import { passesPathPolicy, type VaultRoot } from "./validatePath.js";
-import { isMarkdownPath } from "./vaultExtensions.js";
+import { isParseablePath } from "./vaultExtensions.js";
 import type { WriteCoordinator } from "./writeCoordinator.js";
 
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
@@ -380,7 +380,7 @@ async function* walkVaultMarkdown(
 			continue;
 		}
 		if (!entry.isFile()) continue;
-		if (!isMarkdownPath(childRel)) continue;
+		if (!isParseablePath(childRel)) continue;
 		// Skip non-addressable paths so reindex doesn't trip parse_failed
 		// every tick and wedge scan_complete=false.
 		if (!passesPathPolicy(childRel)) continue;
