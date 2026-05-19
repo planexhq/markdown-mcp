@@ -4,6 +4,40 @@ All notable changes to markdown-mcp are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-05-19
+
+Structured OpenAPI 3.x + opaque YAML support (D43–D47). YAML files join markdown on the parseable surface when admitted via `VAULT_EXTENSIONS`.
+
+### Added
+
+- **OpenAPI 3.x synthesis** (D44). When a YAML file's top-level matches `openapi: "3.*"`, the parser emits one `HeadingMeta` per `paths.<path>.<method>` operation. `stable_id` is derived from `sha8(method + " " + path)` — name-based, so sibling reorder doesn't retire IDs. `get_file_outline` returns one node per operation (`GET /pets`); `get_fragment` returns a synthesized prose rendering (summary, description, parameter prose, plus a compact JSON fence of the full operation object, capped at 64 KiB). On truncation the fence language drops to `text` so agents calling `JSON.parse` on the fragment body don't fail on a partial payload.
+- **Opaque YAML emission** (D43). Non-OpenAPI YAML (Swagger 2.x, generic configs, etc.) indexes opaquely: whole source searchable, parsed top-level exposed as `frontmatter` so nested-path filters (`fields["info.version"].eq`) work via D30. `get_metadata` returns the whole top-level object.
+- **`YAML_PARSE_ERROR`** (D45). New error code discriminated on `ParseError.format`. Same `reason` set as `MARKDOWN_PARSE_ERROR`: `"syntax" | "ast_node_cap_exceeded" | "encoding_failed"`. Pathological-depth input that overflows the V8 stack (`RangeError`) is reclassified to `ast_node_cap_exceeded` at both the `parseYAML` and `normalizeForJson` layers — user-facing error code stays consistent with the explicit cap walker.
+- **`note://` for YAML** (D44). `note://api/petstore.yaml` returns the literal on-disk YAML with `mimeType: application/yaml`. The Resource still preserves on-disk bytes verbatim, so agents calling the Resource see spec truth; `get_fragment` returns the synthesized prose rendering.
+- **`VAULT_EXTENSIONS=md,yaml,yml`** (D46). The extension predicate now admits YAML alongside markdown. Single source of truth: `isParseablePath` gates scanner walk / watcher / `note://` / direct-read tools; the parallel `isResolvableLinkTarget` predicate (excludes YAML) gates `[[wikilink]]` resolution.
+
+### Changed
+
+- **`VAULT_EXTENSIONS` change forces a one-time cold rescan** (D47). The value is persisted in `index_meta.vault_extensions`; startup compares running vs persisted and triggers a full re-walk on mismatch. Pre-D47 caches coerce `NULL → "md"` for the upgrade path. Per-machine cost is bounded by the existing first-cold-scan budget (~5 s for 1K files, ~30 s for 10K).
+- **Hard caps cover YAML symmetrically**. `MAX_AST_NODES = 50K` and `MAX_FILE_BYTES = 10 MB` apply to markdown and YAML inputs alike (`YAML_PARSE_ERROR.reason = "ast_node_cap_exceeded"` / `FILE_TOO_LARGE`).
+
+### Deferred (D48)
+
+Follow-ups surfaced during the D43–D47 review iterations, scoped for v1.x:
+
+- Fold `enforceNodeCap` into `normalizeForJson` (single tree walk).
+- `computePolicyMismatch` 5 SELECTs → 1 (mirror of D39's `getStatusSnapshot`).
+- `stringifyOperationJson` lazy / index-time vs tool-time split.
+- Shared `lineTable` module between `openapi.ts` and `parser.ts`.
+- Opaque YAML body-weight asymmetry (currently routed through `body` at BM25 weight 2.0).
+
+### Out of scope (later)
+
+- **Wikilinks INTO YAML.** `[[petstore]]` does not resolve to `petstore.yaml` — admitting YAML to the resolver requires basename-collision rules between `foo.md` and `foo.yaml`.
+- **OpenAPI 2.x (Swagger) synthesis.** Falls through to opaque YAML emission.
+- **`$ref` dereferencing.** Opaque text indexing covers basic search.
+- **`[[spec.yaml#paths./users/get]]`** OpenAPI fragment refs in wikilinks.
+
 ## [1.0.0] — 2026-05-18
 
 Initial release. Seven tools + one resource, MCP spec **2025-06-18**, stdio transport, single-vault per process, read-only.
@@ -69,4 +103,5 @@ Internal algorithm IDs that ship with v1.0.0:
 
 Algorithm IDs are versioned in `_meta`; behavior changes bump the id rather than mutating under the old name.
 
+[1.1.0]: https://github.com/planexhq/markdown-mcp/releases/tag/v1.1.0
 [1.0.0]: https://github.com/planexhq/markdown-mcp/releases/tag/v1.0.0

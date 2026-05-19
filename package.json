@@ -1,6 +1,6 @@
 {
   "name": "markdown-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MCP server giving AI agents structured, addressable access to a local markdown vault (Obsidian, Foam, plain folder).",
   "license": "MIT",
   "type": "module",

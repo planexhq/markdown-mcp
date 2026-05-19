@@ -21,6 +21,7 @@ import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { MAX_PATH_LENGTH, MIN_PROTOCOL_VERSION } from "../src/lib/limits.js";
+import { PACKAGE_VERSION } from "../src/lib/version.js";
 import type { ErrorCode, MetaEnvelope, PathRejectionReason, VaultError } from "../src/types.js";
 import type { TestClient } from "./helpers/mcp-client.js";
 import { SERVER_BIN, spawnTestServer } from "./helpers/mcp-client.js";
@@ -121,7 +122,7 @@ describe("Initialize handshake", () => {
 	test("server reports name + version", () => {
 		const info = connection.client.getServerVersion();
 		expect(info?.name).toBe("markdown-mcp");
-		expect(info?.version).toBe("1.0.0");
+		expect(info?.version).toBe(PACKAGE_VERSION);
 	});
 
 	test("server advertises tools + resources capabilities", () => {
