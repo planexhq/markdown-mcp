@@ -75,6 +75,98 @@ npm run build
 node dist/index.js --vault /path/to/your/vault
 ```
 
+## Docker
+
+Run `markdown-mcp` as an HTTP daemon in a container. The image is multi-stage (Debian-slim base, ~410 MB; the bulk is Node 22's runtime + `better-sqlite3`'s compiled native binary) and runs as the non-root `node` user (UID 1000).
+
+### Quick start — HTTP daemon (Linux)
+
+```bash
+git clone https://github.com/planexhq/markdown-mcp.git
+cd markdown-mcp
+docker build -t markdown-mcp .
+
+export MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+export VAULT_PATH=/absolute/path/to/your/vault
+sudo chown -R 1000:1000 "$VAULT_PATH"   # see "Vault mount + permissions"
+docker compose up -d
+```
+
+The server is reachable at `http://127.0.0.1:3000/mcp` with `Authorization: Bearer $MCP_AUTH_TOKEN`. Verify the initialize handshake:
+
+```bash
+curl -s -X POST http://127.0.0.1:3000/mcp \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"smoke","version":"0"},"capabilities":{}}}'
+```
+
+### Platform notes
+
+- **Linux**: `network_mode: host` makes the container share the host's loopback. `--bind 127.0.0.1` inside the container = `127.0.0.1` on the host.
+- **macOS / Windows (Docker Desktop)**: host networking routes through a Linux VM, so `127.0.0.1` inside the container is the VM's loopback — *not* the host's. The HTTP daemon won't be reachable from host applications until a future network-bind ADR pairs `0.0.0.0` binds with mandatory auth + rate limiting. Today: use **stdio mode** (below) or run on Linux.
+
+### Environment
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `MCP_AUTH_TOKEN` | Bearer auth (HTTP only). Constant-time compare. | unset = no auth |
+| `MCP_HTTP_SESSION_IDLE_MS` | Idle-session reclaim threshold | 1 800 000 (30 min) |
+| `MCP_HTTP_SESSION_SWEEP_MS` | Idle-session sweep interval | 60 000 (60 s) |
+| `VAULT_EXTENSIONS` | Comma-separated indexable extensions | `md` |
+| `VAULT_TOKENIZER` | Token estimator backend | `heuristic/content-aware-v1` |
+
+### Vault mount + permissions
+
+The container writes a `.markdown-mcp/` cache directory (lockfile + SQLite + WAL/SHM) inside the mounted vault. The `node` user (UID 1000) needs write access. Two options:
+
+```bash
+# Option A — chown the vault on the host (persistent deployments;
+# works for both compose and ad-hoc docker run)
+sudo chown -R 1000:1000 /absolute/path/to/your/vault
+```
+
+```yaml
+# Option B — override the container user (development convenience).
+# In compose.yaml (HTTP daemon):
+services:
+  markdown-mcp:
+    user: "${UID:-1000}:${GID:-1000}"
+```
+
+Then `UID=$(id -u) GID=$(id -g) docker compose up -d`. For ad-hoc stdio launches, pass `--user` to `docker run -i` (the `-i` keeps stdin open so JSON-RPC framing survives; without it the server exits immediately on `STDIN_EOF`):
+
+```bash
+docker run -i --rm --user "$(id -u):$(id -g)" \
+  -v /absolute/path/to/vault:/vault \
+  markdown-mcp --vault /vault
+```
+
+Arguments after the image name **replace** the Dockerfile's CMD (Docker semantics). The stdio example above intentionally drops `--transport http`; stdio is the CLI default.
+
+### Stdio mode (MCP client launches the container)
+
+The same image supports stdio. Point your MCP host at `docker run` instead of `node`:
+
+```json
+{
+  "mcpServers": {
+    "vault": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "/absolute/path/to/vault:/vault",
+        "markdown-mcp",
+        "--vault", "/vault"
+      ]
+    }
+  }
+}
+```
+
+`-i` keeps stdin open (required for JSON-RPC framing). Do *not* pass `-t` — a TTY corrupts the JSON-RPC frame stream.
+
 ## Connect from an MCP host
 
 Tested with Claude Desktop, Claude Code, Cursor, and Windsurf. Any MCP-compatible host that speaks stdio + protocol `2025-06-18` works.

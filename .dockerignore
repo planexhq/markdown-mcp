@@ -1,0 +1,10 @@
+# Allowlist: only files the Dockerfile COPYs end up in build context.
+# Prevents local files (.npmrc with registry creds, .mcp.json, scratch
+# data, future additions) from leaking to remote / legacy builders.
+*
+
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**

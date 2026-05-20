@@ -1,0 +1,38 @@
+# HTTP daemon: `docker compose up -d`. Linux-only out of the box —
+# `network_mode: host` is the only reliable way to expose loopback-bound
+# HTTP from inside a container under v1's localhost-only constraint
+# (the server rejects `--bind 0.0.0.0` at startup). macOS/Windows
+# operators: see README "Docker > Platform notes".
+services:
+  markdown-mcp:
+    build: .
+    # Without this, Compose auto-tags differently and ignores any
+    # `markdown-mcp` image built via the README's `docker build`.
+    image: markdown-mcp
+    # Port publishing (`ports:`) would require `--bind 0.0.0.0` inside the
+    # container, which exits 2 at parse. Host networking is the workaround.
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # `:?` forces MCP_AUTH_TOKEN to be set (compose errors out with a
+      # clear message otherwise) — refuses to silently deploy a no-auth
+      # HTTP server. Pair with `openssl rand -hex 32` for a fresh token.
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN required for HTTP deployment}
+      # Optional tunables — uncomment + override as needed. Defaults are
+      # documented in README "Docker > Environment".
+      # MCP_HTTP_SESSION_IDLE_MS: "1800000"
+      # MCP_HTTP_SESSION_SWEEP_MS: "60000"
+      # VAULT_EXTENSIONS: "md,yaml,yml"
+      # VAULT_TOKENIZER: "heuristic/content-aware-v1"
+    volumes:
+      # Long syntax with `create_host_path: false` so a missing or
+      # typo'd VAULT_PATH errors at `docker compose up` instead of
+      # Compose silently creating an empty root-owned directory that
+      # the daemon then indexes as the (wrong) vault.
+      - type: bind
+        source: ${VAULT_PATH:?VAULT_PATH required (absolute path to vault on host)}
+        target: /vault
+        bind:
+          create_host_path: false
+    # Inherits CMD from Dockerfile (--vault /vault --transport http);
+    # --bind 127.0.0.1 and --port 3000 are server defaults.
