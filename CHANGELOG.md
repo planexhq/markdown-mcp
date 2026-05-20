@@ -4,6 +4,37 @@ All notable changes to markdown-mcp are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+HTTP transport support. Adds Streamable HTTP (MCP spec 2025-06-18+) as an opt-in alongside the existing stdio default — one process can now serve multiple concurrent agent sessions sharing one warm index. Bind is loopback-only; non-loopback addresses are rejected at startup. Optional bearer auth via `MCP_AUTH_TOKEN` for defense-in-depth on shared dev hosts. The stdio path is byte-identical to 1.1.0; no existing setup needs to change.
+
+### Added
+
+- **`--transport <stdio|http>`**. Stdio is the default; HTTP opts in via `--transport http`. Under HTTP, `--port <n>` (default `3000`; use `0` for OS-assigned) and `--bind <addr>` (default `127.0.0.1`; loopback only) control the listener. Multiple concurrent sessions share one `IndexHandle` + `InflightTracker`; each session gets its own per-session `McpServer` because the SDK's `Server.connect` takes ownership of a transport and one McpServer can't multiplex.
+- **`MCP_AUTH_TOKEN` env var**. When set, every HTTP request must carry `Authorization: Bearer <token>`. Constant-time compare via `crypto.timingSafeEqual` over `sha256` hashes (fixed-length inputs prevent length-leak via timing). Missing or mismatched → 401 JSON-RPC error body. Unset → no auth (loopback-trust model, matching stdio). Stdio is unaffected. Read once at startup; restart to rotate.
+- **`get_server_info.server.transport`**. New field on `ServerIdentity`: `"stdio" | "http"`. HTTP additionally populates `bind_address` (the loopback address bound) and `port` (the **resolved** port — `--port 0` reports the OS-assigned value). Lets agents self-verify which channel they reached over before making transport-specific decisions.
+- **`createServerContext` + `createMcpServerForSession`**. `src/server.ts` factored: `createServerContext(vaultRoot, index, config)` builds the shared `ServerContext` (one InflightTracker, hashed `rootHash`, `serverInfoContextBase` with transport metadata) reused across sessions; `createMcpServerForSession(context)` returns one `McpServer` with a fresh per-session `negotiatedProtocolVersion` closure. `createServer` retained as a thin backward-compat wrapper — stdio path unchanged.
+- **`wireInflight(transport, inflight)` helper** (`src/lib/inflightTracker.ts`). Extracted from the inline stdio wiring at `src/index.ts:653–663`. Same contract: increment on inbound request, decrement after `transport.send` fully resolves. HTTP wires it per session; stdio wires it once.
+- **`src/lib/httpTransport.ts`** (~350 LoC). Owns `node:http.Server`, the `Map<sessionId, {transport, mcpServer}>`, the `/mcp` POST/GET/DELETE router, body reader (64 KiB cap → 413), optional bearer-token check. Per-session `StreamableHTTPServerTransport` constructed with `enableDnsRebindingProtection: true` + `allowedHosts`/`allowedOrigins` covering the four loopback Host forms (built after `httpServer.listen()` resolves, so `--port 0` allowlist matches the OS-assigned port).
+- **HTTP integration test suite** (`test/integration/http-transport.test.ts`). End-to-end: transport identity in `get_server_info`, multi-session concurrent clients, bearer auth ladder (no token / wrong token / right token), SIGTERM clean drain. New `test/helpers/mcp-http-client.ts` mirrors the stdio harness.
+
+### Changed
+
+- **D22's "HTTP+SSE deferred to a future major" clause is superseded.** D22's stdio default + `2025-06-18` protocol floor remain authoritative.
+- **THREAT_MODEL V7 reactivated** (was deferred). Mitigations: localhost-only bind enforced at CLI parse, SDK DNS-rebinding protection + allowedHosts/allowedOrigins, optional bearer token. Residual: any local process on the same host can reach `127.0.0.1:<port>` — same model as `redis-server` default, `sqlite3 :memory:`, `chromedriver`. Operators on shared hosts should set `MCP_AUTH_TOKEN`.
+- **Brief lines 763 / 930 / 1045 amended** to reflect dual-transport. Concurrency model now distinguishes stdio (one client) from HTTP (multiple sessions, same trusted local user).
+- **`tearDownAndExit` extended** with `await httpHandle?.close()` between phase 1 (inflight drain) and phase 2 (producer stop). The HTTP handle closes idle keep-alive sockets, tears down per-session McpServer + transport (which terminates SSE streams), then awaits `httpServer.close`. InflightTracker remains the drain authority — `StreamableHTTPServerTransport.close()` does NOT drain on its own.
+
+### Out of scope (deferred)
+
+- **`--bind 0.0.0.0` / non-loopback binds.** Needs V7 rewrite + multi-tenant identity + rate limiting + TLS.
+- **OAuth / mTLS / JWT auth.** Bearer is the v1 surface.
+- **Per-session policy override** (e.g. one session `include_hidden: true`, another `false`). v1 inherits process-wide policy.
+- **Web Standard transport** (`Request`/`Response` shape for Cloudflare Workers / Deno / Bun). Project is Node-only.
+- **Lockfile transport-mode schema extension.** Same-vault same-port HTTP collisions are caught by `EADDRINUSE`; document as "don't do that."
+- **Session ID in `_meta`.** Stderr `session opened` / `session closed` log lines suffice for v1.
+- **HTTP transport resumability** (SDK's `EventStore` option). Defer until long-running-request + flaky-connection scenarios materialize.
+
 ## [1.1.0] — 2026-05-19
 
 Structured OpenAPI 3.x + opaque YAML support (D43–D47). YAML files join markdown on the parseable surface when admitted via `VAULT_EXTENSIONS`.

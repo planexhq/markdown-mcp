@@ -53,6 +53,28 @@ export const MAX_QUERY_LENGTH = 1024;
  */
 export const MIN_PROTOCOL_VERSION = "2025-06-18";
 
+/**
+ * Shared error message for clients requesting a protocol version below
+ * {@link MIN_PROTOCOL_VERSION}. Used by the McpServer initialize handler
+ * (stdio path) AND the HTTP router's pre-validate gate so both surfaces
+ * produce byte-identical diagnostics. `requested` is `unknown` because
+ * the stdio handler reads it from a Zod-parsed request while the HTTP
+ * path reads it from a raw JSON body; non-string values render as
+ * `"(missing)"` so the message stays readable.
+ */
+export function formatProtocolVersionTooOldMessage(requested: unknown): string {
+	const display = typeof requested === "string" ? requested : "(missing)";
+	return `markdown-mcp requires MCP protocol version ${MIN_PROTOCOL_VERSION} or newer; client requested ${display}.`;
+}
+
+/**
+ * Maximum accepted HTTP request body size for the Streamable HTTP
+ * transport. The largest realistic MCP payload is a `search` call with
+ * deep `filters` JSON — comfortably under 64 KiB. Anything larger is
+ * almost certainly malformed; the transport returns 413 Payload Too Large.
+ */
+export const MAX_HTTP_BODY_BYTES = 64 * 1024;
+
 /** Default `pageSize` when client omits it. Brief line 1060 + D26. */
 export const DEFAULT_PAGE_SIZE = 50;
 
