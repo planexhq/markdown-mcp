@@ -24,7 +24,7 @@ import {
 import { errorMessage, internalErrorEnvelope, parseErrorPayload, vaultError } from "./lib/error.js";
 import type { IndexHandle } from "./lib/index/IndexHandle.js";
 import { createInflightTracker, type InflightTracker } from "./lib/inflightTracker.js";
-import { MIN_PROTOCOL_VERSION } from "./lib/limits.js";
+import { formatProtocolVersionTooOldMessage, MIN_PROTOCOL_VERSION } from "./lib/limits.js";
 import { ParseError } from "./lib/parser.js";
 import { FileTooLargeError, readSource } from "./lib/readNote.js";
 import { hashVaultRoot } from "./lib/serverInfo.js";
@@ -48,7 +48,7 @@ import { handleGetMetadata } from "./tools/getMetadata.js";
 import { handleGetServerInfo, type ServerInfoContext } from "./tools/getServerInfo.js";
 import { handleGetVaultTree } from "./tools/getVaultTree.js";
 import { handleSearch } from "./tools/search.js";
-import type { ErrorCode as VaultErrorCode } from "./types.js";
+import type { TransportKind, ErrorCode as VaultErrorCode } from "./types.js";
 
 /**
  * Server name + version reported in the MCP `initialize` handshake AND
@@ -78,9 +78,42 @@ const INSTRUCTIONS =
  * all-or-nothing per CLAUDE.md's "Hidden files: all-or-nothing per-server"
  * gotcha. The watcher and scanner receive the same flag separately at
  * startup; both sides must agree or surfaces drift apart.
+ *
+ * `transport`, `bindAddress`, `port` carry the live transport identity
+ * for `get_server_info`. Stdio populates only `transport`; HTTP populates
+ * all three.
  */
 export interface ServerConfig {
 	includeHidden?: boolean;
+	transport?: TransportKind;
+	bindAddress?: string;
+	port?: number;
+}
+
+/**
+ * Shared state for one server process. Holds the single InflightTracker
+ * (drained on shutdown across every session), the index/vault refs, the
+ * `serverInfoContextBase` (process-constant identity), and the included-
+ * hidden flag. Constructed once at startup by {@link createServerContext}.
+ *
+ * Stdio uses one context + one McpServer. HTTP uses one context + N
+ * McpServers (one per session) so each session carries its own
+ * `negotiatedProtocolVersion` — the SDK's `Server.connect` "assumes
+ * ownership of the Transport, replacing any callbacks" per
+ * `@modelcontextprotocol/sdk/dist/esm/server/mcp.d.ts:38–40`, so one
+ * McpServer cannot multiplex across transports.
+ */
+export interface ServerContext {
+	vaultRoot: VaultRoot;
+	index: IndexHandle | undefined;
+	includeHidden: boolean;
+	inflight: InflightTracker;
+	/**
+	 * Base for {@link ServerInfoContext}; each per-session call to
+	 * {@link createMcpServerForSession} fills in `getMcpProtocolVersion`
+	 * pointing at that session's own closure variable.
+	 */
+	serverInfoContextBase: Omit<ServerInfoContext, "getMcpProtocolVersion">;
 }
 
 /**
@@ -97,24 +130,46 @@ export interface ServerInstance {
 }
 
 /**
- * Build a configured `McpServer` for the given vault root plus an
- * in-flight request tracker scoped to that instance. Caller is
- * responsible for connecting it to a transport.
- *
- * `index` is mandatory for `search` and powers D32 fuzzy stale-id
- * recovery in `get_fragment`. Outline / metadata use it only for the
- * live `_meta.index_status`.
+ * Build the shared {@link ServerContext} once at startup. The single
+ * `InflightTracker` and the once-hashed `rootHash` live here so multiple
+ * sessions (HTTP) or a one-shot session (stdio) can be created against
+ * the same context.
  */
-export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: ServerConfig = {}): ServerInstance {
+export function createServerContext(
+	vaultRoot: VaultRoot,
+	index?: IndexHandle,
+	config: ServerConfig = {},
+): ServerContext {
 	const includeHidden = config.includeHidden ?? false;
 	// Process-start timestamp (ISO 8601, UTC). Captured here (D40) so each
-	// `createServer` instance reports its own creation time — agents detect
-	// unexpected restarts between turns by comparing this across calls.
-	// Pre-D40 this was a module-level const evaluated at first import; an
-	// embedder calling `createServer` long after import (or recreating the
-	// server mid-process) saw a stale module-load timestamp instead of the
-	// instance's real start time.
+	// `createServerContext` invocation reports its own creation time —
+	// agents detect unexpected restarts between turns by comparing this
+	// across calls. Pre-D40 this was a module-level const evaluated at
+	// first import.
 	const serverStartedAt = new Date().toISOString();
+	const inflight = createInflightTracker();
+	const serverInfoContextBase: Omit<ServerInfoContext, "getMcpProtocolVersion"> = {
+		rootHash: hashVaultRoot(vaultRoot.absolute),
+		includeHidden,
+		startedAt: serverStartedAt,
+		serverName: SERVER_NAME,
+		serverVersion: PACKAGE_VERSION,
+		transport: config.transport ?? "stdio",
+		...(config.bindAddress !== undefined && { bindAddress: config.bindAddress }),
+		...(config.port !== undefined && { port: config.port }),
+	};
+	return { vaultRoot, index, includeHidden, inflight, serverInfoContextBase };
+}
+
+/**
+ * Build one `McpServer` against a shared {@link ServerContext}. Each call
+ * yields a fresh `negotiatedProtocolVersion` closure — required for HTTP
+ * because the SDK's `Server.connect` "assumes ownership of the Transport,
+ * replacing any callbacks" (`mcp.d.ts:38–40`), so one McpServer cannot
+ * multiplex across sessions. Stdio calls this exactly once; HTTP calls
+ * it once per session.
+ */
+export function createMcpServerForSession(context: ServerContext): McpServer {
 	// `tools` and `resources` capabilities are auto-registered by the SDK
 	// when registerTool / registerResource fire; no need to pre-declare.
 	// `subscribe: true` was advertised previously but no subscribe handler
@@ -125,7 +180,9 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: 
 	// `get_server_info.server.mcp_protocol_version`. Defaults to LATEST so
 	// pre-handshake debugging calls (no observed client yet) still get an
 	// honest value; the initialize handler overwrites this with whatever
-	// version the SDK actually negotiated for the session.
+	// version the SDK actually negotiated for the session. Per-session
+	// under HTTP so two clients on the same process don't clobber each
+	// other's negotiated version.
 	let negotiatedProtocolVersion: string = LATEST_PROTOCOL_VERSION;
 
 	// D22: declare `2025-06-18` minimum at handshake; reject older clients
@@ -137,10 +194,7 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: 
 	server.server.setRequestHandler(InitializeRequestSchema, async (request) => {
 		const requested = request.params.protocolVersion;
 		if (typeof requested !== "string" || requested < MIN_PROTOCOL_VERSION) {
-			throw new McpError(
-				ErrorCode.InvalidRequest,
-				`markdown-mcp requires MCP protocol version ${MIN_PROTOCOL_VERSION} or newer; client requested ${requested}.`,
-			);
+			throw new McpError(ErrorCode.InvalidRequest, formatProtocolVersionTooOldMessage(requested));
 		}
 		// Per MCP spec: when the client requests a version the server does
 		// not support, respond with the latest version it does. Echoing a
@@ -162,16 +216,34 @@ export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: 
 		};
 	});
 
-	// Tracker is constructed here but wired at the transport boundary by
-	// the caller — `transport.onmessage` increments on incoming requests
-	// and `transport.send` decrements after the response's stdout write
-	// fully resolves. Tracking the handler promise alone is unsafe under
-	// backpressure (see `lib/inflightTracker.ts` doc).
-	const inflight = createInflightTracker();
+	const serverInfoContext: ServerInfoContext = {
+		...context.serverInfoContextBase,
+		getMcpProtocolVersion: () => negotiatedProtocolVersion,
+	};
 
-	registerTools(server, vaultRoot, index, includeHidden, () => negotiatedProtocolVersion, serverStartedAt);
-	registerNoteResource(server, vaultRoot, includeHidden);
-	return { server, inflight };
+	registerTools(server, context.vaultRoot, context.index, context.includeHidden, serverInfoContext);
+	registerNoteResource(server, context.vaultRoot, context.includeHidden);
+	return server;
+}
+
+/**
+ * Build a configured `McpServer` for the given vault root plus an
+ * in-flight request tracker scoped to that instance. Caller is
+ * responsible for connecting it to a transport.
+ *
+ * Thin wrapper over {@link createServerContext} + {@link createMcpServerForSession}
+ * preserved for callers that want the legacy single-shot shape (stdio
+ * mainline, existing tests). HTTP transport calls the two-layer API
+ * directly to share one context across N sessions.
+ *
+ * `index` is mandatory for `search` and powers D32 fuzzy stale-id
+ * recovery in `get_fragment`. Outline / metadata use it only for the
+ * live `_meta.index_status`.
+ */
+export function createServer(vaultRoot: VaultRoot, index?: IndexHandle, config: ServerConfig = {}): ServerInstance {
+	const context = createServerContext(vaultRoot, index, config);
+	const server = createMcpServerForSession(context);
+	return { server, inflight: context.inflight };
 }
 
 // ─── Tool registration ─────────────────────────────────────────────────────
@@ -181,8 +253,7 @@ function registerTools(
 	vaultRoot: VaultRoot,
 	index: IndexHandle | undefined,
 	includeHidden: boolean,
-	getMcpProtocolVersion: () => string,
-	serverStartedAt: string,
+	serverInfoContext: ServerInfoContext,
 ): void {
 	server.registerTool(
 		"get_vault_tree",
@@ -257,16 +328,9 @@ function registerTools(
 	// D37: identity/health snapshot. Index optional — when not configured,
 	// `get_server_info` surfaces `index: null` so an agent debugging a stub
 	// server sees the misconfig honestly instead of an opaque INTERNAL_ERROR.
-	// `rootHash` is hashed once here (vault root is constant for process
-	// lifetime) so we don't re-hash on every call.
-	const serverInfoContext: ServerInfoContext = {
-		rootHash: hashVaultRoot(vaultRoot.absolute),
-		includeHidden,
-		startedAt: serverStartedAt,
-		serverName: SERVER_NAME,
-		serverVersion: PACKAGE_VERSION,
-		getMcpProtocolVersion,
-	};
+	// `serverInfoContext` is built by the caller (createMcpServerForSession)
+	// so per-session getters (negotiatedProtocolVersion) stay session-scoped
+	// and `rootHash` is hashed once at startup (vault root is process-constant).
 	server.registerTool(
 		"get_server_info",
 		{

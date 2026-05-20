@@ -26,10 +26,11 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { errorMessage } from "./lib/error.js";
 import { detectCaseInsensitiveFs } from "./lib/fsDetect.js";
 import { INDEX_DIR_NAME, setFsCaseInsensitive } from "./lib/hiddenPath.js";
+import { bracketIpv6Host, connectHttpTransport, type HttpTransportHandle } from "./lib/httpTransport.js";
 import { createIndexHandle, type IndexHandle } from "./lib/index/IndexHandle.js";
 import { type IndexOutcome, reindexOne, type ScanResult, scanVault } from "./lib/index/scanner.js";
 import { closeSqlite, detectPreW4Schema, openSqliteWithRecovery } from "./lib/index/sqlite.js";
-import type { InflightTracker } from "./lib/inflightTracker.js";
+import { type InflightTracker, wireInflight } from "./lib/inflightTracker.js";
 import { type MerkleTickHandle, startMerkleTick } from "./lib/merkle.js";
 import { setProseOnly } from "./lib/proseOnly.js";
 import { acquireServerLock, ServerLockError, type ServerLockHandle } from "./lib/serverLock.js";
@@ -45,14 +46,30 @@ import { getSortedVaultExtensions } from "./lib/vaultExtensions.js";
 import { PACKAGE_VERSION } from "./lib/version.js";
 import { startWatcher, type Watcher } from "./lib/watcher.js";
 import { WriteCoordinator } from "./lib/writeCoordinator.js";
-import { createServer, type ServerInstance } from "./server.js";
+import { createMcpServerForSession, createServerContext, type ServerInstance } from "./server.js";
+import type { TransportKind } from "./types.js";
 
 interface CliArgs {
 	vault: string;
 	polling: boolean;
 	includeHidden: boolean;
 	proseOnly: boolean;
+	transport: TransportKind;
+	/** Loopback address; meaningful only when `transport === "http"`. */
+	bind: string;
+	/** Listener port; meaningful only when `transport === "http"`. Use `0` for OS-assigned. */
+	port: number;
 }
+
+const DEFAULT_HTTP_BIND = "127.0.0.1";
+const DEFAULT_HTTP_PORT = 3000;
+
+/**
+ * Auth-token env var read once at startup. Unset → no auth (matches
+ * stdio's loopback-trust model). Set → every HTTP request must carry
+ * `Authorization: Bearer <token>`. Not hot-reloadable — restart to rotate.
+ */
+const AUTH_TOKEN_ENV = "MCP_AUTH_TOKEN";
 
 function parseCli(argv: string[]): CliArgs {
 	const { values } = parseArgs({
@@ -62,6 +79,9 @@ function parseCli(argv: string[]): CliArgs {
 			polling: { type: "boolean" },
 			"include-hidden": { type: "boolean" },
 			"prose-only": { type: "boolean" },
+			transport: { type: "string" },
+			port: { type: "string" },
+			bind: { type: "string" },
 			help: { type: "boolean", short: "h" },
 		},
 		strict: true,
@@ -74,17 +94,96 @@ function parseCli(argv: string[]): CliArgs {
 	}
 
 	if (typeof values.vault !== "string" || values.vault.length === 0) {
-		console.error("error: --vault <path> is required.\n");
-		console.error(USAGE);
-		process.exit(2);
+		exitWithUsage("error: --vault <path> is required.");
 	}
+
+	const transport = parseTransport(values.transport);
+	const { bind, port } = parseHttpEndpoint(transport, values.bind, values.port);
 
 	return {
 		vault: values.vault,
 		polling: values.polling === true,
 		includeHidden: values["include-hidden"] === true,
 		proseOnly: values["prose-only"] === true,
+		transport,
+		bind,
+		port,
 	};
+}
+
+/**
+ * Print `message` + USAGE to stderr and exit non-zero. Used for every
+ * CLI argument validation failure so the help text is always reachable.
+ */
+function exitWithUsage(message: string): never {
+	console.error(`${message}\n`);
+	console.error(USAGE);
+	process.exit(2);
+}
+
+function parseTransport(raw: unknown): TransportKind {
+	if (raw === undefined) return "stdio";
+	if (raw === "stdio" || raw === "http") return raw;
+	exitWithUsage(`error: --transport must be "stdio" or "http"; got "${String(raw)}".`);
+}
+
+function parseHttpEndpoint(
+	transport: TransportKind,
+	rawBind: unknown,
+	rawPort: unknown,
+): { bind: string; port: number } {
+	// stdio doesn't bind anywhere; --port/--bind are accepted but inert.
+	// Print a friendly note when they're set — easy mistake to make.
+	if (transport === "stdio") {
+		if (rawBind !== undefined || rawPort !== undefined) {
+			console.error("note: --port / --bind are only used with --transport http; ignoring.");
+		}
+		return { bind: DEFAULT_HTTP_BIND, port: DEFAULT_HTTP_PORT };
+	}
+
+	const bind = typeof rawBind === "string" && rawBind.length > 0 ? rawBind : DEFAULT_HTTP_BIND;
+	if (!isLoopbackBind(bind)) {
+		exitWithUsage(
+			`error: --bind must be a loopback address (127.0.0.0/8, ::1, or localhost); got "${bind}". v1 supports localhost binds only.`,
+		);
+	}
+
+	let port = DEFAULT_HTTP_PORT;
+	if (typeof rawPort === "string" && rawPort.length > 0) {
+		const parsed = Number.parseInt(rawPort, 10);
+		// `--port 0` is legal (OS-assigned, used by tests); the upper bound
+		// is the IANA port space ceiling. Decimals (`3000.5`) and non-
+		// numeric tails (`3000abc`) parse to NaN under `parseInt` only
+		// for the empty case — guard explicitly.
+		if (!Number.isFinite(parsed) || parsed < 0 || parsed > 65535 || String(parsed) !== rawPort.trim()) {
+			exitWithUsage(`error: --port must be an integer in [0, 65535]; got "${rawPort}".`);
+		}
+		port = parsed;
+	}
+	return { bind, port };
+}
+
+/**
+ * Render a `http://host:port` URL for the startup log so operators can
+ * copy-paste the advertised endpoint into curl / browser tools regardless
+ * of bind form. {@link bracketIpv6Host} handles the RFC 3986 bracketing.
+ */
+function formatHttpEndpoint(bind: string, port: number): string {
+	return `http://${bracketIpv6Host(bind)}:${port}`;
+}
+
+function isLoopbackBind(bind: string): boolean {
+	const lower = bind.toLowerCase();
+	if (lower === "localhost") return true;
+	if (lower === "::1" || lower === "0:0:0:0:0:0:0:1") return true;
+	// IPv4 loopback range is 127.0.0.0/8. Match the canonical form
+	// (decimal-dotted) — uncommon CIDR forms like `127.0.0.1/8` aren't a
+	// bind target shape Node accepts anyway.
+	const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(lower);
+	if (ipv4 === null) return false;
+	const octets = ipv4.slice(1, 5).map((s) => Number.parseInt(s, 10));
+	if (octets.some((n) => !Number.isFinite(n) || n < 0 || n > 255)) return false;
+	return octets[0] === 127;
 }
 
 const USAGE = `markdown-mcp ${PACKAGE_VERSION}
@@ -93,6 +192,7 @@ A read-only MCP server giving AI agents structured access to a local markdown va
 
 Usage:
   markdown-mcp --vault <path> [--polling] [--include-hidden] [--prose-only]
+                              [--transport <stdio|http>] [--port <n>] [--bind <addr>]
 
 Options:
   --vault <path>     Absolute or relative path to the vault directory (required).
@@ -109,10 +209,23 @@ Options:
                      and operators wanting smaller MCP frames. Errors render
                      a structured prose body so candidates / progress /
                      retry_after_ms stay surfaced. note:// is unaffected.
+  --transport <name> "stdio" (default) or "http". HTTP speaks Streamable HTTP
+                     (MCP spec 2025-06-18+) and supports multiple concurrent
+                     sessions sharing one warm index.
+  --port <n>         HTTP listener port (default 3000; only with --transport
+                     http). Use 0 for OS-assigned.
+  --bind <addr>      HTTP bind address (default 127.0.0.1; only with
+                     --transport http). v1 supports loopback only
+                     (127.0.0.0/8, ::1, localhost).
   -h, --help         Show this message.
 
-The server speaks MCP over stdio. Connect from a compatible host
-(Claude Desktop, Claude Code, Cursor, etc.).`;
+Environment:
+  ${AUTH_TOKEN_ENV}    Optional bearer token. When set, every HTTP request
+                     must carry "Authorization: Bearer <token>". Constant-time
+                     comparison. Stdio is unaffected (local-process trust).
+
+The server speaks MCP over the selected transport. Connect from a compatible
+host (Claude Desktop, Claude Code, Cursor, etc.).`;
 
 const SHUTDOWN_DRAIN_MS = 5_000;
 const DB_RELATIVE_PATH = `${INDEX_DIR_NAME}/index.sqlite3`;
@@ -131,20 +244,6 @@ export const TEST_ENV = {
 	/** Pause inside `acquireServerLock`'s `onSlotCreated` callback so a signal can land between own-slot creation and reconcile return. */
 	RECONCILE_DELAY_MS: "MARKDOWN_MCP_TEST_RECONCILE_DELAY_MS",
 } as const;
-
-/**
- * JSON-RPC message-shape predicates for the inflight tracker hooks.
- * The SDK exports zod-backed `isJSONRPC*` helpers, but every send /
- * onmessage call would pay a full schema parse — overkill when the
- * transport only ever produces SDK-shaped messages. The shape checks
- * are sufficient to disambiguate request / response / notification.
- */
-function isJsonRpcRequestShape(msg: unknown): boolean {
-	return typeof msg === "object" && msg !== null && "id" in msg && "method" in msg;
-}
-function isJsonRpcResponseShape(msg: unknown): boolean {
-	return typeof msg === "object" && msg !== null && "id" in msg && ("result" in msg || "error" in msg);
-}
 
 function printValidationError(err: PathValidationError): void {
 	console.error(`error: ${err.payload.message}`);
@@ -252,6 +351,16 @@ export function makeReindexCallback(
 async function main(): Promise<void> {
 	const args = parseCli(process.argv.slice(2));
 
+	// MCP_AUTH_TOKEN: stdio ignores it (local-process trust); HTTP must
+	// validate emptiness pre-resource — exitWithUsage's process.exit(2)
+	// bypasses tearDownAndExit, leaking lockfile + SQLite WAL/shm otherwise.
+	const rawAuthToken = args.transport === "http" ? process.env[AUTH_TOKEN_ENV] : undefined;
+	if (rawAuthToken !== undefined && rawAuthToken.trim().length === 0) {
+		exitWithUsage(
+			`error: ${AUTH_TOKEN_ENV} is set but empty; unset it or provide a non-empty value (otherwise every HTTP request would 401).`,
+		);
+	}
+
 	const vaultRoot: VaultRoot = await runOrExitOnPathError(() => validateVaultRoot(args.vault));
 
 	// Probe FS case-sensitivity before any code path consults
@@ -283,7 +392,8 @@ async function main(): Promise<void> {
 	let merkleTick: MerkleTickHandle | null = null;
 	let server: ServerInstance["server"] | null = null;
 	let inflight: InflightTracker | null = null;
-	let transport: Transport | null = null;
+	let stdioTransport: Transport | null = null;
+	let httpHandle: HttpTransportHandle | null = null;
 	let shuttingDown = false;
 
 	// Order is load-bearing: drain in-flight handlers → stop producers →
@@ -307,8 +417,10 @@ async function main(): Promise<void> {
 		// late response would be truncated. In-flight requests (already
 		// past dispatch) are unaffected — they live in the SDK's
 		// `_onrequest` promise chain, not gated by onmessage — so the
-		// drain still completes them honestly.
-		if (transport !== null) transport.onmessage = () => {};
+		// drain still completes them honestly. HTTP applies the same
+		// override to every active session via `suppressDispatch`.
+		if (stdioTransport !== null) stdioTransport.onmessage = () => {};
+		httpHandle?.suppressDispatch();
 		// Three-phase drain: (1) wait for outstanding MCP request handlers
 		// so their responses land on stdout BEFORE `server.close()` + the
 		// final `process.exit()` discard a partial stdout buffer — the
@@ -331,6 +443,29 @@ async function main(): Promise<void> {
 					console.error(
 						`markdown-mcp: tearDown drain timeout while waiting for ${inflight.size()} in-flight request(s); proceeding with close.`,
 					);
+				}
+			}
+			// HTTP: after inflight drains (responses have landed on their
+			// SSE streams), stop accepting new connections and tear down
+			// per-session McpServer + transport. `transport.close()` does
+			// NOT drain inflight on its own — InflightTracker is the drain
+			// authority. Stdio: noop (httpHandle is null).
+			if (httpHandle !== null) {
+				try {
+					const httpClose = httpHandle.close();
+					const httpCloseResult = await Promise.race([
+						httpClose.then(() => "closed" as const),
+						new Promise<"timeout">((resolve) => {
+							timer = setTimeout(() => resolve("timeout"), remaining());
+						}),
+					]);
+					if (timer) clearTimeout(timer);
+					timer = undefined;
+					if (httpCloseResult === "timeout") {
+						console.error("markdown-mcp: tearDown drain timeout while closing HTTP transport; proceeding.");
+					}
+				} catch (err) {
+					console.error(`markdown-mcp http: close error: ${errorMessage(err)}`);
 				}
 			}
 			const producerStops = Promise.allSettled([
@@ -422,61 +557,68 @@ async function main(): Promise<void> {
 	);
 
 	try {
-		// Pipe `process.stdin` to a PassThrough so EOF is detectable
-		// during the post-lock startup window (SQLite open, scanner
-		// setup, the test-injected startup delay). `process.stdin` is
-		// paused by default; its `'end'` event only fires after the
-		// stream is read past EOF, and the SDK transport doesn't attach
-		// its data listener until `transport.start()` runs inside
-		// `server.connect()` — well after this point. Without the pipe,
-		// a client that closes stdin during startup is not noticed
-		// until startup completes; the server keeps holding the lock
-		// and running scanner work after the session is already gone.
-		//
-		// The pipe runs AFTER `acquireServerLock` so spawnSync-style
-		// invocations (whose pipe stdin is at EOF from the start) still
-		// surface lock conflicts as exit 1 via `runOrExitOnLockConflict`
-		// before the stdin-EOF shutdown path can race them.
-		stdinProxy = new PassThrough();
-		const proxy = stdinProxy;
-		// Forward stdin/proxy stream errors through the shutdown path
-		// instead of letting Node's default unhandled-'error' behavior
-		// terminate the process abruptly. The SDK transport attaches its
-		// own error listener on `stdinProxy` only after `server.connect`
-		// runs; before that, an error here (or one forwarded from
-		// `process.stdin` via `pipe`'s onerror) would crash the process
-		// per EventEmitter semantics. Listeners on both streams are
-		// needed because `pipe`'s internal onerror destroys `dest` with
-		// the error when `dest` has no other error listener — emitting
-		// a fresh 'error' on `stdinProxy` that we must also catch.
-		const onStdinStreamError = (err: unknown): void => {
-			console.error(`markdown-mcp: stdin stream error: ${errorMessage(err)}`);
-			void shutdown("STDIN_ERROR");
-		};
-		process.stdin.once("error", onStdinStreamError);
-		proxy.once("error", onStdinStreamError);
-		process.stdin.once("end", () => {
-			// If the proxy has buffered bytes when `process.stdin` EOFs,
-			// the client sent valid request(s) (e.g. `initialize`) then
-			// closed stdin to signal "done sending." Defer shutdown to
-			// the proxy's own `'end'` — the transport (when `server.
-			// connect` runs) consumes the buffer, the wrapped
-			// `transport.send` resolves into `inflight.exit()`, and the
-			// proxy emits `'end'` once its writable side is closed AND
-			// its readable buffer is drained. Without this branch the
-			// buffered payload would be dropped: shutdown would fire
-			// before `server.connect` ever attached a data listener.
-			// Empty buffer at EOF → the original prompt-shutdown case
-			// (client gave up without sending anything).
-			if (proxy.readableLength === 0) {
-				void shutdown("STDIN_EOF");
-				return;
-			}
-			proxy.once("end", () => {
-				void shutdown("STDIN_EOF");
+		// Stdin-EOF detection + proxy plumbing only applies to stdio
+		// transport. Under `--transport http` the client lifecycle is
+		// owned by the HTTP layer (POST initialize / DELETE /mcp / TCP
+		// FIN), and a child of `npx` that closes stdin shouldn't
+		// terminate the long-lived HTTP daemon.
+		if (args.transport === "stdio") {
+			// Pipe `process.stdin` to a PassThrough so EOF is detectable
+			// during the post-lock startup window (SQLite open, scanner
+			// setup, the test-injected startup delay). `process.stdin` is
+			// paused by default; its `'end'` event only fires after the
+			// stream is read past EOF, and the SDK transport doesn't attach
+			// its data listener until `transport.start()` runs inside
+			// `server.connect()` — well after this point. Without the pipe,
+			// a client that closes stdin during startup is not noticed
+			// until startup completes; the server keeps holding the lock
+			// and running scanner work after the session is already gone.
+			//
+			// The pipe runs AFTER `acquireServerLock` so spawnSync-style
+			// invocations (whose pipe stdin is at EOF from the start) still
+			// surface lock conflicts as exit 1 via `runOrExitOnLockConflict`
+			// before the stdin-EOF shutdown path can race them.
+			stdinProxy = new PassThrough();
+			const proxy = stdinProxy;
+			// Forward stdin/proxy stream errors through the shutdown path
+			// instead of letting Node's default unhandled-'error' behavior
+			// terminate the process abruptly. The SDK transport attaches its
+			// own error listener on `stdinProxy` only after `server.connect`
+			// runs; before that, an error here (or one forwarded from
+			// `process.stdin` via `pipe`'s onerror) would crash the process
+			// per EventEmitter semantics. Listeners on both streams are
+			// needed because `pipe`'s internal onerror destroys `dest` with
+			// the error when `dest` has no other error listener — emitting
+			// a fresh 'error' on `stdinProxy` that we must also catch.
+			const onStdinStreamError = (err: unknown): void => {
+				console.error(`markdown-mcp: stdin stream error: ${errorMessage(err)}`);
+				void shutdown("STDIN_ERROR");
+			};
+			process.stdin.once("error", onStdinStreamError);
+			proxy.once("error", onStdinStreamError);
+			process.stdin.once("end", () => {
+				// If the proxy has buffered bytes when `process.stdin` EOFs,
+				// the client sent valid request(s) (e.g. `initialize`) then
+				// closed stdin to signal "done sending." Defer shutdown to
+				// the proxy's own `'end'` — the transport (when `server.
+				// connect` runs) consumes the buffer, the wrapped
+				// `transport.send` resolves into `inflight.exit()`, and the
+				// proxy emits `'end'` once its writable side is closed AND
+				// its readable buffer is drained. Without this branch the
+				// buffered payload would be dropped: shutdown would fire
+				// before `server.connect` ever attached a data listener.
+				// Empty buffer at EOF → the original prompt-shutdown case
+				// (client gave up without sending anything).
+				if (proxy.readableLength === 0) {
+					void shutdown("STDIN_EOF");
+					return;
+				}
+				proxy.once("end", () => {
+					void shutdown("STDIN_EOF");
+				});
 			});
-		});
-		process.stdin.pipe(stdinProxy);
+			process.stdin.pipe(stdinProxy);
+		}
 
 		// Test-only deterministic pause between lock-acquisition and the rest
 		// of startup. The `index.signalDuringStartup` test uses it to SIGTERM
@@ -623,47 +765,57 @@ async function main(): Promise<void> {
 				return { filesIndexed: 0, filesSkipped: 0, aborted: false } satisfies ScanResult;
 			});
 
-		const instance = createServer(vaultRoot, index, {
+		// Single ServerContext shared by every session (HTTP) or the one
+		// session (stdio). Holds the shared InflightTracker that
+		// `tearDownAndExit` drains across all sessions.
+		const context = createServerContext(vaultRoot, index, {
 			includeHidden: args.includeHidden,
+			transport: args.transport,
+			...(args.transport === "http" && { bindAddress: args.bind, port: args.port }),
 		});
-		server = instance.server;
-		inflight = instance.inflight;
-		// `stdinProxy` is the post-lock-acquire pipe target (see top of
-		// try block). The transport reads from it instead of
-		// `process.stdin` so early-startup EOF detection on `process.stdin`
-		// works without the transport stealing data from it.
-		if (stdinProxy === null) throw new Error("stdinProxy must be initialized before connecting the transport.");
-		transport = new StdioServerTransport(stdinProxy);
+		inflight = context.inflight;
 
-		// Wire the inflight counter at the transport boundary so the
-		// teardown drain spans the full request lifecycle, including the
-		// SDK's `await transport.send(response)` step. Tracking the
-		// handler promise alone left a window where `count === 0` between
-		// `handler(request)` resolving and `transport.send(response)`
-		// awaiting stdout drain — a large or backpressured reply was lost
-		// to `process.exit()`. See `lib/inflightTracker.ts` for the
-		// invariant.
-		//
-		// Both hooks are installed BEFORE `server.connect`: the SDK's
-		// `connect` captures the existing `transport.onmessage` and
-		// chain-calls it before its own dispatch (`protocol.js:234-249`),
-		// so our `enter()` fires before the SDK invokes the request
-		// handler. `transport.send` is read fresh on every send call, so
-		// our wrapper is used for all outgoing messages.
-		const originalSend = transport.send.bind(transport);
-		transport.send = async (message) => {
-			try {
-				await originalSend(message);
-			} finally {
-				if (isJsonRpcResponseShape(message)) instance.inflight.exit();
+		if (args.transport === "stdio") {
+			// `stdinProxy` is the post-lock-acquire pipe target (see top of
+			// try block). The transport reads from it instead of
+			// `process.stdin` so early-startup EOF detection on `process.stdin`
+			// works without the transport stealing data from it.
+			if (stdinProxy === null) {
+				throw new Error("stdinProxy must be initialized before connecting the stdio transport.");
 			}
-		};
-		transport.onmessage = (message) => {
-			if (isJsonRpcRequestShape(message)) instance.inflight.enter();
-		};
+			const mcpServer = createMcpServerForSession(context);
+			server = mcpServer;
+			stdioTransport = new StdioServerTransport(stdinProxy);
 
-		await server.connect(transport);
-		console.error(`markdown-mcp running on stdio (vault: ${vaultRoot.absolute}, db: ${dbPath})`);
+			// Wire the inflight counter at the transport boundary so the
+			// teardown drain spans the full request lifecycle, including the
+			// SDK's `await transport.send(response)` step. See
+			// `lib/inflightTracker.ts` for the invariant and ordering rules.
+			// MUST run before `server.connect` so the SDK's chained dispatch
+			// observes our `onmessage` hook.
+			wireInflight(stdioTransport, context.inflight);
+
+			await mcpServer.connect(stdioTransport);
+			console.error(`markdown-mcp running on stdio (vault: ${vaultRoot.absolute}, db: ${dbPath})`);
+		} else {
+			// `server` holder stays null — each session's McpServer lives
+			// inside the httpHandle's session map and is closed by
+			// `httpHandle.close()` during teardown. `connectHttpTransport`
+			// finalizes `serverInfoContextBase.{port,bindAddress}` on the
+			// shared context once `httpServer.listen()` resolves the OS-
+			// assigned port (matters when `args.port === 0`).
+			httpHandle = await connectHttpTransport({
+				bindAddress: args.bind,
+				port: args.port,
+				context,
+				...(rawAuthToken !== undefined && { authToken: rawAuthToken }),
+				isShuttingDown: () => shuttingDown,
+			});
+			const authState = rawAuthToken !== undefined ? "bearer" : "none";
+			console.error(
+				`markdown-mcp running on ${formatHttpEndpoint(args.bind, httpHandle.port)} (vault: ${vaultRoot.absolute}, db: ${dbPath}, auth: ${authState})`,
+			);
+		}
 
 		// Merkle defers until scan drains: a periodic walk during initial
 		// enumeration would compete with scanner's own walk for I/O and

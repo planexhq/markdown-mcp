@@ -600,12 +600,35 @@ export interface NoteResourceResult {
  */
 export type GetServerInfoInput = Record<string, never> | undefined;
 
+/**
+ * Active MCP transport. `stdio` is the default; `http` is the opt-in via
+ * `--transport http`. Used by CLI args, `ServerConfig`, `BuildServerInfoArgs`,
+ * and the `ServerIdentity` wire shape — single source of truth for the
+ * union literal.
+ */
+export type TransportKind = "stdio" | "http";
+
 export interface ServerIdentity {
 	name: string;
 	version: string;
 	mcp_protocol_version: string;
 	started_at: string;
 	prose_only: boolean;
+	/**
+	 * Active MCP transport. Lets agents self-verify the channel they
+	 * reached over before making transport-specific decisions (e.g.
+	 * resumable SSE streams vs stdin/stdout framing).
+	 */
+	transport: TransportKind;
+	/**
+	 * Loopback bind address (e.g. `127.0.0.1`, `::1`, `localhost`).
+	 * Present only when {@link transport} is `"http"`.
+	 */
+	bind_address?: string;
+	/**
+	 * HTTP listener port. Present only when {@link transport} is `"http"`.
+	 */
+	port?: number;
 }
 
 export interface VaultIdentity {

@@ -134,6 +134,12 @@ export interface SpawnedServer {
 export interface SpawnAndWaitOptions {
 	extraArgs?: string[];
 	extraEnv?: Record<string, string>;
+	/**
+	 * Env var names to DELETE from the inherited `process.env` before
+	 * spawning. Use when the child must not see a value the parent shell
+	 * has set (e.g., `MCP_AUTH_TOKEN` polluting an auth-less test).
+	 */
+	clearEnv?: readonly string[];
 	/** Substring the spawned process logs to stderr once `waitFor` is reached. */
 	waitFor: string;
 	timeoutMs?: number;
@@ -147,6 +153,7 @@ export interface SpawnAndWaitOptions {
  */
 export async function spawnAndWaitForStderr(vaultPath: string, opts: SpawnAndWaitOptions): Promise<SpawnedServer> {
 	const env: NodeJS.ProcessEnv = { ...process.env, ...opts.extraEnv };
+	for (const key of opts.clearEnv ?? []) delete env[key];
 	const child = spawn(process.execPath, [SERVER_BIN, "--vault", vaultPath, ...(opts.extraArgs ?? [])], {
 		stdio: ["pipe", "pipe", "pipe"],
 		env,

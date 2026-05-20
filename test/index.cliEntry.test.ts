@@ -96,3 +96,68 @@ describe("CLI flag parsing", () => {
 		expect(stderr).toContain("fatal:");
 	});
 });
+
+describe("CLI HTTP transport flag validation", () => {
+	// All these tests verify exit-2 + a specific error message AT PARSE TIME,
+	// without spinning up a real server. `--vault` is supplied but the
+	// process exits before lock acquisition because `validateTransportArgs`
+	// rejects first.
+
+	test("--bind 0.0.0.0 is rejected", () => {
+		const { code, stderr } = runServerWithArgs(SERVER_BIN, [
+			"--vault",
+			"/tmp/v",
+			"--transport",
+			"http",
+			"--bind",
+			"0.0.0.0",
+		]);
+		expect(code).toBe(2);
+		expect(stderr).toContain("--bind must be a loopback address");
+		expect(stderr).toContain("0.0.0.0");
+	});
+
+	test("--bind 10.0.0.1 is rejected", () => {
+		const { code, stderr } = runServerWithArgs(SERVER_BIN, [
+			"--vault",
+			"/tmp/v",
+			"--transport",
+			"http",
+			"--bind",
+			"10.0.0.1",
+		]);
+		expect(code).toBe(2);
+		expect(stderr).toContain("--bind must be a loopback address");
+	});
+
+	test("--port 70000 is rejected as out of range", () => {
+		const { code, stderr } = runServerWithArgs(SERVER_BIN, [
+			"--vault",
+			"/tmp/v",
+			"--transport",
+			"http",
+			"--port",
+			"70000",
+		]);
+		expect(code).toBe(2);
+		expect(stderr).toContain("--port must be an integer in [0, 65535]");
+	});
+
+	test("--transport bogus is rejected", () => {
+		const { code, stderr } = runServerWithArgs(SERVER_BIN, ["--vault", "/tmp/v", "--transport", "websocket"]);
+		expect(code).toBe(2);
+		expect(stderr).toContain('--transport must be "stdio" or "http"');
+	});
+
+	test("--help mentions --transport, --port, --bind, and MCP_AUTH_TOKEN", () => {
+		const result = spawnSync(process.execPath, [SERVER_BIN, "--help"], {
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		expect(result.status).toBe(0);
+		expect(result.stderr).toContain("--transport");
+		expect(result.stderr).toContain("--port");
+		expect(result.stderr).toContain("--bind");
+		expect(result.stderr).toContain("MCP_AUTH_TOKEN");
+	});
+});

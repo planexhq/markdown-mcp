@@ -14,7 +14,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { GetServerInfoResult, IndexIdentity, IndexStatusSnapshot } from "../types.js";
+import type { GetServerInfoResult, IndexIdentity, IndexStatusSnapshot, TransportKind } from "../types.js";
 import { FUZZY_ALGORITHM_ID } from "./fuzzy.js";
 import { isFsCaseInsensitiveResolved } from "./hiddenPath.js";
 import type { IndexHandle } from "./index/IndexHandle.js";
@@ -72,20 +72,38 @@ export interface BuildServerInfoArgs {
 	 * client downgraded to an older supported version.
 	 */
 	getMcpProtocolVersion: () => string;
+	/**
+	 * Active MCP transport. `stdio` populates only this field; `http`
+	 * additionally populates {@link bindAddress} and {@link port}.
+	 * Lets agents self-verify which transport they reached over —
+	 * useful when one host can dial either path.
+	 */
+	transport: TransportKind;
+	/** Loopback bind address; only set when {@link transport} is `"http"`. */
+	bindAddress?: string;
+	/** HTTP listener port; only set when {@link transport} is `"http"`. */
+	port?: number;
 }
 
 export function buildServerInfo(args: BuildServerInfoArgs): GetServerInfoResult {
+	const serverIdentity: GetServerInfoResult["server"] = {
+		name: args.serverName,
+		version: args.serverVersion,
+		mcp_protocol_version: args.getMcpProtocolVersion(),
+		started_at: args.startedAt,
+		// Reads the module global directly — single source of truth
+		// with `successEnvelope`/`toolErrorEnvelope`'s suppression
+		// path. Same precedent as `case_insensitive_fs` below.
+		prose_only: isProseOnly(),
+		transport: args.transport,
+	};
+	// `bind_address` / `port` are emitted only for `http`; including
+	// `undefined` would violate the wire contract (`?:` means absent,
+	// not present-as-undefined) and `exactOptionalPropertyTypes`.
+	if (args.bindAddress !== undefined) serverIdentity.bind_address = args.bindAddress;
+	if (args.port !== undefined) serverIdentity.port = args.port;
 	return {
-		server: {
-			name: args.serverName,
-			version: args.serverVersion,
-			mcp_protocol_version: args.getMcpProtocolVersion(),
-			started_at: args.startedAt,
-			// Reads the module global directly — single source of truth
-			// with `successEnvelope`/`toolErrorEnvelope`'s suppression
-			// path. Same precedent as `case_insensitive_fs` below.
-			prose_only: isProseOnly(),
-		},
+		server: serverIdentity,
 		vault: {
 			root_hash: args.rootHash,
 			include_hidden: args.includeHidden,
