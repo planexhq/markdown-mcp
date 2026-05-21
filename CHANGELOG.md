@@ -6,7 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-Two features shipping together: **HTTP transport** (Streamable HTTP / Docker) and **structured AsyncAPI 3.x synthesis**. Independent — adopt either or both.
+Three OpenAPI synthesizer enhancements shipping together, plus the previously-released **HTTP transport** and **structured AsyncAPI 3.x synthesis** bundle. The OpenAPI work bumps `PARSER_SHAPE_VERSION` 1 → 2 — existing caches cold-rescan once on upgrade.
+
+### Structured OpenAPI 3.x — webhooks, prose enrichment, operationId slot, pollution defense
+
+#### Added
+
+- **OpenAPI 3.1 webhooks.** `synthesizeOpenApiFile` now enumerates `top.webhooks` and emits one `HeadingMeta` per `webhooks.<name>.<method>` combination. Heading text is `Webhook: <name> <METHOD>`; slot prefix is `webhook[<sha14>]` so webhook IDs are distinct from path-op IDs even when a name happens to hash to the same digest as a path. Path-item-level `parameters` inheritance applies the same way as for `paths`. `get_file_outline` returns webhook nodes at level 2; `get_fragment` resolves them by `heading_path` or `stable_id`; `note://api/spec.yaml` continues to return the LITERAL on-disk YAML. 3.0 specs have no `webhooks` key and are unaffected.
+- **Per-op prose enrichment.** Five fields that previously reached FTS only via the operation JSON fence (`code` BM25 weight 0.5) now render as prose lines (`body` weight 2.0 — 4× the per-token rank): `Deprecated: yes`, `External docs: <description> — <url>`, `Security: <scheme>(<scopes>) | …` (empty requirement `{}` renders as `none` per OpenAPI's "no auth" override), `Servers: <urls>` (op-level overrides only), `Callbacks: <names>` (names only — callback PathItem trees stay in the JSON fence to avoid outline-size explosion). The shared renderer applies the same enrichment to webhook operations.
+- **operationId-keyed slot.** When an operation has `operationId` AND the operationId is unique across `operations + webhooks` in the same file, the slot input is `"oid:" + operationId`; otherwise the synthesizer falls back to today's heading-text hash (`<METHOD> <path>` / `Webhook: <name> <METHOD>`). The `"oid:"` namespace prefix keeps the two schemes collision-distinct at the same digest width. Slot wire-shape is unchanged (`op[<sha14>]` / `webhook[<sha14>]`); the hash input is the toggle. Code-generated specs that move paths while preserving `operationId` (`/v1/pets` → `/api/v2/pets`) now keep the same `stable_id` across the rename — no more heading_history churn on every regeneration. Duplicate operationIds fall back to the heading-text hash (fail-soft; spec violation).
+- **Prototype-pollution defense parity with AsyncAPI.** Lifted `DANGEROUS_KEYS` / `deepSanitize` / `safeSet` / `sanitizeNested` (+ `sanitizeBucketMap` for the components two-level walk) from `asyncapi.ts` to shared module `src/lib/parsers/shared.ts`. Applied across OpenAPI's FTS-bound surfaces: `## Components` fence, per-op fences, and the `## Spec metadata` residual extractors (`extractInfoResidual` / `extractPathItemMapResidual`). Spec-key layers (root, `info` fields, pathItem fields) reject `__proto__`; user-named layers (webhook names, schema names) preserve it as own data via `safeSet`. Hostile specs carrying `__proto__:` map keys no longer reach BM25-indexed FTS columns. `constructor` is intentionally NOT in `DANGEROUS_KEYS` — JSON Schema `properties.constructor: { type }` is legitimate user content. AsyncAPI behavior is byte-equivalent after the lift (all 220 asyncapi tests pass unchanged). See the Fixed section below for follow-up corrections to the initial implementation.
+
+#### Changed
+
+- **`PARSER_SHAPE_VERSION` bump 1 → 2.** All three OpenAPI changes alter synthesized fragment shape for the same source bytes. `computePolicyMismatch` detects the diff and forces a single cold rescan on upgrade — agents holding pre-bump cached IDs hit fuzzy recovery on the first lookup. No new index_meta columns; no migration ceremony.
+
+
+#### Out of scope (deferred)
+
+- **OpenAPI 2.x (Swagger) synthesis** — opaque YAML fallback continues; deferral stands.
+- **`$ref` dereferencing** — `components` content still reaches FTS via the `## Components` catch-all fence (`code` weight 0.5). Schema-level search depends on the JSON fence; per-schema headings deferred to a future ADR.
+- **JSON-format OpenAPI (`spec.json`)** — separate PR / ADR (Tier 1 item 2 from the OpenAPI deep-dive). Touches `vaultExtensions.ts` and `parseFile` dispatcher; not bundled here.
+- **Wikilink fragment refs into operations / webhooks** (`[[spec.yaml#webhooks/shipment.created]]`) — wikilinks-INTO-YAML stays deferred.
+- **Operator opt-out for the operationId slot scheme** — not needed in v1; reopen if a user reports problems with their specific spec layout.
 
 ### HTTP transport
 
@@ -24,7 +46,7 @@ Adds Streamable HTTP (MCP spec 2025-06-18+) as an opt-in alongside the existing 
 
 #### Changed
 
-- **D22's "HTTP+SSE deferred to a future major" clause is superseded.** D22's stdio default + `2025-06-18` protocol floor remain authoritative.
+- **The earlier "HTTP+SSE deferred to a future major" stance is superseded.** The stdio default + `2025-06-18` protocol floor remain authoritative.
 - **THREAT_MODEL V7 reactivated** (was deferred). Mitigations: localhost-only bind enforced at CLI parse, SDK DNS-rebinding protection + allowedHosts/allowedOrigins, optional bearer token. Residual: any local process on the same host can reach `127.0.0.1:<port>` — same model as `redis-server` default, `sqlite3 :memory:`, `chromedriver`. Operators on shared hosts should set `MCP_AUTH_TOKEN`.
 - **Brief lines 763 / 930 / 1045 amended** to reflect dual-transport. Concurrency model now distinguishes stdio (one client) from HTTP (multiple sessions, same trusted local user).
 - **`tearDownAndExit` extended** with `await httpHandle?.close()` between phase 1 (inflight drain) and phase 2 (producer stop). The HTTP handle closes idle keep-alive sockets, tears down per-session McpServer + transport (which terminates SSE streams), then awaits `httpServer.close`. InflightTracker remains the drain authority — `StreamableHTTPServerTransport.close()` does NOT drain on its own.
@@ -86,7 +108,7 @@ Structured OpenAPI 3.x + opaque YAML support. YAML files join markdown on the pa
 
 ### Added
 
-- **OpenAPI 3.x synthesis.** When a YAML file's top-level matches `openapi: "3.*"`, the parser emits one `HeadingMeta` per `paths.<path>.<method>` operation. `stable_id` is derived from `sha8(method + " " + path)` — name-based, so sibling reorder doesn't retire IDs. `get_file_outline` returns one node per operation (`GET /pets`); `get_fragment` returns a synthesized prose rendering (summary, description, parameter prose, plus a compact JSON fence of the full operation object, capped at 64 KiB). On truncation the fence language drops to `text` so agents calling `JSON.parse` on the fragment body don't fail on a partial payload.
+- **OpenAPI 3.x synthesis.** When a YAML file's top-level matches `openapi: "3.*"`, the parser emits one `HeadingMeta` per `paths.<path>.<method>` operation. `stable_id` is derived from `sha14(method + " " + path)` — name-based, so sibling reorder doesn't retire IDs. `get_file_outline` returns one node per operation (`GET /pets`); `get_fragment` returns a synthesized prose rendering (summary, description, parameter prose, plus a compact JSON fence of the full operation object, capped at 64 KiB). On truncation the fence language drops to `text` so agents calling `JSON.parse` on the fragment body don't fail on a partial payload.
 - **Opaque YAML emission.** Non-OpenAPI YAML (Swagger 2.x, generic configs, etc.) indexes opaquely: whole source searchable, parsed top-level exposed as `frontmatter` so nested-path filters (`fields["info.version"].eq`) work directly. `get_metadata` returns the whole top-level object.
 - **`YAML_PARSE_ERROR`.** New error code discriminated on `ParseError.format`. Same `reason` set as `MARKDOWN_PARSE_ERROR`: `"syntax" | "ast_node_cap_exceeded" | "encoding_failed"`. Pathological-depth input that overflows the V8 stack (`RangeError`) is reclassified to `ast_node_cap_exceeded` at both the `parseYAML` and `normalizeForJson` layers — user-facing error code stays consistent with the explicit cap walker.
 - **`note://` for YAML.** `note://api/petstore.yaml` returns the literal on-disk YAML with `mimeType: application/yaml`. The Resource still preserves on-disk bytes verbatim, so agents calling the Resource see spec truth; `get_fragment` returns the synthesized prose rendering.

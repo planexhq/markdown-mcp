@@ -18,7 +18,6 @@
 
 import type { ContentKind, HeadingLevel, Range } from "../../types.js";
 import type { ExcludedRange } from "../blockIds.js";
-import { errorMessage } from "../error.js";
 import { MAX_FILE_BYTES } from "../limits.js";
 import {
 	annotateDescendantTokens,
@@ -29,18 +28,18 @@ import {
 	normalizeHeadingText,
 	type OffsetRange,
 	type ParsedFile,
-	ParseError,
 } from "../parser.js";
 import { sha1HexN, stableId } from "../structuralPath.js";
 import { estimateTokens } from "../tokenizer.js";
-
-/**
- * Hard cap on the compact JSON payload inside a `code`-routed fence
- * (per operation, channels, components, spec metadata). Defends against
- * pathological specs (a single op embedding MB of example data,
- * a `channels` subtree with thousands of messages).
- */
-const MAX_FENCE_JSON_BYTES = 64 * 1024;
+import {
+	DANGEROUS_KEYS,
+	deepSanitize,
+	safeSet,
+	sanitizeBucketMap,
+	sanitizeNested,
+	stringField,
+	stringifyJsonForFence,
+} from "./shared.js";
 
 /**
  * Aggregate cap on synthesized source bytes. Trait amplification: N ops
@@ -241,78 +240,6 @@ function dereferenceTraits(top: Record<string, unknown>, op: Record<string, unkn
 
 /** Spec-forbidden in AsyncAPI 3 OperationTrait — defensively dropped from the merge so a malformed spec can't smuggle them through a trait. `reply` is intentionally absent: per OperationTrait Object spec, traits MAY contain any property from the Operation Object except `action`/`channel`/`messages`/`traits`. */
 const TRAIT_FORBIDDEN_FIELDS: ReadonlySet<string> = new Set(["action", "channel", "messages", "traits"]);
-
-/** `target[k] = v` on `__proto__` invokes `Object.prototype`'s inherited setter and reroutes the target's `[[Prototype]]`; the `yaml` parser stores `__proto__:` as own enumerable data so the key reaches this merge code. `constructor` is deliberately NOT in this set: writing `target.constructor = v` shadows the inherited data property without invoking any setter — no prototype-pollution vector — and JSON Schema `properties.constructor: { type }` is legitimate user content that earlier defensive stripping silently dropped from `## Components`. */
-const DANGEROUS_KEYS: ReadonlySet<string> = new Set(["__proto__"]);
-
-/**
- * Walk a plain-object / array tree, returning a copy with `__proto__`
- * keys filtered at every depth. Applied to `applyTraitMerge` output so
- * the JSON fence — which serializes via `JSON.stringify`'s own-
- * enumerable-key iteration — doesn't surface yaml-parsed `__proto__:`
- * data nested anywhere in the merged tree. Array branch maps element-
- * wise so objects nested inside array-valued AsyncAPI fields (`tags`,
- * `security`, protocol-binding sub-arrays) are scrubbed too — the
- * original object-only branch missed array elements per RFC 7396 §1's
- * "arrays atomic" rule, but that rule applies to the MERGE operator
- * (don't recurse into arrays during merge); the SANITIZE walk must
- * still visit element children. Scalars / tagged scalars / null are
- * atomic leaves.
- */
-function deepSanitize(v: unknown): unknown {
-	if (Array.isArray(v)) return v.map(deepSanitize);
-	if (!isPlainObject(v)) return v;
-	const out: Record<string, unknown> = {};
-	for (const k of Object.keys(v)) {
-		if (DANGEROUS_KEYS.has(k)) continue;
-		out[k] = deepSanitize(v[k]);
-	}
-	return out;
-}
-
-/**
- * Assign `value` to `target[key]` without invoking inherited accessors.
- * For `key === "__proto__"`, `target[key] = value` routes through
- * `Object.prototype`'s inherited `__proto__` setter (polluting the
- * target's `[[Prototype]]` and leaving NO own data); `Object.defineProperty`
- * writes an own data property unconditionally. Used at non-merge call
- * sites where the user-supplied key MAY legitimately be `__proto__`
- * (e.g. an AsyncAPI operation literally named `__proto__`) and should
- * be preserved as own data rather than silently dropped by the setter.
- */
-function safeSet(target: Record<string, unknown>, key: string, value: unknown): void {
-	if (DANGEROUS_KEYS.has(key)) {
-		Object.defineProperty(target, key, {
-			value,
-			writable: true,
-			enumerable: true,
-			configurable: true,
-		});
-	} else {
-		target[key] = value;
-	}
-}
-
-/**
- * Catch-all fence scrubber: at depth 0 of a plain-object map, preserves
- * user-controlled keys via `safeSet` (server/channel/operation names —
- * including a literal `__proto__`) and `deepSanitize`s each value
- * subtree. Non-object inputs (arrays from invalid drafts like
- * `info: [...]`, x-* extension arrays, scalars) route through
- * `deepSanitize` directly so attacker payloads nested inside array
- * elements still get scrubbed; without this, an `x-extra: [{__proto__:
- * {pwn: "X"}}]` would have reached the fence unscrubbed.
- */
-function sanitizeNested(v: unknown): unknown {
-	if (isPlainObject(v)) {
-		const out: Record<string, unknown> = {};
-		for (const k of Object.keys(v)) {
-			safeSet(out, k, deepSanitize(v[k]));
-		}
-		return out;
-	}
-	return deepSanitize(v);
-}
 
 /**
  * Recursive merge: returns a new object where `b` wins at every leaf
@@ -871,7 +798,7 @@ function buildSynthesizedSource(top: Record<string, unknown>, operations: Operat
 		const opJsonStart = offset;
 		// Aliased ops emit bare `$ref`; the shared body remains addressable via `## Components`.
 		const fenceSource = entry.rawRef !== null ? { $ref: entry.rawRef } : entry.merged;
-		const fence = stringifyJsonForFence(fenceSource, "operation");
+		const fence = stringifyJsonForFence(fenceSource, "AsyncAPI operation");
 		emit(`\`\`\`${fence.language}\n`);
 		emit(`${fence.body}\n`);
 		emit("```\n\n");
@@ -900,25 +827,14 @@ function buildSynthesizedSource(top: Record<string, unknown>, operations: Operat
 	const channels = top.channels;
 	const hasChannelsSection = isPlainObject(channels) && Object.keys(channels).length > 0;
 	if (hasChannelsSection) {
-		emitJsonSection("Channels", "channels", "channels", sanitizeNested(channels), "channels");
+		emitJsonSection("Channels", "channels", "channels", sanitizeNested(channels), "AsyncAPI channels");
 	}
 
 	// ─ Components catch-all ──────────────────────────────────────────────
-	// `components` is a TWO-level user-content shape: bucket layer
-	// (`messages`, `schemas`, …) is spec-defined; the layer inside each
-	// bucket is a map of user-controlled names. `sanitizeNested` preserves
-	// only one level, so we explicitly walk the bucket layer and apply
-	// `sanitizeNested` to each bucket value — that way a message literally
-	// named `__proto__` (`components.messages.__proto__`) reaches the
-	// fence while deeper attacker payloads stay scrubbed.
 	const components = top.components;
 	const hasComponentsSection = isPlainObject(components) && Object.keys(components).length > 0;
 	if (hasComponentsSection) {
-		const sanitizedComponents: Record<string, unknown> = {};
-		for (const bucketKey of Object.keys(components)) {
-			safeSet(sanitizedComponents, bucketKey, sanitizeNested(components[bucketKey]));
-		}
-		emitJsonSection("Components", "components", "components", sanitizedComponents, "components");
+		emitJsonSection("Components", "components", "components", sanitizeBucketMap(components), "AsyncAPI components");
 	}
 
 	// ─ Aliased operations: deduped by `rawRef` so N aliases of one target
@@ -939,7 +855,7 @@ function buildSynthesizedSource(top: Record<string, unknown>, operations: Operat
 			"aliased_operations",
 			"aliased-operations",
 			aliasedBodies,
-			"aliased operations",
+			"AsyncAPI aliased operations",
 		);
 	}
 
@@ -975,7 +891,7 @@ function buildSynthesizedSource(top: Record<string, unknown>, operations: Operat
 		}
 	}
 	if (leftovers !== null) {
-		emitJsonSection("Spec metadata", "spec_metadata", "spec-metadata", leftovers, "spec metadata");
+		emitJsonSection("Spec metadata", "spec_metadata", "spec-metadata", leftovers, "AsyncAPI spec metadata");
 	}
 
 	return {
@@ -1179,30 +1095,6 @@ function renderOperationProse(top: Record<string, unknown>, entry: OperationEntr
 	}
 }
 
-interface FenceContent {
-	body: string;
-	language: "json" | "text";
-}
-
-/**
- * Compact-JSON serializer mirroring `openapi.ts:stringifyJsonForFence` —
- * 64 KiB cap + `json`→`text` language swap on truncation defends against
- * pathological payloads (a single op embedding MB of example data, a
- * `channels` subtree with thousands of messages). Errors surface as
- * `YAML_PARSE_ERROR` via `ParseError.yaml(...)`.
- */
-function stringifyJsonForFence(value: unknown, label: string): FenceContent {
-	try {
-		const s = JSON.stringify(value);
-		if (typeof s !== "string") return { body: "{}", language: "json" };
-		if (s.length <= MAX_FENCE_JSON_BYTES) return { body: s, language: "json" };
-		const elided = `${s.slice(0, MAX_FENCE_JSON_BYTES)}\n... (truncated; ${s.length - MAX_FENCE_JSON_BYTES} bytes elided)`;
-		return { body: elided, language: "text" };
-	} catch (cause) {
-		throw ParseError.yaml("syntax", `AsyncAPI ${label} not JSON-serializable: ${errorMessage(cause)}`);
-	}
-}
-
 function buildHeadingMeta(
 	sec: SynthSection,
 	relpath: string,
@@ -1307,12 +1199,7 @@ function offsetToLine(lineStarts: ReadonlyArray<number>, offset: number): number
 	return Math.max(lo, 1);
 }
 
-function stringField(obj: Record<string, unknown>, key: string): string | null {
-	const v = obj[key];
-	return typeof v === "string" && v.length > 0 ? v : null;
-}
-
-/** Like {@link stringField} but preserves `""` as a present value. Use for fields where the spec distinguishes empty from null/absent. */
+/** Like `stringField` (from `./shared.js`) but preserves `""` as a present value. Use for fields where the spec distinguishes empty from null/absent. */
 function nullableString(obj: Record<string, unknown>, key: string): string | null {
 	const v = obj[key];
 	return typeof v === "string" ? v : null;
