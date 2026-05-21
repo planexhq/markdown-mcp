@@ -1,5 +1,5 @@
 /**
- * Integration test — OpenAPI YAML end-to-end (D43, D44, D45, D46).
+ * Integration test — OpenAPI YAML end-to-end.
  *
  * Spins up a server against a vault containing a markdown note + a small
  * OpenAPI 3.x YAML file. Exercises every tool surface to confirm the
@@ -11,8 +11,8 @@
  *   - `get_fragment` (stable_id anchor) returns a specific operation section.
  *   - `get_metadata` returns the entire top-level OpenAPI object.
  *   - `search` matches operation summaries with BM25 ranking.
- *   - `search` with `filters.fields["info.version"].eq` filters via D30 nested-path.
- *   - `get_links` returns empty outgoing/incoming for a YAML file (D46 — wikilinks-into-YAML deferred).
+ *   - `search` with `filters.fields["info.version"].eq` filters via nested-path.
+ *   - `get_links` returns empty outgoing/incoming for a YAML file (wikilinks-into-YAML deferred).
  *   - `note://api/petstore.yaml` returns literal on-disk bytes with `application/yaml` mimeType.
  *
  * Setup creates a tmpdir vault and launches the built dist server with
@@ -58,6 +58,48 @@ paths:
           description: Pet created
 `;
 
+// Fixture exercising pollution defense, webhooks + prose enrichment,
+// and operationId-keyed slot end-to-end via real MCP tool
+// surfaces. Single spec keeps the setup simple; each test asserts on
+// the relevant slice.
+const EXTENDED_YAML = `openapi: "3.1.0"
+info:
+  title: Shipping API
+  version: "3.0.0"
+  description: Webhook + security demo.
+paths:
+  /v1/orders:
+    get:
+      summary: List orders
+      operationId: listOrders
+      deprecated: true
+      externalDocs:
+        description: Order schema reference
+        url: https://example.com/docs/orders
+      security:
+        - oauth2: [read:orders]
+      responses:
+        "200":
+          description: ok
+webhooks:
+  shipment.created:
+    post:
+      summary: Shipment created event
+      operationId: notifyShipmentCreated
+      responses:
+        "200":
+          description: ack
+components:
+  schemas:
+    Order:
+      type: object
+      __proto__:
+        leaked-via-prototype-pollution-attack: "should not appear in any FTS column"
+      properties:
+        id:
+          type: string
+`;
+
 const MARKDOWN_NOTE = `---
 title: Auth Overview
 tags: [auth, internal]
@@ -75,6 +117,7 @@ beforeAll(async () => {
 	vault = await createTempVault({
 		api: {
 			"petstore.yaml": PETSTORE_YAML,
+			"shipping.yaml": EXTENDED_YAML,
 		},
 		notes: {
 			"auth.md": MARKDOWN_NOTE,
@@ -89,7 +132,7 @@ afterAll(async () => {
 	await vault.cleanup();
 });
 
-describe("integration — OpenAPI YAML end-to-end (D43–D46)", () => {
+describe("integration — OpenAPI YAML end-to-end", () => {
 	test("get_vault_tree lists petstore.yaml as an indexed file", async () => {
 		const r = await conn.client.callTool({ name: "get_vault_tree", arguments: { depth: 5, pageSize: 50 } });
 		expect(r.isError).toBeFalsy();
@@ -101,7 +144,7 @@ describe("integration — OpenAPI YAML end-to-end (D43–D46)", () => {
 		expect(yamlEntry?.subheadings).toBeGreaterThanOrEqual(2);
 	});
 
-	test("get_vault_tree emits a resource_link for the YAML file (D46)", async () => {
+	test("get_vault_tree emits a resource_link for the YAML file", async () => {
 		const r = await conn.client.callTool({ name: "get_vault_tree", arguments: { depth: 5, pageSize: 50 } });
 		expect(r.isError).toBeFalsy();
 		const content = r.content as Array<{ type: string; uri?: string }>;
@@ -178,7 +221,7 @@ describe("integration — OpenAPI YAML end-to-end (D43–D46)", () => {
 		expect(petsHit).toBeDefined();
 	});
 
-	test("search with fields['info.version'] filter matches via D30 nested-path access", async () => {
+	test("search with fields['info.version'] filter matches via nested-path access", async () => {
 		const r = await conn.client.callTool({
 			name: "search",
 			arguments: {
@@ -195,7 +238,7 @@ describe("integration — OpenAPI YAML end-to-end (D43–D46)", () => {
 		expect(petstoreHits.length).toBeGreaterThan(0);
 	});
 
-	test("get_links returns empty outgoing/incoming for a YAML file (D46)", async () => {
+	test("get_links returns empty outgoing/incoming for a YAML file", async () => {
 		const r = await conn.client.callTool({
 			name: "get_links",
 			arguments: { file: "api/petstore.yaml", direction: "both" },
@@ -206,7 +249,7 @@ describe("integration — OpenAPI YAML end-to-end (D43–D46)", () => {
 		expect(out.incoming ?? []).toEqual([]);
 	});
 
-	test("D46 — get_fragment on a YAML file returns empty outgoing_links / embeds", async () => {
+	test("get_fragment on a YAML file returns empty outgoing_links / embeds", async () => {
 		// Scanner's `buildWikilinkRows` short-circuits at `parsed.kind === "yaml"`;
 		// `get_fragment`'s read-time `buildLinksAndEmbeds` mirrors that gate so
 		// phantom `[[X]]` text inside a YAML scalar doesn't surface as links.
@@ -220,7 +263,7 @@ describe("integration — OpenAPI YAML end-to-end (D43–D46)", () => {
 		expect(frag.embeds ?? []).toEqual([]);
 	});
 
-	test("D46 — get_vault_tree resource_link emits application/yaml mimeType for YAML files", async () => {
+	test("get_vault_tree resource_link emits application/yaml mimeType for YAML files", async () => {
 		const r = await conn.client.callTool({ name: "get_vault_tree", arguments: { depth: 5, pageSize: 50 } });
 		expect(r.isError).toBeFalsy();
 		const content = r.content as Array<{ type: string; uri?: string; mimeType?: string }>;
@@ -243,5 +286,105 @@ describe("integration — OpenAPI YAML end-to-end (D43–D46)", () => {
 		const first = resource.contents[0] as { mimeType?: string; text?: string };
 		expect(first.mimeType).toBe("text/markdown");
 		expect(first.text).toBe(MARKDOWN_NOTE);
+	});
+});
+
+describe("integration — OpenAPI Tier 1 bundle", () => {
+	test("get_file_outline exposes webhook nodes at level 2", async () => {
+		const r = await conn.client.callTool({
+			name: "get_file_outline",
+			arguments: { file: "api/shipping.yaml" },
+		});
+		expect(r.isError).toBeFalsy();
+		const out = r.structuredContent as GetFileOutlineResult;
+		const texts = out.outline.map((n) => n.text);
+		// One path op + one webhook op + Components catch-all.
+		expect(texts).toContain("GET /v1/orders");
+		expect(texts).toContain("Webhook: shipment.created POST");
+		expect(texts).toContain("Components");
+	});
+
+	test("get_fragment resolves a webhook by heading_path", async () => {
+		const r = await conn.client.callTool({
+			name: "get_fragment",
+			arguments: {
+				file: "api/shipping.yaml",
+				anchor: { kind: "heading_path", path: "Webhook: shipment.created POST" },
+			},
+		});
+		expect(r.isError).toBeFalsy();
+		const frag = r.structuredContent as { content?: string };
+		expect(frag.content ?? "").toContain("Webhook: shipment.created POST");
+		expect(frag.content ?? "").toContain("Shipment created event");
+	});
+
+	test("search('Deprecated') finds the op via new prose body weight", async () => {
+		const r = await conn.client.callTool({
+			name: "search",
+			arguments: { query: "Deprecated", pageSize: 20 },
+		});
+		expect(r.isError).toBeFalsy();
+		const out = r.structuredContent as SearchOutput;
+		const hit = out.items.find(
+			(i) => "heading_path" in i && Array.isArray(i.heading_path) && i.heading_path.includes("GET /v1/orders"),
+		);
+		expect(hit).toBeDefined();
+	});
+
+	test("operationId-keyed slot survives heading_path drift via stable_id round-trip", async () => {
+		// Fetch outline → capture stable_id derived from operationId →
+		// re-fetch fragment via that stable_id → confirm the same op.
+		const outline = await conn.client.callTool({
+			name: "get_file_outline",
+			arguments: { file: "api/shipping.yaml" },
+		});
+		const out = outline.structuredContent as GetFileOutlineResult;
+		const opNode = out.outline.find((n) => n.text === "GET /v1/orders");
+		expect(opNode?.stable_id).toBeDefined();
+		if (!opNode?.stable_id) throw new Error("missing stable_id");
+		// `stable_id` is a top-level field on get_fragment; `anchor` is required
+		// even when stable_id is present (stable_id wins per Brief line 116).
+		const frag = await conn.client.callTool({
+			name: "get_fragment",
+			arguments: {
+				file: "api/shipping.yaml",
+				anchor: { kind: "heading_path", path: ["GET /v1/orders"] },
+				stable_id: opNode.stable_id,
+			},
+		});
+		expect(frag.isError).toBeFalsy();
+		const body = frag.structuredContent as { content?: string };
+		expect(body.content ?? "").toContain("List orders");
+	});
+
+	test("pollution-defense — __proto__ injection does NOT reach FTS", async () => {
+		// The marker text lives only inside `components.schemas.Order.__proto__.leaked-...`.
+		// sanitizeNested strips that key before JSON.stringify routes the
+		// Components fence into the `code` FTS column. So search for the
+		// marker text must return zero hits from this file.
+		const r = await conn.client.callTool({
+			name: "search",
+			arguments: { query: "should not appear", pageSize: 20 },
+		});
+		expect(r.isError).toBeFalsy();
+		const out = r.structuredContent as SearchOutput;
+		const shippingHit = out.items.find((i) => i.file === "api/shipping.yaml");
+		expect(shippingHit).toBeUndefined();
+	});
+
+	test("pollution-defense — Components fence body has no own __proto__ key after JSON.parse", async () => {
+		// Read the Components fragment directly and parse its JSON fence.
+		const r = await conn.client.callTool({
+			name: "get_fragment",
+			arguments: { file: "api/shipping.yaml", anchor: { kind: "heading_path", path: "Components" } },
+		});
+		expect(r.isError).toBeFalsy();
+		const frag = r.structuredContent as { content?: string };
+		const fenceMatch = /```json\n([\s\S]*?)\n```/.exec(frag.content ?? "");
+		if (!fenceMatch?.[1]) throw new Error("expected json fence in Components fragment");
+		const obj = JSON.parse(fenceMatch[1]);
+		expect(Object.hasOwn(obj.schemas.Order, "__proto__")).toBe(false);
+		// Legitimate sibling field still present.
+		expect(obj.schemas.Order.properties.id.type).toBe("string");
 	});
 });
