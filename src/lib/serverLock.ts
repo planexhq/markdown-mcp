@@ -58,6 +58,12 @@ export interface ServerLockOptions {
 	indexDir: string;
 	includeHidden: boolean;
 	/**
+	 * In-code `PARSER_SHAPE_VERSION` for this binary. Persisted in the lock
+	 * record so a peer with a mismatched binary refuses to admit (preventing
+	 * mixed-shape fragment writes from concurrent reindexers).
+	 */
+	parserShapeVersion: number;
+	/**
 	 * Fires once the own-PID slot file is on disk, before the foreign-slot
 	 * reconcile pass; lets the caller publish the handle to its shutdown
 	 * path so a signal landing during reconcile's (≥25 ms) unparseable
@@ -179,6 +185,24 @@ export class ServerLockExtensionConflictError extends ServerLockError {
 	}
 }
 
+/**
+ * Live peer runs a different `PARSER_SHAPE_VERSION` (different binary). The
+ * startup mismatch check fires a cold rescan + stamps the DB at the newer
+ * version, but the older peer's watcher continues to write rows with the
+ * old fragment shape — leaving the DB marked current but mixed-shape.
+ * Refuse at the lock gate instead.
+ */
+export class ServerLockParserShapeConflictError extends ServerLockError {
+	constructor(conflictPid: number, conflictShape: number, requestedShape: number) {
+		super(
+			`Another markdown-mcp server (PID ${conflictPid}) is running on this vault with ` +
+				`PARSER_SHAPE_VERSION=${conflictShape}. This binary uses PARSER_SHAPE_VERSION=${requestedShape}. ` +
+				`Stop the other server or upgrade it to the matching binary.`,
+			"ServerLockParserShapeConflictError",
+		);
+	}
+}
+
 const LOCK_FILE_PREFIX = "server-";
 const LOCK_FILE_SUFFIX = ".lock";
 const LOCK_NAME_RE = /^server-(\d+)\.lock$/;
@@ -210,6 +234,10 @@ interface LockFileRecord {
 	/** Sorted lowercase extensions (no leading dot). Absent in legacy
 	 *  lockfiles; {@link recordExts} normalizes the missing case. */
 	vaultExtensions?: ReadonlyArray<string>;
+	/** `PARSER_SHAPE_VERSION` of the binary that wrote this slot. Absent in
+	 *  pre-field lockfiles; {@link recordParserShape} coerces missing → 0
+	 *  so any non-zero in-code constant conflicts with a legacy peer. */
+	parserShapeVersion?: number;
 }
 
 /** Sorted form of {@link DEFAULT_EXTENSIONS} for the legacy-record fallback. */
@@ -219,7 +247,13 @@ function parseLockFile(text: string): LockFileRecord | null {
 	try {
 		const parsed: unknown = JSON.parse(text);
 		if (typeof parsed !== "object" || parsed === null) return null;
-		const obj = parsed as { includeHidden?: unknown; hostname?: unknown; pid?: unknown; vaultExtensions?: unknown };
+		const obj = parsed as {
+			includeHidden?: unknown;
+			hostname?: unknown;
+			pid?: unknown;
+			vaultExtensions?: unknown;
+			parserShapeVersion?: unknown;
+		};
 		if (typeof obj.includeHidden !== "boolean") return null;
 		const record: LockFileRecord = { includeHidden: obj.includeHidden };
 		if (typeof obj.hostname === "string") record.hostname = obj.hostname;
@@ -228,6 +262,9 @@ function parseLockFile(text: string): LockFileRecord | null {
 		}
 		if (Array.isArray(obj.vaultExtensions) && obj.vaultExtensions.every((s) => typeof s === "string")) {
 			record.vaultExtensions = obj.vaultExtensions as ReadonlyArray<string>;
+		}
+		if (typeof obj.parserShapeVersion === "number" && Number.isInteger(obj.parserShapeVersion)) {
+			record.parserShapeVersion = obj.parserShapeVersion;
 		}
 		return record;
 	} catch {
@@ -238,6 +275,13 @@ function parseLockFile(text: string): LockFileRecord | null {
 /** Normalize legacy/missing field to the default — see {@link LockFileRecord.vaultExtensions}. */
 function recordExts(record: LockFileRecord): ReadonlyArray<string> {
 	return record.vaultExtensions ?? LEGACY_LOCK_DEFAULT_EXTS;
+}
+
+/** Normalize legacy/missing field to 0 — matches {@link computePolicyMismatch}'s
+ *  same-fallback rule so a fresh binary with a non-zero in-code constant
+ *  conflicts with a legacy peer. */
+function recordParserShape(record: LockFileRecord): number {
+	return record.parserShapeVersion ?? 0;
 }
 
 /** Set-equality. `parseLockFile` doesn't re-sort on read, so an externally
@@ -338,10 +382,12 @@ async function statEntry(path: string): Promise<StatResult> {
 export async function acquireServerLock(opts: ServerLockOptions): Promise<ServerLockHandle> {
 	const ourPath = join(opts.indexDir, lockFileNameForPid(process.pid));
 	const ourExts = getSortedVaultExtensions();
+	const ourParserShape = opts.parserShapeVersion;
 	const payload = `${JSON.stringify({
 		includeHidden: opts.includeHidden,
 		hostname: hostname(),
 		vaultExtensions: ourExts,
+		parserShapeVersion: ourParserShape,
 	})}\n`;
 
 	await acquireOwnSlot(ourPath, payload);
@@ -362,7 +408,7 @@ export async function acquireServerLock(opts: ServerLockOptions): Promise<Server
 		// env) routes through the existing rm + throw path.
 		const ourMtimeMs = (await lstat(ourPath)).mtimeMs;
 		if (opts.onSlotCreated) await opts.onSlotCreated(handle);
-		await reconcileIndexDir(opts.indexDir, opts.includeHidden, ourExts, ourPath, ourMtimeMs);
+		await reconcileIndexDir(opts.indexDir, opts.includeHidden, ourExts, ourParserShape, ourPath, ourMtimeMs);
 	} catch (err) {
 		await rm(ourPath, { force: true });
 		throw err;
@@ -437,6 +483,7 @@ async function reconcileIndexDir(
 	indexDir: string,
 	ourPolicy: boolean,
 	ourExts: ReadonlyArray<string>,
+	ourParserShape: number,
 	ourPath: string,
 	ourMtimeMs: number,
 ): Promise<void> {
@@ -449,7 +496,7 @@ async function reconcileIndexDir(
 	}
 	for (const name of entries) {
 		if (name === LEGACY_LOCK_FILE_NAME) {
-			await cleanupLegacyEntry(join(indexDir, name), ourPolicy, ourExts);
+			await cleanupLegacyEntry(join(indexDir, name), ourPolicy, ourExts, ourParserShape);
 			continue;
 		}
 		const m = LOCK_NAME_RE.exec(name);
@@ -458,7 +505,7 @@ async function reconcileIndexDir(
 		if (otherPath === ourPath) continue;
 		const otherPid = Number.parseInt(m[1] ?? "0", 10);
 		if (!isValidPosixPid(otherPid)) continue;
-		await inspectForeignSlot(otherPath, otherPid, ourPolicy, ourExts, ourMtimeMs);
+		await inspectForeignSlot(otherPath, otherPid, ourPolicy, ourExts, ourParserShape, ourMtimeMs);
 	}
 }
 
@@ -466,6 +513,7 @@ async function cleanupLegacyEntry(
 	legacyPath: string,
 	ourPolicy: boolean,
 	ourExts: ReadonlyArray<string>,
+	ourParserShape: number,
 ): Promise<void> {
 	const probe = await statEntry(legacyPath);
 	if (probe.kind === "absent") return;
@@ -508,6 +556,11 @@ async function cleanupLegacyEntry(
 		throw new ServerLockExtensionConflictError(record.pid, theirExts, ourExts);
 	}
 
+	const theirParserShape = recordParserShape(record);
+	if (theirParserShape !== ourParserShape) {
+		throw new ServerLockParserShapeConflictError(record.pid, theirParserShape, ourParserShape);
+	}
+
 	// Same-policy live legacy owner: leave the file alone, its
 	// shutdown handler will unlink it.
 	console.error(
@@ -520,6 +573,7 @@ async function inspectForeignSlot(
 	otherPid: number,
 	ourPolicy: boolean,
 	ourExts: ReadonlyArray<string>,
+	ourParserShape: number,
 	ourMtimeMs: number,
 ): Promise<void> {
 	const probe = await statEntry(otherPath);
@@ -589,6 +643,15 @@ async function inspectForeignSlot(
 			return;
 		}
 		throw new ServerLockExtensionConflictError(otherPid, theirExts, ourExts);
+	}
+
+	const theirParserShape = recordParserShape(otherRecord);
+	if (theirParserShape !== ourParserShape) {
+		if (weArrivedFirst(ourMtimeMs, otherMtimeMs, otherPid)) {
+			logTiebreakerWin(otherPath, otherPid, `PARSER_SHAPE_VERSION=${theirParserShape}`);
+			return;
+		}
+		throw new ServerLockParserShapeConflictError(otherPid, theirParserShape, ourParserShape);
 	}
 }
 

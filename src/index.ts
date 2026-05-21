@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * markdown-mcp CLI entrypoint. Stdio-only per D22.
+ * markdown-mcp CLI entrypoint. Stdio-only per the MCP transport spec.
  *
  * NEVER write to stdout — that's the JSON-RPC transport channel. All
  * diagnostic logging goes to stderr (biome's `noConsole` rule permits
@@ -32,6 +32,7 @@ import { type IndexOutcome, reindexOne, type ScanResult, scanVault } from "./lib
 import { closeSqlite, detectPreW4Schema, openSqliteWithRecovery } from "./lib/index/sqlite.js";
 import { type InflightTracker, wireInflight } from "./lib/inflightTracker.js";
 import { type MerkleTickHandle, startMerkleTick } from "./lib/merkle.js";
+import { PARSER_SHAPE_VERSION } from "./lib/parsers/version.js";
 import { setProseOnly } from "./lib/proseOnly.js";
 import { acquireServerLock, ServerLockError, type ServerLockHandle } from "./lib/serverLock.js";
 import { chooseStartupState, computePolicyMismatch } from "./lib/startup.js";
@@ -545,6 +546,7 @@ async function main(): Promise<void> {
 		acquireServerLock({
 			indexDir: dbDir,
 			includeHidden: args.includeHidden,
+			parserShapeVersion: PARSER_SHAPE_VERSION,
 			onSlotCreated: async (h) => {
 				lockHandle = h;
 				const delay = Number.parseInt(process.env[TEST_ENV.RECONCILE_DELAY_MS] ?? "0", 10);
@@ -639,7 +641,7 @@ async function main(): Promise<void> {
 		// Non-null view for downstream code; `openedDb` (`T | null`) stays as
 		// the holder `shutdown()` reads.
 		const opened = openedDb;
-		// D47 — canonicalize the running VAULT_EXTENSIONS once (sorted
+		// Canonicalize the running VAULT_EXTENSIONS once (sorted
 		// lowercase comma-joined). Passed to `createIndexHandle` so
 		// `markScanFinalized` persists this exact string and to
 		// `computePolicyMismatch` so the disk-vs-running comparison uses
@@ -676,6 +678,9 @@ async function main(): Promise<void> {
 			argIncludeHidden: args.includeHidden,
 			vaultExtensionsPolicy: index.getVaultExtensionsPolicy(),
 			argVaultExtensions: vaultExtensionsSnapshot,
+			parserShapeVersion: index.getParserShapeVersionPolicy(),
+			argParserShapeVersion: PARSER_SHAPE_VERSION,
+			inflightParserShapeVersion: index.getInflightParserShape(),
 		});
 		const decision = chooseStartupState({
 			preexisted: opened.preexisted,

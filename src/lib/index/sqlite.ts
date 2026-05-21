@@ -204,18 +204,30 @@ export function runMigrationV1(db: DatabaseType): void {
 		ensureColumn(db, "index_meta", "inflight_include_hidden", "INTEGER");
 		// Epoch ms of the most recent `markScanFinalized`; surfaced via
 		// `_meta.index_status.last_scan_finished_at` and `get_server_info`
-		// as ISO 8601. Nullable: pre-D36 caches and never-finalized indices
+		// as ISO 8601. Nullable: pre-column caches and never-finalized indices
 		// read as NULL, which the formatter renders as field-omitted.
 		ensureColumn(db, "index_meta", "last_scan_finished_at", "INTEGER");
-		// D47 — sorted lowercase comma-joined extension list of the last
+		// Sorted lowercase comma-joined extension list of the last
 		// cleanly-finalized scan. Compared against the running
 		// `VAULT_EXTENSIONS` snapshot at startup; mismatch forces a cold
-		// rescan (parallel to D27's `include_hidden` policy mismatch).
-		// Pre-D47 caches: NULL → mismatch when args differ from default
+		// rescan (parallel to the `include_hidden` policy mismatch).
+		// Pre-column caches: NULL → mismatch when args differ from default
 		// `md`, so an upgrader switching `VAULT_EXTENSIONS=md,yaml,yml`
 		// gets a forced cold rescan that indexes the previously-skipped
 		// YAML files.
 		ensureColumn(db, "index_meta", "vault_extensions", "TEXT");
+		// Parser-output-shape stamp. NULL → coerced to 0; mismatch
+		// with in-code `PARSER_SHAPE_VERSION` forces cold rescan. See
+		// `src/lib/parsers/version.ts` for the bump policy.
+		ensureColumn(db, "index_meta", "parser_shape_version", "INTEGER");
+		// In-flight parser-shape marker. Mirrors `inflight_include_hidden`:
+		// records the `PARSER_SHAPE_VERSION` under which the current scan
+		// is running; cleared atomically by `markScanFinalized`. A SIGTERM
+		// mid-scan leaves this set, and the next startup compares it
+		// against the running in-code constant — closes the
+		// downgrade-after-interrupt mixed-shape window where the finalized
+		// stamp still recorded the prior clean shape.
+		ensureColumn(db, "index_meta", "inflight_parser_shape_version", "INTEGER");
 	}).immediate();
 }
 

@@ -14,7 +14,7 @@ Seven tools — `get_vault_tree`, `get_file_outline`, `get_fragment`, `search`, 
 - **BM25 full-text search** with frontmatter filtering (tags, dates, custom fields). Two modes: query and filter-only.
 - **Heading-anchored fragments** addressed by `heading_path` or `stable_id`. Stale IDs recover via fuzzy fallback when files are edited.
 - **Wikilink resolution + backlinks.** Resolves Obsidian/Foam-style `[[note]]`, `[[note#section]]`, `[[note^block]]`; surfaces incoming links per file or section.
-- **OpenAPI 3.x + opaque YAML.** Set `VAULT_EXTENSIONS=md,yaml,yml` to admit YAML alongside markdown. OpenAPI 3.x specs expose one fragment per operation (`GET /pets`, `POST /pets`); other YAML files index opaquely with the parsed top-level surfaced as frontmatter for filter queries.
+- **OpenAPI 3.x + AsyncAPI 3.x + opaque YAML.** Set `VAULT_EXTENSIONS=md,yaml,yml` to admit YAML alongside markdown. OpenAPI 3.x specs expose one fragment per operation (`GET /pets`, `POST /pets`); AsyncAPI 3.x specs expose one fragment per operation (`send userSignedUp`, `receive lightMeasured`); other YAML files index opaquely with the parsed top-level surfaced as frontmatter for filter queries.
 - **Async-reconcile startup.** Server is up immediately; the index warms in the background. Bounded reads (outline, fragment, metadata) work during warmup.
 - **No Obsidian plugin required.** Reads the vault directly from disk; works with any markdown folder.
 - **Fast.** Sub-second warm restart on 10K-file vaults; search p95 < 100 ms (1K-file vault, BM25 + filter — see [`bench/`](bench/README.md)).
@@ -245,7 +245,7 @@ Windsurf, Goose, Zed, and other stdio-based MCP hosts accept the same `command` 
 
 | Variable | Purpose |
 |---|---|
-| `VAULT_EXTENSIONS` | Comma-separated list of file extensions treated as parseable notes (no leading dot, case-insensitive). Default: `md`. Examples: `md,markdown`, `md,mdx`, `md,yaml,yml`. Gates `note://`, `get_vault_tree` resource links, and every direct-read tool. YAML files route through OpenAPI 3.x synthesis when detected; otherwise indexed opaquely. Changing this value forces a one-time cold rescan on next start. |
+| `VAULT_EXTENSIONS` | Comma-separated list of file extensions treated as parseable notes (no leading dot, case-insensitive). Default: `md`. Examples: `md,markdown`, `md,mdx`, `md,yaml,yml`. Gates `note://`, `get_vault_tree` resource links, and every direct-read tool. YAML files route through OpenAPI 3.x synthesis, then AsyncAPI 3.x synthesis, then opaque emission. Changing this value forces a one-time cold rescan on next start. |
 | `MCP_AUTH_TOKEN` | Optional bearer token for HTTP transport. When set, every HTTP request must carry `Authorization: Bearer <token>` (constant-time `crypto.timingSafeEqual` against the configured value). Unset → no auth (loopback-trust model). Stdio is unaffected. Read once at startup; restart to rotate. |
 
 ## Tools
@@ -263,6 +263,8 @@ Windsurf, Goose, Zed, and other stdio-based MCP hosts accept the same `command` 
 The `note://{path}` Resource returns the raw on-disk markdown (frontmatter included) so hosts can stream a literal note when a parsed fragment isn't what they want.
 
 **OpenAPI 3.x YAML** (when admitted via `VAULT_EXTENSIONS`): `get_file_outline` returns one node per operation (`GET /pets`); `get_fragment` returns a synthesized prose rendering — summary, description, parameter prose, plus a compact JSON fence of the full operation object; `get_metadata` returns the whole top-level spec object so nested-path filters (`fields["info.version"].eq`) work directly. `note://api/petstore.yaml` returns the literal on-disk YAML with `mimeType: application/yaml`. Wikilinks **into** YAML are not yet resolved; other YAML files index opaquely (whole source searchable, top-level exposed as frontmatter).
+
+**AsyncAPI 3.x YAML** (same admittance gate): `get_file_outline` returns one node per top-level operation (`send userSignedUp`, `receive lightMeasured`); `get_fragment` returns synthesized prose with the resolved channel address, message list, reply info, tags, plus a compact JSON fence of the full operation object. Intra-document `$ref` (`#/channels/<name>`, `#/channels/<chan>/messages/<msg>`) is resolved; external `$ref` renders verbatim. `## Channels` and `## Components` catch-all sections keep large specs navigable. AsyncAPI 2.x (with nested `publish`/`subscribe`) is deferred and falls through to opaque YAML emission.
 
 ## Typical agent flow
 
@@ -592,7 +594,7 @@ Domain errors come back as `isError: true` with `structuredContent: { code, mess
 | `INDEX_WARMING` | Index isn't ready yet. Transient — retry per `retry_after_ms`. |
 | `FILE_TOO_LARGE` | File is over 10 MB. |
 | `MARKDOWN_PARSE_ERROR` | Markdown parser failed. `reason: "syntax" \| "ast_node_cap_exceeded" \| "encoding_failed"` discriminates. |
-| `YAML_PARSE_ERROR` | YAML parser failed (opaque YAML or OpenAPI 3.x). `reason: "syntax" \| "ast_node_cap_exceeded" \| "encoding_failed"` discriminates. |
+| `YAML_PARSE_ERROR` | YAML parser failed (opaque YAML, OpenAPI 3.x, or AsyncAPI 3.x). `reason: "syntax" \| "ast_node_cap_exceeded" \| "encoding_failed"` discriminates. |
 | `INTERNAL_ERROR` | Unhandled server error. `request_id` ties to the stderr log line. |
 
 ## Security model

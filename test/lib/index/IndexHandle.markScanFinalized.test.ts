@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { createIndexHandle, type IndexHandle } from "../../../src/lib/index/IndexHandle.js";
 import { closeSqlite, openSqlite } from "../../../src/lib/index/sqlite.js";
+import { PARSER_SHAPE_VERSION } from "../../../src/lib/parsers/version.js";
 
 let opened: ReturnType<typeof openSqlite>;
 
@@ -125,6 +126,51 @@ describe("markScanFinalized atomicity", () => {
 	});
 });
 
+describe("parser_shape_version persistence", () => {
+	test("getParserShapeVersionPolicy returns null on a fresh DB before any finalize", () => {
+		const index: IndexHandle = createIndexHandle(opened.db, { includeHidden: false });
+		expect(index.getParserShapeVersionPolicy()).toBeNull();
+	});
+
+	test("markScanFinalized persists the running PARSER_SHAPE_VERSION", () => {
+		const index: IndexHandle = createIndexHandle(opened.db, { includeHidden: false });
+		index.markScanFinalized();
+		expect(index.getParserShapeVersionPolicy()).toBe(PARSER_SHAPE_VERSION);
+	});
+
+	test("parser_shape_version writes atomically alongside scan_complete + ever_complete + include_hidden", () => {
+		const index: IndexHandle = createIndexHandle(opened.db, { includeHidden: true });
+		index.markScanFinalized();
+		const row = opened.db
+			.prepare("SELECT scan_complete, ever_complete, include_hidden, parser_shape_version FROM index_meta WHERE id = 1")
+			.get() as {
+			scan_complete: number;
+			ever_complete: number;
+			include_hidden: number | null;
+			parser_shape_version: number | null;
+		};
+		expect(row).toEqual({
+			scan_complete: 1,
+			ever_complete: 1,
+			include_hidden: 1,
+			parser_shape_version: PARSER_SHAPE_VERSION,
+		});
+	});
+
+	test("re-finalize after manual column reset re-stamps the running version", () => {
+		// Manual UPDATE simulates an out-of-band cache corruption or a
+		// downgrade-then-upgrade cycle. The next finalize writes the
+		// current in-code value regardless of what's on disk.
+		const index: IndexHandle = createIndexHandle(opened.db, { includeHidden: false });
+		index.markScanFinalized();
+		opened.db.prepare("UPDATE index_meta SET parser_shape_version = 0 WHERE id = 1").run();
+		expect(index.getParserShapeVersionPolicy()).toBe(0);
+
+		index.markScanFinalized();
+		expect(index.getParserShapeVersionPolicy()).toBe(PARSER_SHAPE_VERSION);
+	});
+});
+
 describe("multi-process write-on-change cache removal", () => {
 	test("setScanComplete writes disk even when this handle's prior observation matches the requested value", () => {
 		// Same-policy multi-process operation is allowed. Peer A and
@@ -162,5 +208,47 @@ describe("multi-process write-on-change cache removal", () => {
 		// still write disk regardless.
 		peerB.setInflightIncludeHidden(true);
 		expect(readMeta().inflight_include_hidden).toBe(1);
+	});
+});
+
+describe("inflight_parser_shape_version", () => {
+	function readInflightShape(): number | null {
+		const row = opened.db.prepare("SELECT inflight_parser_shape_version FROM index_meta WHERE id = 1").get() as {
+			inflight_parser_shape_version: number | null;
+		};
+		return row.inflight_parser_shape_version;
+	}
+
+	test("setter / getter round-trip via the dedicated column", () => {
+		const index: IndexHandle = createIndexHandle(opened.db, { includeHidden: false });
+		expect(index.getInflightParserShape()).toBeNull();
+		index.setInflightParserShape(PARSER_SHAPE_VERSION);
+		expect(readInflightShape()).toBe(PARSER_SHAPE_VERSION);
+		expect(index.getInflightParserShape()).toBe(PARSER_SHAPE_VERSION);
+	});
+
+	test("markScanFinalized clears the inflight column atomically", () => {
+		const index: IndexHandle = createIndexHandle(opened.db, { includeHidden: false });
+		index.setInflightParserShape(PARSER_SHAPE_VERSION);
+		expect(readInflightShape()).toBe(PARSER_SHAPE_VERSION);
+
+		index.markScanFinalized();
+
+		expect(readInflightShape()).toBeNull();
+		expect(index.getInflightParserShape()).toBeNull();
+		// Finalize still writes the canonical stamp into the finalized column.
+		const finalized = opened.db.prepare("SELECT parser_shape_version FROM index_meta WHERE id = 1").get() as {
+			parser_shape_version: number;
+		};
+		expect(finalized.parser_shape_version).toBe(PARSER_SHAPE_VERSION);
+	});
+
+	test("stale inflight value from an interrupted older binary surfaces on next open", () => {
+		// Simulate: an older binary started a scan, wrote inflight=9,
+		// then SIGTERMed before finalize. A fresh handle (this one) opens
+		// the same DB and reads the stale value.
+		opened.db.prepare("UPDATE index_meta SET inflight_parser_shape_version = 9 WHERE id = 1").run();
+		const index: IndexHandle = createIndexHandle(opened.db, { includeHidden: false });
+		expect(index.getInflightParserShape()).toBe(9);
 	});
 });

@@ -2,11 +2,15 @@ import type { IndexState } from "../types.js";
 
 /**
  * Stderr log fragment emitted when {@link chooseStartupState} forces a
- * cold rescan because of a policy mismatch. Exported so tests assert
- * against the same string the production code emits — if the copy ever
- * changes, both move together.
+ * cold rescan because of any policy / configuration mismatch axis
+ * ({@link computePolicyMismatch} — `--include-hidden`, `VAULT_EXTENSIONS`,
+ * `PARSER_SHAPE_VERSION`, or an interrupted-scan policy flip). Exported
+ * so tests assert against the same string the production code emits —
+ * if the copy ever changes, both move together. Wording is intentionally
+ * generic: a previous `--include-hidden`-specific copy misattributed
+ * every parser-shape / extensions bump to the hidden flag.
  */
-export const POLICY_MISMATCH_LOG_FRAGMENT = "--include-hidden policy changed since last run";
+export const POLICY_MISMATCH_LOG_FRAGMENT = "index policy or parser configuration changed since last run";
 
 /**
  * Inputs to {@link computePolicyMismatch}. Multiple signals collapse into
@@ -24,19 +28,43 @@ export interface PolicyMismatchInputs {
 	inflightIncludeHidden: boolean | null;
 	argIncludeHidden: boolean;
 	/**
-	 * D47 (optional, defaults to `null`) — persisted `VAULT_EXTENSIONS`
+	 * Optional (defaults to `null`) — persisted `VAULT_EXTENSIONS`
 	 * snapshot (sorted lowercase comma-joined) from the last cleanly-
-	 * finalized scan, or `null` for pre-D47 caches. Optional so pre-D47
-	 * test fixtures that don't exercise the extension-mismatch axis can
-	 * keep their existing call shape; production callers always supply
-	 * both this and `argVaultExtensions`.
+	 * finalized scan, or `null` for pre-column caches. Optional so
+	 * pre-column test fixtures that don't exercise the extension-mismatch
+	 * axis can keep their existing call shape; production callers always
+	 * supply both this and `argVaultExtensions`.
 	 */
 	vaultExtensionsPolicy?: string | null;
-	/** D47 (optional, defaults to `"md"`) — `VAULT_EXTENSIONS` snapshot
+	/** Optional (defaults to `"md"`) — `VAULT_EXTENSIONS` snapshot
 	 * for THIS run, canonicalized the same way (sorted lowercase
-	 * comma-joined). Defaulting to `"md"` matches the pre-D47 cache
+	 * comma-joined). Defaulting to `"md"` matches the pre-column cache
 	 * default so an omitted field never triggers a spurious mismatch. */
 	argVaultExtensions?: string;
+	/**
+	 * Optional (defaults to `null`) — persisted parser-output-shape
+	 * stamp from the last cleanly-finalized scan, or `null` for
+	 * pre-column caches.
+	 */
+	parserShapeVersion?: number | null;
+	/**
+	 * Optional (defaults to `0`) — in-code `PARSER_SHAPE_VERSION` for
+	 * THIS run. Defaulting to `0` matches the pre-column cache default
+	 * (`parserShapeVersion: null` also coerces to `0`) so an omitted
+	 * field never triggers a spurious mismatch.
+	 */
+	argParserShapeVersion?: number;
+	/**
+	 * `PARSER_SHAPE_VERSION` of an IN-FLIGHT (interrupted) scan, or `null`
+	 * when no scan is in progress / last scan finalized cleanly. Closes the
+	 * downgrade-after-interrupt mixed-shape window the finalized stamp
+	 * alone cannot detect: when a cold rescan under shape Y is interrupted
+	 * before `markScanFinalized` runs, the persisted `parser_shape_version`
+	 * still records the prior clean shape X; a subsequent restart at shape
+	 * X compares equal on the finalized axis and would otherwise serve a
+	 * warm snapshot containing partial shape-Y rows.
+	 */
+	inflightParserShapeVersion?: number | null;
 }
 
 /**
@@ -51,12 +79,19 @@ export interface PolicyMismatchInputs {
  *    `args.includeHidden`. Without this signal, `chooseStartupState`
  *    would return warm via `(preexisted && everComplete)` and serve a
  *    contaminated snapshot.
- * 3. **D47 — `VAULT_EXTENSIONS` mismatch**: the persisted extension list
+ * 3. **`VAULT_EXTENSIONS` mismatch**: the persisted extension list
  *    differs from this run's. Symmetric in both directions: adding `yaml`
  *    needs to index previously-skipped files; removing `yaml` needs to
  *    prune existing YAML rows from search. NULL coerces to `"md"` (the
- *    pre-D47 default extension), so an upgrader opening a default-built
+ *    pre-column default extension), so an upgrader opening a default-built
  *    cache with `VAULT_EXTENSIONS=md,yaml,yml` is caught.
+ * 4. **Parser-output-shape mismatch**: NULL coerces to `0` so any
+ *    pre-column cache mismatches a non-zero in-code constant. See the
+ *    field JSDoc on `parserShapeVersion` for the upgrade rationale.
+ * 5. **Interrupted-scan parser-shape mismatch**: a scan was interrupted
+ *    (`scan_complete=false`) at a different `PARSER_SHAPE_VERSION` than
+ *    this run's binary. See the field JSDoc on `inflightParserShapeVersion`
+ *    for the downgrade-after-interrupt scenario axis 4 cannot detect.
  *
  * `preexisted=false` short-circuits to false; a fresh DB forces cold via
  * the rest of `chooseStartupState`.
@@ -68,7 +103,11 @@ export function computePolicyMismatch(inputs: PolicyMismatchInputs): boolean {
 	const persistedExt = inputs.vaultExtensionsPolicy ?? "md";
 	const argExt = inputs.argVaultExtensions ?? "md";
 	if (persistedExt !== argExt) return true;
+	const persistedShape = inputs.parserShapeVersion ?? 0;
+	const argShape = inputs.argParserShapeVersion ?? 0;
+	if (persistedShape !== argShape) return true;
 	if (inputs.scanComplete) return false;
+	if (inputs.inflightParserShapeVersion != null && inputs.inflightParserShapeVersion !== argShape) return true;
 	if (inputs.inflightIncludeHidden === null) return false;
 	return inputs.inflightIncludeHidden !== inputs.argIncludeHidden;
 }

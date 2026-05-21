@@ -110,16 +110,20 @@ describe("openSqlite", () => {
 		);
 	});
 
-	test("index_meta has scan_complete + ever_complete + include_hidden + inflight_include_hidden + last_scan_finished_at + vault_extensions columns", () => {
+	test("index_meta has scan_complete + ever_complete + include_hidden + inflight_include_hidden + last_scan_finished_at + vault_extensions + parser_shape_version + inflight_parser_shape_version columns", () => {
 		const { db } = open();
 		const cols = (db.prepare("PRAGMA table_info(index_meta)").all() as Array<{ name: string }>).map((c) => c.name);
-		// D37 adds `last_scan_finished_at`; D47 adds `vault_extensions`.
+		// Column additions: `last_scan_finished_at`, `vault_extensions`,
+		// `parser_shape_version`, and `inflight_parser_shape_version`
+		// (symmetric with `inflight_include_hidden`).
 		expect(cols.sort()).toEqual([
 			"ever_complete",
 			"id",
 			"include_hidden",
 			"inflight_include_hidden",
+			"inflight_parser_shape_version",
 			"last_scan_finished_at",
+			"parser_shape_version",
 			"scan_complete",
 			"vault_extensions",
 		]);
@@ -148,13 +152,15 @@ describe("openSqlite", () => {
 					"id",
 					"include_hidden",
 					"inflight_include_hidden",
+					"inflight_parser_shape_version",
 					"last_scan_finished_at",
+					"parser_shape_version",
 					"scan_complete",
 					"vault_extensions",
 				]);
 				const row = opened.db
 					.prepare(
-						"SELECT scan_complete, ever_complete, include_hidden, inflight_include_hidden, last_scan_finished_at, vault_extensions FROM index_meta WHERE id = 1",
+						"SELECT scan_complete, ever_complete, include_hidden, inflight_include_hidden, last_scan_finished_at, vault_extensions, parser_shape_version, inflight_parser_shape_version FROM index_meta WHERE id = 1",
 					)
 					.get() as {
 					scan_complete: number;
@@ -163,16 +169,18 @@ describe("openSqlite", () => {
 					inflight_include_hidden: number | null;
 					last_scan_finished_at: number | null;
 					vault_extensions: string | null;
+					parser_shape_version: number | null;
+					inflight_parser_shape_version: number | null;
 				};
 				expect(row.scan_complete).toBe(1);
 				expect(row.ever_complete).toBe(1);
 				expect(row.include_hidden).toBeNull();
 				expect(row.inflight_include_hidden).toBeNull();
-				// D37: newly-added column starts NULL on legacy DBs until the
-				// first post-upgrade `markScanFinalized` populates it.
+				// Newly-added columns start NULL on legacy DBs until the
+				// first post-upgrade `markScanFinalized` populates them.
 				expect(row.last_scan_finished_at).toBeNull();
-				// D47: same applies to vault_extensions.
 				expect(row.vault_extensions).toBeNull();
+				expect(row.parser_shape_version).toBeNull();
 			} finally {
 				closeSqlite(opened.db);
 			}
@@ -218,7 +226,9 @@ describe("runMigrationV1 concurrent same-policy peers", () => {
 						"id",
 						"include_hidden",
 						"inflight_include_hidden",
+						"inflight_parser_shape_version",
 						"last_scan_finished_at",
+						"parser_shape_version",
 						"scan_complete",
 						"vault_extensions",
 					]);

@@ -193,9 +193,9 @@ describe("computePolicyMismatch", () => {
 		).toBe(false);
 	});
 
-	// ─── D47 — VAULT_EXTENSIONS mismatch ───────────────────────────────
+	// ─── VAULT_EXTENSIONS mismatch ───────────────────────────────
 
-	test("D47 — vaultExtensionsPolicy='md' vs argVaultExtensions='md,yaml,yml' → mismatch", () => {
+	test("vaultExtensionsPolicy='md' vs argVaultExtensions='md,yaml,yml' → mismatch", () => {
 		expect(
 			computePolicyMismatch({
 				preexisted: true,
@@ -209,9 +209,9 @@ describe("computePolicyMismatch", () => {
 		).toBe(true);
 	});
 
-	test("D47 — pre-column legacy DB (NULL extensions) opened with VAULT_EXTENSIONS=md,yaml,yml → mismatch", () => {
-		// Pre-D47 caches default to NULL `vault_extensions`. Coerced to `"md"`
-		// (the pre-D47 default) — non-default `argVaultExtensions` fires.
+	test("pre-column legacy DB (NULL extensions) opened with VAULT_EXTENSIONS=md,yaml,yml → mismatch", () => {
+		// Pre-column caches default to NULL `vault_extensions`. Coerced to `"md"`
+		// (the pre-column default) — non-default `argVaultExtensions` fires.
 		expect(
 			computePolicyMismatch({
 				preexisted: true,
@@ -225,7 +225,7 @@ describe("computePolicyMismatch", () => {
 		).toBe(true);
 	});
 
-	test("D47 — pre-column legacy DB (NULL extensions) opened with default 'md' → no mismatch", () => {
+	test("pre-column legacy DB (NULL extensions) opened with default 'md' → no mismatch", () => {
 		expect(
 			computePolicyMismatch({
 				preexisted: true,
@@ -239,7 +239,7 @@ describe("computePolicyMismatch", () => {
 		).toBe(false);
 	});
 
-	test("D47 — extensions match exactly → no mismatch even when arg sorted", () => {
+	test("extensions match exactly → no mismatch even when arg sorted", () => {
 		// Production callers canonicalize via `[...getVaultExtensions()].sort().join(",")`
 		// before comparing, so the persisted value is already sorted.
 		expect(
@@ -255,7 +255,7 @@ describe("computePolicyMismatch", () => {
 		).toBe(false);
 	});
 
-	test("D47 — removing yaml from VAULT_EXTENSIONS also triggers mismatch (symmetric)", () => {
+	test("removing yaml from VAULT_EXTENSIONS also triggers mismatch (symmetric)", () => {
 		// 'md,yaml,yml' → 'md' must prune YAML rows from search via cold rescan.
 		expect(
 			computePolicyMismatch({
@@ -268,5 +268,159 @@ describe("computePolicyMismatch", () => {
 				argVaultExtensions: "md",
 			}),
 		).toBe(true);
+	});
+
+	// ─── PARSER_SHAPE_VERSION mismatch ───────────────────────────
+
+	test("persisted shape version less than arg → mismatch (upgrade past synthesizer bump)", () => {
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				parserShapeVersion: 0,
+				argParserShapeVersion: 1,
+			}),
+		).toBe(true);
+	});
+
+	test("pre-column legacy DB (NULL shape) opened with non-zero arg → mismatch", () => {
+		// Pre-column caches default to NULL parser_shape_version. Coerced to 0;
+		// any non-zero in-code constant triggers the cold rescan that lets
+		// previously-indexed YAML files pick up new synthesizer output.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				parserShapeVersion: null,
+				argParserShapeVersion: 1,
+			}),
+		).toBe(true);
+	});
+
+	test("shape versions equal → no mismatch", () => {
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				parserShapeVersion: 1,
+				argParserShapeVersion: 1,
+			}),
+		).toBe(false);
+	});
+
+	test("pre-column legacy DB opened with arg=0 → no mismatch", () => {
+		// Symmetric to the 'NULL persisted + default arg = no mismatch'
+		// case: omitting argParserShapeVersion (or stubbing 0) shouldn't
+		// fire on a pre-column cache.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				parserShapeVersion: null,
+				argParserShapeVersion: 0,
+			}),
+		).toBe(false);
+	});
+
+	test("both axes (extensions + shape) mismatching → mismatch (any axis triggers)", () => {
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				vaultExtensionsPolicy: "md",
+				argVaultExtensions: "md,yaml,yml",
+				parserShapeVersion: 0,
+				argParserShapeVersion: 1,
+			}),
+		).toBe(true);
+	});
+
+	test("shape downgrade (persisted > arg) also fires (symmetric)", () => {
+		// Defensive: if a contributor accidentally lowers PARSER_SHAPE_VERSION
+		// or a user downgrades the binary, force a cold rescan rather than
+		// trusting an unknown-future-shape snapshot.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				parserShapeVersion: 2,
+				argParserShapeVersion: 1,
+			}),
+		).toBe(true);
+	});
+
+	test("downgrade after interrupted-shape-Y rescan forces cold when inflight differs from arg", () => {
+		// T0 clean scan at shape X=1 → parser_shape_version=1, everComplete=true.
+		// T1 upgrade to shape Y=2 starts cold rescan, sets inflight=2.
+		// T2 SIGTERM mid-pass; parser_shape_version still 1.
+		// T3 user reverts to shape X=1 binary; finalized stamp matches (1==1)
+		// but inflight (2) differs → mismatch → cold rescan over the partial
+		// shape-Y rows.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: false,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: false,
+				argIncludeHidden: false,
+				parserShapeVersion: 1,
+				argParserShapeVersion: 1,
+				inflightParserShapeVersion: 2,
+			}),
+		).toBe(true);
+	});
+
+	test("interrupted scan at same parser shape as the running binary is not a mismatch", () => {
+		// Interrupted scan ran at the same shape we now boot under — no
+		// mixed-shape hazard. The warm `everComplete` branch correctly
+		// serves the prior snapshot while reconcile resumes.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: false,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: false,
+				argIncludeHidden: false,
+				parserShapeVersion: 1,
+				argParserShapeVersion: 1,
+				inflightParserShapeVersion: 1,
+			}),
+		).toBe(false);
+	});
+
+	test("clean finalize ignores inflight parser-shape regardless of value", () => {
+		// scanComplete=true short-circuits before the inflight check; the
+		// inflight column should be NULL post-finalize anyway, but a stale
+		// non-null value must not cause a spurious mismatch.
+		expect(
+			computePolicyMismatch({
+				preexisted: true,
+				scanComplete: true,
+				includeHiddenPolicy: false,
+				inflightIncludeHidden: null,
+				argIncludeHidden: false,
+				parserShapeVersion: 1,
+				argParserShapeVersion: 1,
+				inflightParserShapeVersion: 99, // stale but ignored
+			}),
+		).toBe(false);
 	});
 });
