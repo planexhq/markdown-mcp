@@ -34,7 +34,8 @@
     "notes",
     "ai",
     "claude",
-    "rag"
+    "rag",
+    "prisma"
   ],
   "engines": {
     "node": ">=22.0.0"
@@ -56,6 +57,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@mrleebo/prisma-ast": "^0.16.0",
     "better-sqlite3": "^12.9.0",
     "chokidar": "^4.0.3",
     "mdast-util-to-string": "^4.0.0",

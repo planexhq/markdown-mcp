@@ -46,6 +46,7 @@ import {
 import { NAMED_ESCAPES } from "./controlChars.js";
 import { errorMessage } from "./error.js";
 import { MAX_AST_NODES } from "./limits.js";
+import { parsePrismaFile } from "./parsers/prisma.js";
 import { parseYamlFile } from "./parsers/yaml.js";
 import { buildStructuralPath, type StructuralAncestor, stableId } from "./structuralPath.js";
 import { estimateTokens } from "./tokenizer.js";
@@ -145,8 +146,8 @@ export interface ParsedFile {
  */
 export type ParseErrorReason = "syntax" | "ast_node_cap_exceeded" | "encoding_failed";
 
-/** D45 — parser-format discriminator on `ParseError`. Routes to the right error code. */
-export type ParseErrorFormat = "markdown" | "yaml";
+/** Parser-format discriminator on `ParseError`. Routes to the right error code. */
+export type ParseErrorFormat = "markdown" | "yaml" | "prisma";
 
 export class ParseError extends Error {
 	override readonly name = "ParseError";
@@ -181,6 +182,14 @@ export class ParseError extends Error {
 	 */
 	static yaml(reason: ParseErrorReason, message: string, opts: { line?: number; column?: number } = {}): ParseError {
 		return new ParseError(reason, message, opts.line, opts.column, "yaml");
+	}
+
+	/**
+	 * Convenience factory for Prisma-source errors. Mirror of {@link ParseError.yaml}
+	 * so PSL parse failures route to `PRISMA_PARSE_ERROR` via `parseErrorPayload`.
+	 */
+	static prisma(reason: ParseErrorReason, message: string, opts: { line?: number; column?: number } = {}): ParseError {
+		return new ParseError(reason, message, opts.line, opts.column, "prisma");
 	}
 
 	/**
@@ -239,6 +248,7 @@ export interface ParseFileOptions {
 export function parseFile(source: string, relpath: string, options: ParseFileOptions = {}): ParsedFile {
 	const kind = getParserKind(relpath);
 	if (kind === "yaml") return parseYamlFile(source, relpath, options);
+	if (kind === "prisma") return parsePrismaFile(source, relpath, options);
 	return parseMarkdownFile(source, relpath, options);
 }
 

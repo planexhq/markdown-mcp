@@ -9,6 +9,7 @@
  * `""`) is similarly AsyncAPI-local until a second consumer needs it.
  */
 
+import type { Range } from "../../types.js";
 import { errorMessage } from "../error.js";
 import { isPlainObject, ParseError } from "../parser.js";
 
@@ -129,6 +130,18 @@ export interface FenceContent {
 }
 
 /**
+ * `JSON.stringify` replacer that drops `DANGEROUS_KEYS` inline — same
+ * security property as `deepSanitize` for fence output, without
+ * allocating a copy of the input tree. Synthesizers that don't already
+ * `deepSanitize` their value (e.g. Prisma, whose AST is consumed
+ * verbatim) pass this as the `replacer` argument to
+ * `stringifyJsonForFence`.
+ */
+export function jsonSanitizeReplacer(key: string, value: unknown): unknown {
+	return DANGEROUS_KEYS.has(key) ? undefined : value;
+}
+
+/**
  * Serialize a value as compact JSON for a `code` FTS fence. On
  * truncation the fence language drops to `text` so an agent calling
  * `JSON.parse` on `get_fragment(file).content` doesn't fail on the
@@ -141,18 +154,30 @@ export interface FenceContent {
  * (`"OpenAPI operation"`, `"AsyncAPI components"`) so the surfaced
  * `YAML_PARSE_ERROR` identifies which fence emitter failed.
  *
+ * `onSerializationError` is opt-in: when omitted, errors surface as
+ * `ParseError.yaml("syntax", ...)` (the OpenAPI/AsyncAPI default).
+ * Prisma passes `(msg) => ParseError.prisma("syntax", msg)` so the
+ * error code reflects the actual format. `replacer` is opt-in too —
+ * synthesizers that don't pre-sanitize pass `jsonSanitizeReplacer`.
+ *
  * Transient `JSON.stringify` peak is bounded by the upstream 10 MB
  * file cap; fences emit sequentially, not summed.
  */
-export function stringifyJsonForFence(value: unknown, label: string): FenceContent {
+export function stringifyJsonForFence(
+	value: unknown,
+	label: string,
+	onSerializationError?: (message: string) => Error,
+	replacer?: (key: string, value: unknown) => unknown,
+): FenceContent {
 	try {
-		const s = JSON.stringify(value);
+		const s = JSON.stringify(value, replacer);
 		if (typeof s !== "string") return { body: "{}", language: "json" };
 		if (s.length <= MAX_FENCE_JSON_BYTES) return { body: s, language: "json" };
 		const elided = `${s.slice(0, MAX_FENCE_JSON_BYTES)}\n... (truncated; ${s.length - MAX_FENCE_JSON_BYTES} bytes elided)`;
 		return { body: elided, language: "text" };
 	} catch (cause) {
-		throw ParseError.yaml("syntax", `${label} not JSON-serializable: ${errorMessage(cause)}`);
+		const msg = `${label} not JSON-serializable: ${errorMessage(cause)}`;
+		throw onSerializationError ? onSerializationError(msg) : ParseError.yaml("syntax", msg);
 	}
 }
 
@@ -160,4 +185,58 @@ export function stringifyJsonForFence(value: unknown, label: string): FenceConte
 export function stringField(obj: Record<string, unknown>, key: string): string | null {
 	const v = obj[key];
 	return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/**
+ * Precompute the start offset of every line in `source`. `lineStarts[i]`
+ * is the byte offset of the `i`-th line (0-indexed); built once per
+ * synthesis. Synthesized source is `\n`-only by construction (no `\r` is
+ * ever emitted); a CR-aware variant for on-disk content lives in
+ * `parser.ts:countLines`.
+ */
+export function computeLineStarts(source: string): number[] {
+	const starts: number[] = [0];
+	for (let i = 0; i < source.length; i++) {
+		if (source.charCodeAt(i) === 10) starts.push(i + 1);
+	}
+	return starts;
+}
+
+/** Upper-bound binary search: largest `i` with `lineStarts[i] <= offset`. Result is 1-based. */
+export function offsetToLine(lineStarts: ReadonlyArray<number>, offset: number): number {
+	const clamped = Math.max(0, offset);
+	let lo = 0;
+	let hi = lineStarts.length;
+	while (lo < hi) {
+		const mid = (lo + hi) >>> 1;
+		const start = lineStarts[mid] ?? 0;
+		if (start <= clamped) lo = mid + 1;
+		else hi = mid;
+	}
+	return Math.max(lo, 1);
+}
+
+export function computeLineRange(lineStarts: ReadonlyArray<number>, startOffset: number, endOffset: number): Range {
+	return {
+		start: offsetToLine(lineStarts, startOffset),
+		end: offsetToLine(lineStarts, Math.max(endOffset - 1, startOffset)),
+	};
+}
+
+/**
+ * GitHub-compatible kebab slug: lowercase the input, replace non-alnum
+ * runs with `-`, trim leading/trailing `-`. Fallback returned when the
+ * resulting slug would be empty (input was entirely non-alnum).
+ */
+export function kebabSlug(input: string, fallback: string): string {
+	const slug = input
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return slug || fallback;
+}
+
+/** True iff `frontmatter` is a non-null record with at least one own key. Mirrors the predicate `ParsedFile.hasFrontmatter` carries on the wire. */
+export function hasFrontmatterKeys(frontmatter: Record<string, unknown> | null | undefined): boolean {
+	return frontmatter != null && Object.keys(frontmatter).length > 0;
 }

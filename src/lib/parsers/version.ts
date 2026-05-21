@@ -17,4 +17,4 @@
  * changed YAML fragment shape with no corresponding invalidation
  * mechanism — caches without this stamp stayed opaque.
  */
-export const PARSER_SHAPE_VERSION = 2;
+export const PARSER_SHAPE_VERSION = 3;

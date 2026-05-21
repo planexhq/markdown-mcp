@@ -804,13 +804,13 @@ function buildFragmentRows(parsed: ParsedFile): FragmentRowInput[] {
  * scopes its counter per call, and we call it once per source section.
  */
 function buildWikilinkRows(parsed: ParsedFile): WikilinkRowInput[] {
-	// Wikilinks INTO YAML are deferred to v1.x; wikilinks FROM YAML
-	// are also out of scope for v1. YAML files (opaque or OpenAPI-synthesized)
-	// emit zero wikilink rows. Without this gate, `[[X]]` text accidentally
-	// appearing inside a YAML scalar value would be extracted as a wikilink
-	// and persist in the `wikilinks` table, surfacing as a phantom outgoing
-	// link from the YAML's `file` row in `get_links`.
-	if (parsed.kind === "yaml") return [];
+	// Wikilinks FROM non-markdown surfaces are not indexed.
+	// YAML (opaque / OpenAPI / AsyncAPI) and PSL files emit zero wikilink
+	// rows. Without this gate, `[[X]]` text inside a YAML scalar value or
+	// a Prisma `///` doc comment would surface as a phantom outgoing link
+	// from the file row in `get_links`. Generalized to `!== "markdown"` so
+	// future non-markdown parser kinds pick up the same gate for free.
+	if (parsed.kind !== "markdown") return [];
 	const out: WikilinkRowInput[] = [];
 
 	const pushExtracted = (

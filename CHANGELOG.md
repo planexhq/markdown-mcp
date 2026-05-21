@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-Three OpenAPI synthesizer enhancements shipping together, plus the previously-released **HTTP transport** and **structured AsyncAPI 3.x synthesis** bundle. The OpenAPI work bumps `PARSER_SHAPE_VERSION` 1 → 2 — existing caches cold-rescan once on upgrade.
+Four feature sets shipping together: **structured Prisma schema (PSL) support**, three OpenAPI synthesizer enhancements (webhooks + prose enrichment + operationId slot + pollution defense), **HTTP transport**, and **structured AsyncAPI 3.x synthesis**. The combined work bumps `PARSER_SHAPE_VERSION` 1 → 3 — existing caches cold-rescan once on upgrade.
 
 ### Structured OpenAPI 3.x — webhooks, prose enrichment, operationId slot, pollution defense
 
@@ -101,6 +101,36 @@ AsyncAPI specs join OpenAPI and opaque YAML on the parseable surface; same `kind
 - **Per-protocol binding prose rendering** (Kafka headers, MQTT QoS, AMQP exchange types). Bindings reach FTS only via the JSON fence.
 - **`operation.reply.address.location` runtime-expression resolution** (e.g. `$message.header#/replyTo`) — rendered as-is in prose.
 - **Chained `$ref` resolution.** Refs that point to another ref (`#/components/operations/X` whose target is itself a `$ref`) stay unresolved; single-level dereference only.
+
+---
+
+Structured Prisma schema (PSL) support. `.prisma` files join markdown, OpenAPI YAML, AsyncAPI YAML, and opaque YAML on the parseable surface. Third synthesizer landing on the parser-kind axis; first non-YAML structured format.
+
+### Added
+
+- **Prisma 3rd-party `ParserKind` value.** `ParsedFile.kind` widened from `"markdown" | "yaml"` to `"markdown" | "yaml" | "prisma"`. `parseFile` routes `.prisma` to a new `parsePrismaFile` synthesizer (`src/lib/parsers/prisma.ts`); `.prisma` is NOT YAML, so the new parser sits as a peer to `parseYamlFile` at the dispatcher level, not nested inside it.
+- **Prisma schema synthesis.** Each top-level block (`model`, `enum`, `view`, `type`, `datasource`, `generator`) emits one `HeadingMeta`. `stable_id` slot input is `<kind>[sha14(name)]` — kind-prefixed so `model User` and `enum User` produce DISTINCT IDs. `get_file_outline` returns `<kind> <name>` headings (`model User`, `enum Role`, `datasource db`); `get_fragment` returns synthesized prose with block-level `///` doc comment paragraph, `Fields:` / `Values:` / `Settings:` bullet lists, optional `Table: <name>` line for `@@map("X")`, `Block attributes:` listing `@@id` / `@@index` / `@@unique` / `@@schema`, plus a compact JSON fence of the full AST subtree (64 KiB cap; language drops to `text` on truncation).
+- **`PRISMA_PARSE_ERROR` error code.** New `ParseErrorFormat` value `"prisma"`; `parseErrorPayload` extends to a 3-arm switch. Mirrors the per-surface precedent (`MARKDOWN_PARSE_ERROR` / `YAML_PARSE_ERROR` / now `PRISMA_PARSE_ERROR`) so agents disambiguate parser failures by surface.
+- **`note://` for `.prisma`.** `note://schema.prisma` returns the literal on-disk PSL with `mimeType: text/x-prisma`. Matches Prisma's own VS Code extension; no IANA-registered type exists. `get_fragment` returns the synthesized prose rendering — same split between resource (literal) and tool (synthesized) as the OpenAPI/AsyncAPI synthesizers.
+- **`VAULT_EXTENSIONS=md,prisma`.** The extension predicate now admits Prisma alongside markdown / YAML. `isParseablePath` gates scanner walk / watcher / `note://` / direct-read tools; `isResolvableLinkTarget` EXCLUDES `.prisma` (alongside YAML), so `[[User]]` does NOT silently retarget to `models/user.prisma`. `getParserKind` returns the new `"prisma"` value for `.prisma` extensions.
+- **`frontmatter` synthesis from datasource + generator blocks.** Top-level shape `{ datasource: {<name>: assignments}, generator: {<name>: assignments} }` so nested-path filters work (`fields["datasource.db.provider"].eq: "postgresql"` matches PostgreSQL-backed schemas; `fields["generator.client.provider"].eq` matches generator choice). Model / enum / view / type blocks are NOT exposed via frontmatter — they're addressable via headings.
+- **`## Schema notes` catch-all.** Free-floating `///` and `/* */` comments not attached to any block surface in a single trailing heading. Bare `//` comments are dropped (PSL's `///` is the only author-prose channel preserved by the AST).
+- **`@mrleebo/prisma-ast@^0.16.0`** added as a runtime dep (chevrotain-backed, 56 KB + ~150 KB transitive, used by Prisma's own dev tooling chain). Pinned minor; AST shape locked by a contract test (`prisma.test.ts:synthesizePrismaFile — AST shape contract`) so a future minor bump fails CI with a precise diff.
+
+### Changed
+
+- **`parsed.kind === "yaml"` → `parsed.kind !== "markdown"`** at `scanner.ts:793` (wikilink extraction) + `getFragment.ts:390` (read-time wikilink/embed gate). Both sites encode the more general invariant "doesn't participate in markdown wikilinks." Future non-markdown parsers inherit the gate for free; no zero-line update needed when adding the next kind.
+- **mimeType resolver in `server.ts:345` + `getVaultTree.ts:142`** widened from a 2-arm ternary (`yaml` → `application/yaml`, else `text/markdown`) to a 3-arm switch (`yaml` → `application/yaml`, `prisma` → `text/x-prisma`, else `text/markdown`).
+- **`PARSER_SHAPE_VERSION` bumped 2 → 3.** Forces a one-time cold rescan on upgrade so previously-skipped `.prisma` files admitted via `VAULT_EXTENSIONS=md,prisma` pick up structured fragments. (PR #6 had already bumped 1 → 2 for the OpenAPI 3.1 rollout; this is the next sequential.)
+
+### Out of scope (later)
+
+- **Wikilinks INTO `.prisma`.** `[[User]]` does not resolve to `models/user.prisma` — same deferral as YAML. Admitting `.prisma` to the resolver requires basename-collision rules between `user.md` and `user.prisma`.
+- **`[[schema.prisma#model User]]`** Prisma fragment refs in wikilinks.
+- **Multi-file Prisma schemas** (Prisma 5+ preview feature). Each `.prisma` file is parsed independently; cross-file relation refs render as bare type names.
+- **Per-field nested headings.** Field-level `///` surfaces in the `Fields:` bullet list but fields are not independently addressable via `heading_path`.
+- **Prisma migration files** (`.sql` files in `prisma/migrations/`). Users can opt into `.sql` via `VAULT_EXTENSIONS=md,prisma,sql` for opaque indexing, but no SQL synthesizer ships.
+- **Surfacing the relation graph as `get_links` rows.** Prisma `@relation(fields: [...], references: [...])` is structurally a foreign key, not a wikilink. Exposing the graph via `get_links` needs a separate ADR — every `User` ↔ `Post` relation would surface as a link edge, which may or may not match agent intent.
 
 ## [1.1.0] — 2026-05-19
 

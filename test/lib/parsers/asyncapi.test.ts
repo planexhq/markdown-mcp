@@ -3675,6 +3675,37 @@ operations:
 		expect(JSON.stringify(fenceJson)).not.toContain("deep-leak");
 	});
 
+	test("YAML 1.1 timestamp scalar (parsed as Date) preserves ISO string in fence, not {}", () => {
+		// Under default yaml@2.x (YAML 1.2 schema) ISO-shape strings stay strings;
+		// under a `%YAML 1.1` directive OR explicit `!!timestamp` tag, they become
+		// `Date` instances. The shared `deepSanitize`'s `isPlainObject` guard MUST
+		// reject Date so the fall-through path lets `JSON.stringify` invoke
+		// `Date.prototype.toJSON` — otherwise the value walks Object.keys() and
+		// serializes to `{}`, silently dropping user data.
+		const parsed = parseYamlFile(
+			`%YAML 1.1
+---
+asyncapi: "3.0.0"
+info: { title: T, version: "1" }
+channels:
+  q:
+    address: rpc/q
+operations:
+  emit:
+    action: send
+    channel:
+      $ref: "#/channels/q"
+    bindings:
+      kafka:
+        recordedAt: 2024-06-01T00:00:00Z
+`,
+			"x.yaml",
+		);
+		const fenceJson = JSON.parse(readFenceBody(parsed, "send emit"));
+		expect(fenceJson.bindings.kafka.recordedAt).toBe("2024-06-01T00:00:00.000Z");
+		expect(fenceJson.bindings.kafka.recordedAt).not.toEqual({});
+	});
+
 	test("regression-pin: clean nested trait inputs unchanged", () => {
 		const parsed = parseYamlFile(
 			`asyncapi: "3.0.0"

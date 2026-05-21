@@ -18,7 +18,7 @@ import { extname, posix } from "node:path";
 import type { Embed, EmbedKind, OutgoingLink } from "../types.js";
 import { type ExcludedRange, isInsideAny } from "./blockIds.js";
 import { normalizeHeadingText } from "./parser.js";
-import { getVaultExtensions, isAssetPath, isResolvableLinkTarget, YAML_EXTENSIONS } from "./vaultExtensions.js";
+import { getVaultExtensions, isAssetPath, isLinkableExtension, isResolvableLinkTarget } from "./vaultExtensions.js";
 
 // ─── Extraction ────────────────────────────────────────────────────────────
 
@@ -421,6 +421,7 @@ function resolveFile(filePart: string, sourceFile: string, vaultIndex: VaultFile
 			const bucket = vaultIndex.filesByBasename(baseLower);
 			const matches: string[] = [];
 			for (const cand of bucket) {
+				if (!isResolvableLinkTarget(cand)) continue;
 				const candNoExtLower = stripMarkdownExt(cand).toLowerCase();
 				if (!candNoExtLower.endsWith(`/${suffixLower}`)) continue;
 				if (explicitExt !== null && extname(cand).toLowerCase() !== explicitExt) continue;
@@ -446,7 +447,9 @@ function resolveFile(filePart: string, sourceFile: string, vaultIndex: VaultFile
 	if (isAssetPath(filePart)) {
 		return { resolved: false, file: "" };
 	}
-	const matches = vaultIndex.filesByBasename(stripMarkdownExt(filePart).toLowerCase());
+	const matches = vaultIndex
+		.filesByBasename(stripMarkdownExt(filePart).toLowerCase())
+		.filter((f) => isResolvableLinkTarget(f));
 	if (matches.length === 0) return { resolved: false, file: "" };
 	if (matches.length === 1) return { resolved: true, file: matches[0] ?? "" };
 
@@ -464,16 +467,13 @@ function segmentLength(relpath: string): number {
 
 /**
  * Try `${base}.${ext}` for every configured vault extension that's a valid
- * wikilink target (mirrors `isResolvableLinkTarget`: configured AND not
- * YAML-family). D46 defers wikilinks INTO YAML — without the YAML filter,
- * `[[notes/auth]]` would silently resolve to `notes/auth.yaml` in vaults
- * configured with `VAULT_EXTENSIONS=md,yaml,yml` when no markdown match
- * exists. Hardcoding `.md` instead would miss `notes/auth.mdx` in
- * mixed-markdown-extension vaults.
+ * wikilink target — `isLinkableExtension` enforces the family rules
+ * (markdown only; YAML and Prisma deferred). Hardcoding `.md`
+ * would miss `notes/auth.mdx` in mixed-markdown-extension vaults.
  */
 function findFileWithVaultExt(vaultIndex: VaultFileIndex, base: string): string | null {
 	for (const ext of getVaultExtensions()) {
-		if (YAML_EXTENSIONS.has(ext)) continue;
+		if (!isLinkableExtension(ext)) continue;
 		const found = vaultIndex.findFileCi(`${base}.${ext}`);
 		if (found !== null) return found;
 	}
