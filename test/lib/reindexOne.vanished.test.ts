@@ -10,7 +10,7 @@
  * through the callback and need the vanished branch.
  */
 
-import { rm, writeFile } from "node:fs/promises";
+import { rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -89,6 +89,23 @@ describe("reindexOne — vanished file outcome", () => {
 		expect(outcome).toBe("vanished");
 		// Index never picked up the non-markdown row (was never indexed).
 		expect(index.getFileMtime(target)).toBeNull();
+	});
+
+	test("symlink-leaf markdown path → 'vanished' early-exit (mirrors walkVault skip)", async () => {
+		// chokidar with `followSymlinks: false` still emits `add` events
+		// for symlink leaves themselves. Without the gate in `reindexOne`,
+		// validatePath rejects with SYMLINK_SEGMENT → parse_failed →
+		// addPendingRetry, but walkVault never re-enumerates the symlink so
+		// the entry sits in pendingRetries forever and wedges the warming
+		// gate (state stays at `warming`, `ever_complete=false`).
+		const realTarget = "real.md";
+		const linkTarget = "alias.md";
+		await writeFile(join(vault.path, realTarget), "# Real\n", "utf8");
+		await symlink(realTarget, join(vault.path, linkTarget));
+		const outcome = await reindexOne(vaultRoot, index, linkTarget);
+		expect(outcome).toBe("vanished");
+		// Symlink path was never indexed (gate short-circuits before indexOne).
+		expect(index.getFileMtime(linkTarget)).toBeNull();
 	});
 
 	test("stale row for renamed-to-non-markdown is cleared by 'vanished' route", async () => {

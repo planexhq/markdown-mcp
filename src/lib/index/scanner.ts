@@ -703,6 +703,19 @@ export async function reindexOne(
 	// removeFile + clearPendingRetry; the former is a no-op for
 	// never-indexed paths and correct for renamed-to-non-markdown rows.
 	if (!isParseablePath(relpath)) return "vanished";
+	// chokidar emits `add` for symlink leaves even with
+	// `followSymlinks: false`; without this gate, validatePath's
+	// SYMLINK_SEGMENT → parse_failed → pendingRetry wedges the warming
+	// gate (next scan won't enumerate the symlink either). Mirror
+	// walkVault's lstat-skip.
+	try {
+		const st = await lstat(join(vaultRoot.absolute, relpath));
+		if (st.isSymbolicLink()) return "vanished";
+	} catch (err) {
+		if (isVanishedErrno(err)) return "vanished";
+		// Other errno (EACCES, EIO, …) — let `indexOne` classify via
+		// `validatePath`'s own segment walk.
+	}
 	return indexOne(vaultRoot, index, relpath, true, includeHidden);
 }
 
