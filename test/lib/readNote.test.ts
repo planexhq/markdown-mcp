@@ -112,7 +112,7 @@ describe("readNote — encoding errors", () => {
 });
 
 describe("readNote — VAULT_EXTENSIONS gate", () => {
-	test("non-markdown extension (.txt) → PathValidationError PATH_NOT_FOUND", async () => {
+	test("non-markdown extension (.txt) → PATH_NOT_FOUND with reason=EXTENSION_NOT_PARSEABLE", async () => {
 		await writeFile(join(vault.path, "secret.txt"), "secret data\n", "utf-8");
 		const safe = await validatePath("secret.txt", vaultRoot);
 		try {
@@ -123,13 +123,20 @@ describe("readNote — VAULT_EXTENSIONS gate", () => {
 			if (e instanceof PathValidationError) {
 				expect(e.payload.code).toBe("PATH_NOT_FOUND");
 				expect(e.payload.param).toBe("file");
+				// New discriminator + improved message — agents can branch on
+				// `reason` to know the rejection was a policy mismatch, and
+				// the message names the active extension set so an operator
+				// can self-correct via `VAULT_EXTENSIONS=md,txt`.
+				expect(e.payload.reason).toBe("EXTENSION_NOT_PARSEABLE");
+				expect(e.payload.message).toContain(".txt");
+				expect(e.payload.message).toContain("VAULT_EXTENSIONS [md]");
 			}
 		}
 	});
 });
 
 describe("readNote — hidden-path gate (default-off)", () => {
-	test("dot-prefixed directory (.obsidian/notes.md) → PathValidationError PATH_NOT_FOUND", async () => {
+	test("dot-prefixed directory (.obsidian/notes.md) → PATH_NOT_FOUND with reason=HIDDEN_PATH", async () => {
 		await mkdir(join(vault.path, ".obsidian"));
 		await writeFile(join(vault.path, ".obsidian", "notes.md"), "# secret\n", "utf-8");
 		const safe = await validatePath(".obsidian/notes.md", vaultRoot);
@@ -141,6 +148,9 @@ describe("readNote — hidden-path gate (default-off)", () => {
 			if (e instanceof PathValidationError) {
 				expect(e.payload.code).toBe("PATH_NOT_FOUND");
 				expect(e.payload.param).toBe("file");
+				expect(e.payload.reason).toBe("HIDDEN_PATH");
+				// Message hints at the recovery: pass `--include-hidden`.
+				expect(e.payload.message).toContain("--include-hidden");
 			}
 		}
 	});
@@ -150,6 +160,54 @@ describe("readNote — hidden-path gate (default-off)", () => {
 		await writeFile(join(vault.path, "notes", ".private.md"), "# private\n", "utf-8");
 		const safe = await validatePath("notes/.private.md", vaultRoot);
 		await expect(readNote(safe)).rejects.toBeInstanceOf(PathValidationError);
+	});
+});
+
+describe("readNote — index cache gate", () => {
+	test(".markdown-mcp/foo.md → PATH_NOT_FOUND with reason=INDEX_CACHE_PATH", async () => {
+		// Even though the cache dir is normally created by the server itself,
+		// an agent passing `.markdown-mcp/index.sqlite3` directly (or a
+		// markdown placeholder inside) must always be rejected — independent
+		// of `--include-hidden`. Verifies the dedicated cache-rejection branch
+		// in `assertNotePathString` fires before the hidden-path branch.
+		await mkdir(join(vault.path, ".markdown-mcp"));
+		await writeFile(join(vault.path, ".markdown-mcp", "foo.md"), "# spoof\n", "utf-8");
+		const safe = await validatePath(".markdown-mcp/foo.md", vaultRoot);
+		try {
+			await readNote(safe);
+			throw new Error("expected PathValidationError");
+		} catch (e) {
+			expect(e).toBeInstanceOf(PathValidationError);
+			if (e instanceof PathValidationError) {
+				expect(e.payload.code).toBe("PATH_NOT_FOUND");
+				expect(e.payload.param).toBe("file");
+				expect(e.payload.reason).toBe("INDEX_CACHE_PATH");
+				expect(e.payload.message).toContain("server cache directory");
+			}
+		}
+	});
+
+	test(".markdown-mcp/index.sqlite3 → INDEX_CACHE_PATH (cache wins over extension)", async () => {
+		// Regression catcher: a naive extension-first ordering would surface
+		// EXTENSION_NOT_PARSEABLE with a misleading "add sqlite3 to
+		// VAULT_EXTENSIONS" hint — but adding sqlite3 wouldn't unlock the
+		// path (cache gate is unconditional).
+		await mkdir(join(vault.path, ".markdown-mcp"));
+		await writeFile(join(vault.path, ".markdown-mcp", "index.sqlite3"), Buffer.from([0x53, 0x51, 0x4c, 0x69]));
+		const safe = await validatePath(".markdown-mcp/index.sqlite3", vaultRoot);
+		try {
+			await readNote(safe);
+			throw new Error("expected PathValidationError");
+		} catch (e) {
+			expect(e).toBeInstanceOf(PathValidationError);
+			if (e instanceof PathValidationError) {
+				expect(e.payload.code).toBe("PATH_NOT_FOUND");
+				expect(e.payload.param).toBe("file");
+				expect(e.payload.reason).toBe("INDEX_CACHE_PATH");
+				expect(e.payload.message).toContain("server cache directory");
+				expect(e.payload.message).not.toContain("VAULT_EXTENSIONS");
+			}
+		}
 	});
 });
 

@@ -163,17 +163,21 @@ describe("get_vault_tree — validatePath param rebrand", () => {
 });
 
 describe("get_vault_tree — M1 hidden-root rejection", () => {
-	test("hidden directory as start path returns PATH_NOT_FOUND", async () => {
+	test("hidden directory as start path returns PATH_NOT_FOUND with reason=HIDDEN_PATH", async () => {
 		// Hidden files are excluded from every surface by default ("all-or-
 		// nothing per server"). Without the gate, an agent could pass
 		// `path: ".obsidian"` and walk inside the hidden root (per-entry
 		// isHiddenName only filters CHILDREN); the requested ROOT needs
-		// the same policy check.
+		// the same policy check. The `reason` discriminator + the
+		// `--include-hidden` hint in the message let agents self-correct
+		// without grepping prose.
 		const result = await conn.client.callTool({ name: "get_vault_tree", arguments: { path: ".obsidian" } });
 		expect(result.isError).toBe(true);
 		const err = result.structuredContent as VaultError;
 		expect(err.code).toBe("PATH_NOT_FOUND");
 		expect(err.param).toBe("path");
+		expect(err.reason).toBe("HIDDEN_PATH");
+		expect(err.message).toContain("--include-hidden");
 	});
 
 	test("hidden parent segment in start path also rejected", async () => {
@@ -194,6 +198,71 @@ describe("get_vault_tree — M1 hidden-root rejection", () => {
 		const { structured } = await callTree({ depth: 5, pageSize: 50 });
 		const hidden = structured.items.find((i) => i.path.startsWith(".obsidian"));
 		expect(hidden).toBeUndefined();
+	});
+});
+
+describe("get_vault_tree — path rejection: distinguishable reasons", () => {
+	// Four distinct `reason` discriminators on `PATH_NOT_FOUND` —
+	// agents that only branch on `code` see the unchanged envelope code;
+	// agents that want to act on the specific rejection mode now can.
+
+	test("cache directory (.markdown-mcp) → reason=INDEX_CACHE_PATH", async () => {
+		// `.markdown-mcp/` is unconditionally excluded — even under
+		// `--include-hidden` (out of scope here, but the dirent filter
+		// matches). The spawned MCP server has already created this dir
+		// (after `waitForWarm`), so the resolver's `isIndexCachePath`
+		// check is the only thing standing between an agent and the
+		// SQLite cache files.
+		const result = await conn.client.callTool({
+			name: "get_vault_tree",
+			arguments: { path: ".markdown-mcp" },
+		});
+		expect(result.isError).toBe(true);
+		const err = result.structuredContent as VaultError;
+		expect(err.code).toBe("PATH_NOT_FOUND");
+		expect(err.param).toBe("path");
+		expect(err.reason).toBe("INDEX_CACHE_PATH");
+		expect(err.message).toContain("server cache directory");
+	});
+
+	test("file path (b.md) → reason=NOT_A_DIRECTORY", async () => {
+		// `get_vault_tree` walks subtrees — passing a regular file is a
+		// usage error. The message names the recovery (`get_file_outline`
+		// / `get_fragment`) so an agent gets a redirect instead of a bare
+		// "doesn't exist".
+		const result = await conn.client.callTool({
+			name: "get_vault_tree",
+			arguments: { path: "b.md" },
+		});
+		expect(result.isError).toBe(true);
+		const err = result.structuredContent as VaultError;
+		expect(err.code).toBe("PATH_NOT_FOUND");
+		expect(err.param).toBe("path");
+		expect(err.reason).toBe("NOT_A_DIRECTORY");
+		expect(err.message).toContain("get_file_outline");
+	});
+
+	test("genuinely-missing path (control) → no reason field", async () => {
+		// Regression catcher: the unchanged "missing" case keeps `reason`
+		// absent on the envelope. Note: the missing-path message itself
+		// comes from `validatePath` (it lstats and fails before
+		// resolveStartPath's stat fallback), so the message is
+		// "Path does not exist: ..." rather than the resolver's
+		// "Tree root path does not exist: ..." fallback (which only fires
+		// when validatePath succeeds but the subsequent stat fails — a
+		// TOCTOU window). The shared substring `"does not exist"` matches
+		// both code paths. If a future fix tags missing-path with a
+		// reason, the `toBeUndefined()` assertion catches it.
+		const result = await conn.client.callTool({
+			name: "get_vault_tree",
+			arguments: { path: "does/not/exist" },
+		});
+		expect(result.isError).toBe(true);
+		const err = result.structuredContent as VaultError;
+		expect(err.code).toBe("PATH_NOT_FOUND");
+		expect(err.param).toBe("path");
+		expect(err.reason).toBeUndefined();
+		expect(err.message).toContain("does not exist");
 	});
 });
 

@@ -31,14 +31,15 @@
 
 import type { FileHandle } from "node:fs/promises";
 import { lstat } from "node:fs/promises";
+import { extname } from "node:path";
 
 import type { PathRejectionReason, SafePath } from "../types.js";
 import { errorMessage, isVanishedErrno, vaultError } from "./error.js";
 import { isHiddenPath, isIndexCachePath } from "./hiddenPath.js";
 import { MAX_FILE_BYTES } from "./limits.js";
 import { type ParsedFile, ParseError, type ParseFileOptions, parseFile } from "./parser.js";
-import { openNoFollow, PathValidationError } from "./validatePath.js";
-import { getParserKind, isParseablePath } from "./vaultExtensions.js";
+import { openNoFollow, PathValidationError, pathNotFound } from "./validatePath.js";
+import { getParserKind, getSortedVaultExtensions, isParseablePath } from "./vaultExtensions.js";
 
 export interface SourceData {
 	source: string;
@@ -78,21 +79,34 @@ export class FileTooLargeError extends Error {
 }
 
 function assertNotePathString(safePath: SafePath, includeHidden: boolean): void {
-	if (!isParseablePath(safePath.relative)) {
-		throw pathNotFound(`Path is not a markdown note: ${safePath.relative}`);
-	}
-	// Server's own cache dir is rejected regardless of `--include-hidden`.
-	// Mirrors `watcher.ts:shouldIgnore` + `getVaultTree.resolveStartPath` +
-	// `search.classifyScope`. Without this, an agent under `--include-hidden`
-	// could read markdown placed inside `.markdown-mcp/` via get_fragment etc.
+	// Unconditional cache gate runs first: no env var or flag unlocks
+	// `.markdown-mcp/*`. Mirrors `watcher.ts:shouldIgnore`,
+	// `getVaultTree.resolveStartPath`, and `search.classifyScope`.
+	// Ordering matters — a cache file with a non-VAULT_EXTENSIONS
+	// extension (e.g. `.sqlite3`) would otherwise surface as
+	// EXTENSION_NOT_PARSEABLE with a misleading "add sqlite3" hint, and
+	// an `--include-hidden` agent could read markdown placed inside
+	// `.markdown-mcp/` via get_fragment if cache deferred to the
+	// hidden check.
 	if (isIndexCachePath(safePath.relative)) {
-		throw pathNotFound(`Path is inside the server cache directory: ${safePath.relative}`);
+		throw pathNotFound(`Path is inside the server cache directory: ${safePath.relative}`, "INDEX_CACHE_PATH");
+	}
+	if (!isParseablePath(safePath.relative)) {
+		const ext = extname(safePath.relative).slice(1).toLowerCase() || "(none)";
+		const active = getSortedVaultExtensions().join(",");
+		throw pathNotFound(
+			`Path extension '.${ext}' is not in VAULT_EXTENSIONS [${active}]: ${safePath.relative}`,
+			"EXTENSION_NOT_PARSEABLE",
+		);
 	}
 	if (!includeHidden && isHiddenPath(safePath.relative)) {
 		// Brief line 928: hidden files are policy-excluded from every direct-read
 		// surface by default. `--include-hidden` (CLI in W5) flips this off so
 		// dotfiles become addressable through every surface symmetrically.
-		throw pathNotFound(`Path is hidden (excluded by default): ${safePath.relative}`);
+		throw pathNotFound(
+			`Path is hidden (excluded by default; pass --include-hidden to include): ${safePath.relative}`,
+			"HIDDEN_PATH",
+		);
 	}
 }
 
@@ -213,8 +227,4 @@ export async function readNote(
 
 function isFsErrorCode(err: unknown, code: string): boolean {
 	return typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === code;
-}
-
-function pathNotFound(message: string): PathValidationError {
-	return new PathValidationError(vaultError("PATH_NOT_FOUND", message, { param: "file" }));
 }

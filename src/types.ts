@@ -208,7 +208,13 @@ export type PathRejectionReason =
 	| "STAT_FAILED"
 	| "REALPATH_FAILED"
 	| "INDEX_FILE_SYMLINK"
-	| "INDEX_FILE_NOT_REGULAR";
+	| "INDEX_FILE_NOT_REGULAR"
+	// Surfaced on `PATH_NOT_FOUND` envelopes (the validation reasons
+	// above sit on `PATH_OUTSIDE_VAULT`).
+	| "INDEX_CACHE_PATH"
+	| "HIDDEN_PATH"
+	| "NOT_A_DIRECTORY"
+	| "EXTENSION_NOT_PARSEABLE";
 
 // ─── Range / shared (Brief lines 73–87) ────────────────────────────────────
 
