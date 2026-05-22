@@ -32,8 +32,11 @@ export const MARKDOWN_EXTENSIONS: ReadonlySet<string> = new Set(["md", "markdown
 /** YAML-family extensions — consumed by `getParserKind` + `isResolvableLinkTarget`'s YAML gate. */
 export const YAML_EXTENSIONS: ReadonlySet<string> = new Set(["yaml", "yml"]);
 
-/** Parser-kind discriminator (D43). `null` = extension not addressable. */
-export type ParserKind = "markdown" | "yaml";
+/** Prisma-family extensions — consumed by `getParserKind` + `isResolvableLinkTarget`'s non-markdown gate. */
+export const PRISMA_EXTENSIONS: ReadonlySet<string> = new Set(["prisma"]);
+
+/** Parser-kind discriminator. `null` = extension not addressable. */
+export type ParserKind = "markdown" | "yaml" | "prisma";
 
 let cachedRawEnv: string | undefined;
 let cachedExtensions: ReadonlySet<string> = DEFAULT_EXTENSIONS;
@@ -105,6 +108,7 @@ export function isResolvableLinkTarget(relpath: string, exts?: ReadonlySet<strin
 	const ext = extname(relpath).slice(1).toLowerCase();
 	if (ext === "") return false;
 	if (YAML_EXTENSIONS.has(ext)) return false;
+	if (PRISMA_EXTENSIONS.has(ext)) return false;
 	return (exts ?? getVaultExtensions()).has(ext);
 }
 
@@ -118,6 +122,20 @@ export function isResolvableLinkTarget(relpath: string, exts?: ReadonlySet<strin
  */
 export function isAssetPath(relpath: string, exts?: ReadonlySet<string>): boolean {
 	return extname(relpath) !== "" && !isResolvableLinkTarget(relpath, exts);
+}
+
+/**
+ * True iff `ext` (bare, no leading dot, lowercase) is configured AND
+ * belongs to a wikilink-resolvable family. Same family rules as
+ * `isResolvableLinkTarget` — YAML and Prisma are deferred — but
+ * operates on bare extensions for callers that iterate
+ * `getVaultExtensions()` to synthesize candidate filenames
+ * (`wikilinks.ts:findFileWithVaultExt`, `getLinks.ts:computeIncomingCandidates`).
+ */
+export function isLinkableExtension(ext: string, exts?: ReadonlySet<string>): boolean {
+	if (YAML_EXTENSIONS.has(ext)) return false;
+	if (PRISMA_EXTENSIONS.has(ext)) return false;
+	return (exts ?? getVaultExtensions()).has(ext);
 }
 
 /**
@@ -139,5 +157,6 @@ export function getParserKind(relpath: string, exts?: ReadonlySet<string>): Pars
 	if (!configured.has(ext)) return null;
 	if (MARKDOWN_EXTENSIONS.has(ext)) return "markdown";
 	if (YAML_EXTENSIONS.has(ext)) return "yaml";
+	if (PRISMA_EXTENSIONS.has(ext)) return "prisma";
 	return null;
 }

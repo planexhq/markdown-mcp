@@ -129,6 +129,8 @@ function buildResourceLinks(items: ReadonlyArray<VaultTreeItem>): ExtraContentBl
 		// resolve for `note://` reads even when absent from the index — so
 		// a tree-walk surface that suppresses resource_links based on index
 		// presence would hide working resources.
+		const kind = getParserKind(item.path);
+		const mimeType = kind === "yaml" ? "application/yaml" : kind === "prisma" ? "text/x-prisma" : "text/markdown";
 		blocks.push({
 			type: "resource_link",
 			// Per-segment encodeURIComponent because validatePath admits `#`
@@ -139,7 +141,7 @@ function buildResourceLinks(items: ReadonlyArray<VaultTreeItem>): ExtraContentBl
 			// template's path expansion works as before.
 			uri: `note://${item.path.split("/").map(encodeURIComponent).join("/")}`,
 			name: item.name,
-			mimeType: getParserKind(item.path) === "yaml" ? "application/yaml" : "text/markdown",
+			mimeType,
 		});
 	}
 	return blocks;

@@ -406,7 +406,8 @@ function registerNoteResource(server: McpServer, vaultRoot: VaultRoot, includeHi
 				// `note://` deliberately surfaces the literal bytes so
 				// agents reading the resource get the spec verbatim.
 				const { source } = await readSource(safePath, includeHidden);
-				const mimeType = getParserKind(safePath.relative) === "yaml" ? "application/yaml" : "text/markdown";
+				const kind = getParserKind(safePath.relative);
+				const mimeType = kind === "yaml" ? "application/yaml" : kind === "prisma" ? "text/x-prisma" : "text/markdown";
 				return {
 					contents: [{ uri: uri.toString(), mimeType, text: source }],
 				};

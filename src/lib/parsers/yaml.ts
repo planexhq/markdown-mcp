@@ -22,6 +22,7 @@ import {
 } from "../parser.js";
 import { detectAsyncApi, synthesizeAsyncApiFile } from "./asyncapi.js";
 import { detectOpenApi, synthesizeOpenApiFile } from "./openapi.js";
+import { hasFrontmatterKeys } from "./shared.js";
 
 export function parseYamlFile(source: string, relpath: string, options: ParseFileOptions = {}): ParsedFile {
 	const parsed = parseYamlSource(source);
@@ -31,7 +32,7 @@ export function parseYamlFile(source: string, relpath: string, options: ParseFil
 	enforceNodeCap(normalized, options.maxAstNodes ?? MAX_AST_NODES);
 
 	const frontmatter = isPlainObject(normalized) ? normalized : null;
-	const hasFrontmatter = frontmatter !== null && Object.keys(frontmatter).length > 0;
+	const hasFrontmatter = hasFrontmatterKeys(frontmatter);
 
 	if (options.frontmatterOnly) {
 		return buildOpaqueFile(source, relpath, frontmatter, hasFrontmatter, /* withBodyPreamble */ false);

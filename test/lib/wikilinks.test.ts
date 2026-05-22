@@ -680,3 +680,60 @@ describe("wikilinks — VAULT_EXTENSIONS resolution", () => {
 		expect(r.targetFile).toBe("notes/auth.md");
 	});
 });
+
+// ─── Non-resolvable target families: YAML + Prisma ─────────────────────────
+
+describe("wikilinks — non-resolvable target gating (YAML + Prisma)", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
+	test("Phase 0 source-relative extensionless input does NOT retarget to .prisma", () => {
+		vi.stubEnv("VAULT_EXTENSIONS", "md,prisma");
+		const idx = new FakeVaultIndex({ files: ["schema.prisma"] });
+		const r = resolveWikilink("./schema", "src.md", idx);
+		expect(r.resolved).toBe(false);
+	});
+
+	test("Phase 1 explicit vault-root extensionless input does NOT retarget to .prisma", () => {
+		vi.stubEnv("VAULT_EXTENSIONS", "md,prisma");
+		const idx = new FakeVaultIndex({ files: ["prisma/schema.prisma"] });
+		const r = resolveWikilink("prisma/schema", "src.md", idx);
+		expect(r.resolved).toBe(false);
+	});
+
+	test("Phase 2/3 bare basename does NOT retarget to .prisma", () => {
+		vi.stubEnv("VAULT_EXTENSIONS", "md,prisma");
+		const idx = new FakeVaultIndex({ files: ["notes/schema.prisma"] });
+		const r = resolveWikilink("schema", "src.md", idx);
+		expect(r.resolved).toBe(false);
+	});
+
+	test("Phase 2/3 bare basename does NOT retarget to .yaml (latent hole closed)", () => {
+		vi.stubEnv("VAULT_EXTENSIONS", "md,yaml");
+		const idx = new FakeVaultIndex({ files: ["notes/petstore.yaml"] });
+		const r = resolveWikilink("petstore", "src.md", idx);
+		expect(r.resolved).toBe(false);
+	});
+
+	test("Phase 1.5 suffix lookup does NOT retarget to .prisma when bucket includes it", () => {
+		vi.stubEnv("VAULT_EXTENSIONS", "md,prisma");
+		const idx = new FakeVaultIndex({ files: ["nested/folder/schema.prisma"] });
+		const r = resolveWikilink("folder/schema", "src.md", idx);
+		expect(r.resolved).toBe(false);
+	});
+
+	test("happy path: markdown still resolves when both .md and .prisma exist", () => {
+		vi.stubEnv("VAULT_EXTENSIONS", "md,prisma");
+		const idx = new FakeVaultIndex({ files: ["schema.md", "schema.prisma"] });
+		const r = resolveWikilink("./schema", "src.md", idx);
+		expect(r).toMatchObject({ resolved: true, targetFile: "schema.md" });
+	});
+
+	test("happy path: bare basename picks .md over .prisma sibling", () => {
+		vi.stubEnv("VAULT_EXTENSIONS", "md,prisma");
+		const idx = new FakeVaultIndex({ files: ["notes/schema.md", "notes/schema.prisma"] });
+		const r = resolveWikilink("schema", "src.md", idx);
+		expect(r).toMatchObject({ resolved: true, targetFile: "notes/schema.md" });
+	});
+});

@@ -19,7 +19,7 @@ import type { MetaEnvelope } from "../../src/types.js";
 
 // `URL.pathname` keeps percent escapes (e.g. `%20`); `fileURLToPath`
 // decodes them so checkout paths with spaces or non-ASCII still spawn.
-const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
+export const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 export const SERVER_BIN = join(REPO_ROOT, "dist/index.js");
 
 export interface TestClient {

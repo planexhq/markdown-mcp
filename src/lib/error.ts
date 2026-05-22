@@ -16,7 +16,7 @@
 import { randomUUID } from "node:crypto";
 import type { ErrorCode, HeadingCandidate, IndexStatus, MetaEnvelope, VaultError } from "../types.js";
 import { MAX_FILE_BYTES } from "./limits.js";
-import type { ParseError } from "./parser.js";
+import type { ParseError, ParseErrorFormat } from "./parser.js";
 import { isProseOnly } from "./proseOnly.js";
 import { renderError } from "./renderText/error.js";
 
@@ -327,15 +327,22 @@ export function fileTooLargeEnvelope(
 }
 
 /**
+ * `Record<ParseErrorFormat, ErrorCode>` shape makes adding a new format a
+ * one-row change with TS-enforced exhaustiveness — the compiler rejects
+ * any extension of `ParseErrorFormat` that doesn't update this map.
+ */
+const FORMAT_TO_ERROR_CODE: Record<ParseErrorFormat, ErrorCode> = {
+	markdown: "MARKDOWN_PARSE_ERROR",
+	yaml: "YAML_PARSE_ERROR",
+	prisma: "PRISMA_PARSE_ERROR",
+};
+
+/**
  * Parser error payload from a `ParseError` instance — shared between
  * Tool surface (`routeError.ts`) and Resource surface (`server.ts`
  * `note://`) so both report identical `{reason, line?, column?}` for the
  * same parser failure. `messagePrefix` lets the Resource side prepend
  * `"note:// parse failed: "` to disambiguate.
- *
- * D45 — dispatches on `err.format` to pick `MARKDOWN_PARSE_ERROR` vs
- * `YAML_PARSE_ERROR`. Payload shape is identical between the two codes;
- * only the discriminator differs.
  */
 export function parseErrorPayload(
 	err: ParseError,
@@ -343,7 +350,7 @@ export function parseErrorPayload(
 	options: { messagePrefix?: string; requestId?: string } = {},
 ): VaultError {
 	const message = options.messagePrefix !== undefined ? `${options.messagePrefix}${err.message}` : err.message;
-	const code: ErrorCode = err.format === "yaml" ? "YAML_PARSE_ERROR" : "MARKDOWN_PARSE_ERROR";
+	const code: ErrorCode = FORMAT_TO_ERROR_CODE[err.format];
 	return vaultError(code, message, {
 		param,
 		reason: err.reason,

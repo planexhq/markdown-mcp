@@ -24,6 +24,7 @@ export type ErrorCode =
 	| "PATH_OUTSIDE_VAULT"
 	| "MARKDOWN_PARSE_ERROR"
 	| "YAML_PARSE_ERROR"
+	| "PRISMA_PARSE_ERROR"
 	| "FILTER_SYNTAX_ERROR"
 	| "INVALID_QUERY"
 	| "CURSOR_INVALID"
@@ -578,10 +579,11 @@ export interface NoteResourceContent {
 	uri: string;
 	/**
 	 * `text/markdown` for `.md` / `.markdown` / `.mdx` files;
-	 * `application/yaml` for `.yaml` / `.yml` (D44 / D46). Resource handlers
+	 * `application/yaml` for `.yaml` / `.yml`;
+	 * `text/x-prisma` for `.prisma`. Resource handlers
 	 * pick the right value via `getParserKind(safe.relative)`.
 	 */
-	mimeType: "text/markdown" | "application/yaml";
+	mimeType: "text/markdown" | "application/yaml" | "text/x-prisma";
 	text: string;
 }
 
