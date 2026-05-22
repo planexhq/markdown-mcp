@@ -263,7 +263,7 @@ Windsurf, Goose, Zed, and other stdio-based MCP hosts accept the same `command` 
 
 The `note://{path}` Resource returns the raw on-disk markdown (frontmatter included) so hosts can stream a literal note when a parsed fragment isn't what they want.
 
-**OpenAPI 3.x YAML** (when admitted via `VAULT_EXTENSIONS`): `get_file_outline` returns one node per operation (`GET /pets`); `get_fragment` returns a synthesized prose rendering — summary, description, parameter prose, plus a compact JSON fence of the full operation object; `get_metadata` returns the whole top-level spec object so nested-path filters (`fields["info.version"].eq`) work directly. `note://api/petstore.yaml` returns the literal on-disk YAML with `mimeType: application/yaml`. Wikilinks **into** YAML are not yet resolved; other YAML files index opaquely (whole source searchable, top-level exposed as frontmatter).
+**OpenAPI 3.x YAML** (when admitted via `VAULT_EXTENSIONS`): `get_file_outline` returns one node per operation (`GET /pets`); OpenAPI 3.1 `webhooks` join `paths` as `Webhook: <name> <METHOD>` headings. `get_fragment` returns a synthesized prose rendering (summary, description, parameter prose) plus a compact JSON fence of the operation object; `get_metadata` returns the whole top-level spec so nested-path filters (`fields["info.version"].eq`) work directly. `note://api/petstore.yaml` returns the literal on-disk YAML with `mimeType: application/yaml`. Operations with a stable `operationId` keep their `stable_id` across path renames (e.g. `/v1/pets` → `/api/v2/pets`). Wikilinks **into** YAML are not yet resolved; other YAML files index opaquely (whole source searchable, top-level exposed as frontmatter).
 
 **AsyncAPI 3.x YAML** (same admittance gate): `get_file_outline` returns one node per top-level operation (`send userSignedUp`, `receive lightMeasured`); `get_fragment` returns synthesized prose with the resolved channel address, message list, reply info, tags, plus a compact JSON fence of the full operation object. Intra-document `$ref` (`#/channels/<name>`, `#/channels/<chan>/messages/<msg>`) is resolved; external `$ref` renders verbatim. `## Channels` and `## Components` catch-all sections keep large specs navigable. AsyncAPI 2.x (with nested `publish`/`subscribe`) is deferred and falls through to opaque YAML emission.
 
@@ -507,7 +507,7 @@ Narrow to one section with `heading_path: ["Authentication", "OAuth2"]` or `stab
 
 // structuredContent
 {
-  "server": { "name": "markdown-mcp", "version": "1.0.0", "mcp_protocol_version": "2025-06-18",
+  "server": { "name": "markdown-mcp", "version": "1.2.0", "mcp_protocol_version": "2025-06-18",
               "started_at": "2026-05-18T08:23:18.842Z", "prose_only": false },
   "vault":  { "root_hash": "2cd5a7f35e256539", "include_hidden": false,
               "extensions": ["md"],
@@ -532,7 +532,7 @@ server_info
 
 ## Server
 - name: markdown-mcp
-- version: 1.0.0
+- version: 1.2.0
 - mcp_protocol_version: 2025-06-18
 - started_at: 2026-05-18T08:23:18.842Z
 - prose_only: false
@@ -587,7 +587,7 @@ Domain errors come back as `isError: true` with `structuredContent: { code, mess
 
 | Code | When you see it |
 |---|---|
-| `PATH_NOT_FOUND` | File or directory doesn't exist, or has a non-vault extension (e.g. `.png` for direct-read tools). |
+| `PATH_NOT_FOUND` | File or directory doesn't exist, or the server refused to surface it. Optional `reason: "INDEX_CACHE_PATH" \| "HIDDEN_PATH" \| "NOT_A_DIRECTORY" \| "EXTENSION_NOT_PARSEABLE"` discriminates the rejection mode (`.markdown-mcp/` cache · dot-prefixed path without `--include-hidden` · file path passed where a directory was expected · extension not in `VAULT_EXTENSIONS`). Absent `reason` = genuinely missing on disk. |
 | `PATH_OUTSIDE_VAULT` | Path tries to escape the vault root (`..`, absolute path, symlink, `\0`, depth > 32, etc.). `reason` names the specific rejection. |
 | `HEADING_NOT_FOUND` | `heading_path` / `stable_id` didn't match any heading. Stale `stable_id` paths include `candidates[]` and `requested_stable_id` when fuzzy recovery exhausts. |
 | `HEADING_AMBIGUOUS` | Multiple headings share the requested path. `candidates[]` lists each match with its `stable_id`. |

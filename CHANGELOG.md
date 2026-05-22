@@ -4,9 +4,9 @@ All notable changes to markdown-mcp are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] — 2026-05-22
 
-Four feature sets shipping together: **structured Prisma schema (PSL) support**, three OpenAPI synthesizer enhancements (webhooks + prose enrichment + operationId slot + pollution defense), **HTTP transport**, and **structured AsyncAPI 3.x synthesis**. The combined work bumps `PARSER_SHAPE_VERSION` 1 → 3 — existing caches cold-rescan once on upgrade.
+Four feature sets shipping together: **structured Prisma schema (PSL) support**, three OpenAPI synthesizer enhancements (webhooks + prose enrichment + operationId slot + pollution defense), **HTTP transport**, and **structured AsyncAPI 3.x synthesis**, plus two cross-cutting fixes (`PATH_NOT_FOUND` reason discriminator, symlink-leaf warming-gate unwedge). The combined work bumps `PARSER_SHAPE_VERSION` 1 → 3 — existing caches cold-rescan once on upgrade.
 
 ### Structured OpenAPI 3.x — webhooks, prose enrichment, operationId slot, pollution defense
 
@@ -132,6 +132,20 @@ Structured Prisma schema (PSL) support. `.prisma` files join markdown, OpenAPI Y
 - **Prisma migration files** (`.sql` files in `prisma/migrations/`). Users can opt into `.sql` via `VAULT_EXTENSIONS=md,prisma,sql` for opaque indexing, but no SQL synthesizer ships.
 - **Surfacing the relation graph as `get_links` rows.** Prisma `@relation(fields: [...], references: [...])` is structurally a foreign key, not a wikilink. Exposing the graph via `get_links` needs a separate ADR — every `User` ↔ `Post` relation would surface as a link edge, which may or may not match agent intent.
 
+---
+
+### Cross-cutting hardening
+
+#### Added
+
+- **`PATH_NOT_FOUND` carries a structured `reason` discriminator.** `get_vault_tree` and every direct-read tool (`get_file_outline`, `get_fragment`, `get_metadata`, `get_links`, `note://`) now surface one of four `PathRejectionReason` values when a path is rejected: `INDEX_CACHE_PATH` (the `.markdown-mcp/` cache directory), `HIDDEN_PATH` (dot-prefixed paths when `--include-hidden` is off), `NOT_A_DIRECTORY` (`get_vault_tree` called on a file path), `EXTENSION_NOT_PARSEABLE` (path with extension not in `VAULT_EXTENSIONS`). The error code stays `PATH_NOT_FOUND` — non-breaking for clients that branch on `code` — and the genuinely-missing-on-disk case keeps `reason` absent as the control-test catcher. Agents can now branch on the rejection mode without grepping message text. Shared `pathNotFound(message, reason?, param?)` exported from `validatePath.ts` consolidates the previous inline construction pattern. `assertNotePathString` in `readNote.ts` names the offending extension AND the active `VAULT_EXTENSIONS` set in the error message (`Path extension '.yaml' is not in VAULT_EXTENSIONS [md]: …`) so operators get a self-correctable signal.
+
+#### Fixed
+
+- **Symlink-leaf markdown paths no longer wedge the warming gate.** Chokidar with `followSymlinks: false` still emits `add` events for the symlink leaves themselves. `reindexOne` previously routed them to `indexOne` → `validatePath`, which threw `PathValidationError(SYMLINK_SEGMENT)`; the watcher's `reindexCallback` mapped that to `parse_failed` and called `addPendingRetry`. Since `walkVault` never re-enumerates the symlink (it `lstat`-skips them), the entry sat in `pendingRetries` forever and `markScanFinalized` never fired — the server hung at `state: warming, ever_complete: false` indefinitely on any vault containing a markdown symlink. `reindexOne` now mirrors `walkVault`'s `lstat`-skip at entry: lstat the leaf and return `"vanished"` if it's a symbolic link (or ENOENT/ENOTDIR). Cost is one extra `lstat` per chokidar `add` event for markdown-extensioned paths (~20µs).
+
+---
+
 ## [1.1.0] — 2026-05-19
 
 Structured OpenAPI 3.x + opaque YAML support. YAML files join markdown on the parseable surface when admitted via `VAULT_EXTENSIONS`.
@@ -231,6 +245,6 @@ Internal algorithm IDs that ship with v1.0.0:
 
 Algorithm IDs are versioned in `_meta`; behavior changes bump the id rather than mutating under the old name.
 
-[Unreleased]: https://github.com/planexhq/markdown-mcp/compare/v1.1.0...HEAD
+[1.2.0]: https://github.com/planexhq/markdown-mcp/releases/tag/v1.2.0
 [1.1.0]: https://github.com/planexhq/markdown-mcp/releases/tag/v1.1.0
 [1.0.0]: https://github.com/planexhq/markdown-mcp/releases/tag/v1.0.0
