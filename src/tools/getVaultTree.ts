@@ -30,8 +30,6 @@ import {
 	successEnvelope,
 	type ToolErrorEnvelope,
 	type ToolSuccessEnvelope,
-	toolErrorEnvelope,
-	vaultError,
 } from "../lib/error.js";
 import { isHiddenName, isHiddenPath, isIndexCachePath } from "../lib/hiddenPath.js";
 import type { IndexHandle } from "../lib/index/IndexHandle.js";
@@ -40,7 +38,13 @@ import { clampPageSize, MAX_PATH_DEPTH } from "../lib/limits.js";
 import { renderTree } from "../lib/renderText/getVaultTree.js";
 import { sha1HexN } from "../lib/structuralPath.js";
 import { getTokenizerId } from "../lib/tokenizer.js";
-import { PathValidationError, passesPathPolicy, type VaultRoot, validatePath } from "../lib/validatePath.js";
+import {
+	PathValidationError,
+	passesPathPolicy,
+	pathNotFound,
+	type VaultRoot,
+	validatePath,
+} from "../lib/validatePath.js";
 import { getParserKind, isParseablePath } from "../lib/vaultExtensions.js";
 import type { GetVaultTreeInput, GetVaultTreeResult, SafePath, VaultTreeItem } from "../types.js";
 import { routeToolError } from "./routeError.js";
@@ -58,13 +62,6 @@ export async function handleGetVaultTree(
 		// Path validation precedes INDEX_WARMING (mirrors search.ts) so
 		// permanent errors like `path: "../etc"` aren't masked as transient.
 		const startRel = await resolveStartPath(input.path, vaultRoot, includeHidden);
-		if (startRel === null) {
-			const err = vaultError("PATH_NOT_FOUND", `Tree root path does not exist: ${input.path ?? ""}`, {
-				param: "path",
-				request_id: meta.request_id,
-			});
-			return toolErrorEnvelope(err, meta);
-		}
 
 		const indexStatus = index?.getStatus();
 		if (indexStatus && isIndexWarming(indexStatus.state)) {
@@ -151,7 +148,7 @@ async function resolveStartPath(
 	input: string | undefined,
 	vaultRoot: VaultRoot,
 	includeHidden: boolean,
-): Promise<string | null> {
+): Promise<string> {
 	if (!input || input === "" || input === "/") return "";
 	let safe: SafePath;
 	try {
@@ -165,22 +162,49 @@ async function resolveStartPath(
 		}
 		throw err;
 	}
+	// Order matters: cache check BEFORE hidden check. `.markdown-mcp/` is
+	// both hidden AND the cache; the cache is the more-specific, unconditional
+	// policy (always excluded, regardless of `--include-hidden`), so it owns
+	// the rejection. Without this ordering, an agent passing `.markdown-mcp`
+	// under default config would see `reason: HIDDEN_PATH` + a misleading
+	// "pass --include-hidden to include" suggestion — but the cache stays
+	// excluded under that flag too. Mirrors `readNote.assertNotePathString`'s
+	// cache-then-hidden order.
+	if (isIndexCachePath(safe.relative)) {
+		throw pathNotFound(
+			`Tree root is the server cache directory (always excluded): ${safe.relative}`,
+			"INDEX_CACHE_PATH",
+			"path",
+		);
+	}
 	// Hidden roots are policy-excluded by default — without this gate, an agent
 	// passing `path: ".obsidian"` would walk inside the hidden root and emit
 	// its non-hidden children. Per-entry isHiddenName in walkTreeDfs only
 	// vets descendants. Mirrors search.ts (scope.path) and readNote.ts.
-	if (!includeHidden && isHiddenPath(safe.relative)) return null;
-	// Server's own cache dir is rejected as a tree root regardless of
-	// `--include-hidden`. The dirent filter in `shouldEmitDirent` only excludes
-	// `.markdown-mcp` when encountered as a child of vault root — without this
-	// resolver-level gate, `path: ".markdown-mcp"` under `--include-hidden` would
-	// walk inside the cache and enumerate `index.sqlite3` + WAL/SHM siblings.
-	if (isIndexCachePath(safe.relative)) return null;
+	if (!includeHidden && isHiddenPath(safe.relative)) {
+		throw pathNotFound(
+			`Tree root is hidden (excluded by default; pass --include-hidden to include): ${safe.relative}`,
+			"HIDDEN_PATH",
+			"path",
+		);
+	}
 	try {
 		const st = await stat(safe.absolute);
-		if (!st.isDirectory()) return null;
-	} catch {
-		return null;
+		if (!st.isDirectory()) {
+			throw pathNotFound(
+				`Tree root is a file, not a directory (use get_file_outline / get_fragment for files): ${safe.relative}`,
+				"NOT_A_DIRECTORY",
+				"path",
+			);
+		}
+	} catch (err) {
+		// Swallow filesystem errnos (ENOENT / ENOTDIR / etc.) into the
+		// historical "does not exist" envelope with `reason` absent —
+		// the backward-compatible missing-case shape that control tests
+		// depend on. PathValidationError comes from the NOT_A_DIRECTORY
+		// throw above and must keep its `reason` intact.
+		if (err instanceof PathValidationError) throw err;
+		throw pathNotFound(`Tree root path does not exist: ${input}`, undefined, "path");
 	}
 	return safe.relative;
 }

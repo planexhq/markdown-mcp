@@ -60,6 +60,26 @@ export class PathValidationError extends Error {
 }
 
 /**
+ * Shared `PATH_NOT_FOUND` constructor. Optional `reason` lets callers
+ * distinguish policy-rejection sub-states (cache dir, hidden, wrong type,
+ * extension policy) from a genuinely-missing path — the missing case
+ * passes `reason: undefined` and gets the historical envelope shape.
+ *
+ * `param` defaults to `"file"` for the direct-read tools; `get_vault_tree`
+ * overrides to `"path"` so clients keying off `param` get the right field.
+ */
+export function pathNotFound(
+	message: string,
+	reason?: PathRejectionReason,
+	param: string = "file",
+): PathValidationError {
+	// `vaultError` filters undefined values from its options object, so
+	// passing `reason: undefined` is equivalent to omitting it — no need
+	// for a conditional intermediate object.
+	return new PathValidationError(vaultError("PATH_NOT_FOUND", message, { param, reason }));
+}
+
+/**
  * Patterns evaluated once at module load — `validatePath` is invoked on
  * every tool call, so per-call regex compilation or template-literal
  * allocation would be hot-path bloat.
