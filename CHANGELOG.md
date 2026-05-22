@@ -4,6 +4,8 @@ All notable changes to markdown-mcp are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [1.2.0] — 2026-05-22
 
 Four feature sets shipping together: **structured Prisma schema (PSL) support**, three OpenAPI synthesizer enhancements (webhooks + prose enrichment + operationId slot + pollution defense), **HTTP transport**, and **structured AsyncAPI 3.x synthesis**, plus two cross-cutting fixes (`PATH_NOT_FOUND` reason discriminator, symlink-leaf warming-gate unwedge). The combined work bumps `PARSER_SHAPE_VERSION` 1 → 3 — existing caches cold-rescan once on upgrade.
@@ -245,6 +247,7 @@ Internal algorithm IDs that ship with v1.0.0:
 
 Algorithm IDs are versioned in `_meta`; behavior changes bump the id rather than mutating under the old name.
 
+[Unreleased]: https://github.com/planexhq/markdown-mcp/compare/v1.2.0...HEAD
 [1.2.0]: https://github.com/planexhq/markdown-mcp/releases/tag/v1.2.0
 [1.1.0]: https://github.com/planexhq/markdown-mcp/releases/tag/v1.1.0
 [1.0.0]: https://github.com/planexhq/markdown-mcp/releases/tag/v1.0.0
